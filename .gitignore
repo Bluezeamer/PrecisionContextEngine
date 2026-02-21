@@ -49,6 +49,7 @@ dmypy.json
 temp/
 serena/
 .claude/
+.env
 
 # OS
 .DS_Store

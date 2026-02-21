@@ -240,24 +240,6 @@ class ErrorResponse(BaseSchema):
     details: Optional[NonEmptyStr] = Field(default=None, description="详细错误信息（可选）")
 
 
-class InitRequest(BaseSchema):
-    """pce_init 工具的请求参数。"""
-
-    root_path: Optional[Path] = Field(default=None, description="项目根路径（默认当前目录）")
-    force: bool = Field(default=False, description="是否强制重建索引")
-
-
-class InitResponse(BaseSchema):
-    """pce_init 工具的响应结果。"""
-
-    success: bool = Field(..., description="初始化是否成功")
-    message: NonEmptyStr = Field(..., description="结果提示信息")
-    stats: Optional[BuildStats] = Field(default=None, description="构建统计（成功时提供）")
-    project_meta: Optional[ProjectMeta] = Field(
-        default=None, description="项目元数据（成功时提供）"
-    )
-
-
 class QueryRequest(BaseSchema):
     """pce_query 工具的请求参数。"""
 

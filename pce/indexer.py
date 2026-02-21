@@ -28,7 +28,7 @@ from typing import Any
 import aiofiles
 import litellm
 
-from .memory import append_memory, save_index
+from .memory import append_memory, load_index, save_index
 from .models import (
     BuildStats,
     FileMeta,
@@ -83,7 +83,8 @@ HIGH_LEVEL_KINDS = frozenset({
 })
 
 DEFAULT_CONCURRENCY = 10
-DEFAULT_MODEL = os.getenv("PCE_ANNOTATION_MODEL", "step-3.5-flash")
+# litellm 模型名格式参考 pce/agent.py 中的说明
+DEFAULT_MODEL = os.getenv("PCE_ANNOTATION_MODEL", "openrouter/stepfun/step-3.5-flash:free")
 
 
 # ============================================================================
@@ -94,9 +95,29 @@ DEFAULT_MODEL = os.getenv("PCE_ANNOTATION_MODEL", "step-3.5-flash")
 def _normalize_tool_result(value: Any) -> Any:
     """将工具返回值统一化为 dict/list 结构。
 
-    Serena 工具在 _jsonable 处理后通常返回字符串(已解析)或原始结构。
-    此函数处理"单元素列表包含字符串"等边缘情况。
+    Serena 工具返回值经过 _jsonable 处理后可能有多种形态：
+    1. 直接返回 dict/list（最理想）
+    2. 单元素列表包含 JSON 字符串（旧版兼容）
+    3. {'meta': ..., 'content': [{'type': 'text', 'text': <data>}]} 外壳（实测形态）
     """
+    # 处理 content 外壳结构：{'meta': ..., 'content': [...]}
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            # 取第一个 type=text 的条目（兼容多元素 content）
+            text_item = next(
+                (item for item in content if isinstance(item, dict) and item.get("type") == "text"),
+                None,
+            )
+            if text_item is not None:
+                inner = text_item["text"]
+                if isinstance(inner, str):
+                    try:
+                        return json.loads(inner)
+                    except (ValueError, json.JSONDecodeError):
+                        return inner
+                return inner
+    # 处理单元素列表包含 JSON 字符串的情况（旧版兼容）
     if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
         try:
             return json.loads(value[0])
@@ -142,15 +163,47 @@ def _extract_file_list(payload: Any) -> list[str]:
 
 
 def _flatten_symbols(payload: Any) -> list[dict[str, Any]]:
-    """从 get_symbols_overview 响应中提取所有符号 dict。"""
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        result: list[dict[str, Any]] = []
-        for v in payload.values():
-            result.extend(_flatten_symbols(v))
-        return result
-    return []
+    """从 get_symbols_overview 响应中提取所有符号。
+
+    Serena 的 get_symbols_overview 返回按类型分组的嵌套结构：
+      {"Class": ["Foo", {"Bar": {"Method": ["baz"]}}], "Function": ["qux"]}
+    键 = 符号类型, 值 = 列表, 元素为字符串(简单符号)或 dict(嵌套容器)。
+    此函数将其展平为 [{"name": ..., "kind": ...}, ...] 的统一列表。
+    """
+    _KIND_KEYS = {
+        "class", "interface", "method", "function", "module",
+        "file", "variable", "import", "enum", "property",
+        "constructor", "field", "constant", "namespace",
+    }
+    result: list[dict[str, Any]] = []
+
+    def _is_kind_group(d: dict[str, Any]) -> bool:
+        """判断 dict 的键是否全部为符号类型名。"""
+        return bool(d) and all(str(k).lower() in _KIND_KEYS for k in d)
+
+    def _walk(node: Any, kind: str | None) -> None:
+        if isinstance(node, str):
+            if kind:
+                result.append({"name": node, "kind": kind})
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, kind)
+            return
+        if isinstance(node, dict):
+            # 情况 1: {"Class": [...], "Function": [...]} — 按类型分组
+            if _is_kind_group(node):
+                for k, v in node.items():
+                    _walk(v, str(k))
+                return
+            # 情况 2: {"SymbolRef": {"Method": [...]}} — 嵌套容器符号
+            for name, children in node.items():
+                if kind:
+                    result.append({"name": str(name), "kind": kind})
+                _walk(children, None)
+
+    _walk(payload, None)
+    return result
 
 
 def _flatten_references(payload: Any) -> list[dict[str, Any]]:
@@ -379,7 +432,7 @@ async def _generate_annotations(
 async def _scan_directory(serena_client: SerenaClient) -> list[str]:
     """递归扫描项目目录,返回源代码文件路径列表。"""
     try:
-        raw = await serena_client.list_dir(".", recursive=True)
+        raw = await serena_client.list_dir(".", recursive=True, skip_ignored_files=True)
     except SerenaClientError as e:
         logger.error(f"目录扫描失败: {e}")
         return []
@@ -614,5 +667,131 @@ async def build_index(
             logger.info("语义注解已写入 Memory")
         except Exception as e:
             logger.warning(f"写入语义注解失败(已降级): {e}")
+
+    return snapshot
+
+
+async def build_index_incremental(
+    project_path: str | Path,
+    serena_client: SerenaClient,
+    memory_root: str | Path | None = None,
+    *,
+    changed_files: list[str],
+    deleted_files: list[str] | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> IndexSnapshot:
+    """增量索引更新：仅重建变更文件，合并到已有索引。
+
+    若不存在历史索引，自动降级为全量 build_index。
+
+    Args:
+        project_path: 目标项目根路径
+        serena_client: 已连接的 Serena 客户端
+        memory_root: Memory 文件的写入根路径
+        changed_files: 变更（含新增）的文件相对路径列表
+        deleted_files: 已删除的文件相对路径列表
+        concurrency: 并发索引文件数上限
+
+    Returns:
+        合并后的 IndexSnapshot
+    """
+    root_path = Path(project_path).resolve()
+    memory_root_path = Path(memory_root).resolve() if memory_root else root_path
+    start_time = time.monotonic()
+
+    # 尝试加载已有索引
+    existing = await load_index(root_path=memory_root_path)
+    if existing is None:
+        logger.info("无历史索引，降级为全量构建")
+        return await build_index(
+            project_path=project_path,
+            serena_client=serena_client,
+            memory_root=memory_root,
+            concurrency=concurrency,
+        )
+
+    # 过滤有效的代码文件
+    effective_changes = [
+        f for f in changed_files
+        if _is_code_file(Path(f)) and not _should_skip(Path(f))
+    ]
+    deleted = set(deleted_files or [])
+
+    if not effective_changes and not deleted:
+        logger.info("无有效变更，跳过增量更新")
+        return existing
+
+    logger.info(
+        f"开始增量索引: {len(effective_changes)} 个变更, "
+        f"{len(deleted)} 个删除"
+    )
+
+    # 并发重建变更文件
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _run(file_path: str) -> IndexEntry | None:
+        async with semaphore:
+            return await _index_file(file_path, serena_client)
+
+    results = await asyncio.gather(
+        *[_run(f) for f in effective_changes], return_exceptions=True
+    )
+
+    # 以现有条目为基础，按文件路径建立映射
+    entries_map: dict[str, IndexEntry] = {
+        str(e.file_meta.path): e for e in existing.entries
+    }
+
+    failed_files: list[str] = []
+    for file_path, result in zip(effective_changes, results):
+        if isinstance(result, BaseException):
+            logger.warning(f"增量索引异常: {file_path}: {result}")
+            failed_files.append(file_path)
+        elif result is None:
+            failed_files.append(file_path)
+        else:
+            entries_map[str(result.file_meta.path)] = result
+
+    # 移除已删除文件的条目
+    for path in deleted:
+        entries_map.pop(path, None)
+
+    merged_entries = list(entries_map.values())
+    warnings = [f"增量索引失败: {path}" for path in failed_files]
+
+    # 更新元数据（保留原始 created_at 和 index_version）
+    project_meta = ProjectMeta(
+        root_path=root_path,
+        created_at=existing.project_meta.created_at,
+        index_version=existing.project_meta.index_version,
+        file_count=len(merged_entries),
+        loc_total=sum(e.file_meta.loc for e in merged_entries),
+    )
+
+    build_stats = BuildStats(
+        total_files=len(merged_entries),
+        total_symbols=sum(len(e.symbols) for e in merged_entries),
+        total_edges=sum(len(e.edges) for e in merged_entries),
+        duration_ms=int((time.monotonic() - start_time) * 1000),
+        warnings=warnings,
+    )
+
+    snapshot = IndexSnapshot(
+        project_meta=project_meta,
+        entries=merged_entries,
+        created_at=datetime.now(timezone.utc),
+        build_stats=build_stats,
+    )
+
+    # 写入 Memory
+    await save_index(snapshot, root_path=memory_root_path)
+    await _write_structure_md(merged_entries, memory_root_path)
+
+    logger.info(
+        f"增量索引完成: {len(effective_changes)} 文件更新, "
+        f"{len(deleted)} 文件删除, "
+        f"合计 {len(merged_entries)} 文件, "
+        f"耗时 {build_stats.duration_ms}ms"
+    )
 
     return snapshot

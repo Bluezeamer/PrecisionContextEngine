@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -27,6 +28,35 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 30
+_PROXY_ENV_KEYS = {
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+}
+
+# Serena 写工具：修改代码库的操作，透传给上层 Agent 直接调用，PCE Agent 不参与推理
+EDIT_TOOL_NAMES: set[str] = {
+    "replace_symbol_body",
+    "insert_after_symbol",
+    "insert_before_symbol",
+    "rename_symbol",
+    "create_text_file",
+    "replace_content",
+}
+
+
+def _collect_serena_env() -> dict[str, str]:
+    """收集需要传递给 Serena 子进程的环境变量。"""
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key.startswith("UV_") or key in _PROXY_ENV_KEYS:
+            env[key] = value
+    return env
 
 
 # ============================================================================
@@ -152,7 +182,8 @@ class SerenaClient:
         self._session: ClientSession | None = None
         self._stdio_cm: Any | None = None
         self._session_cm: Any | None = None
-        self._tools_schema: list[dict[str, Any]] = []
+        self._read_tools_schema: list[dict[str, Any]] = []
+        self._edit_tools_schema: list[dict[str, Any]] = []
         self._tool_names: set[str] = set()
         self._project_path: Path | None = None
 
@@ -163,8 +194,13 @@ class SerenaClient:
 
     @property
     def tools_schema(self) -> list[dict[str, Any]]:
-        """返回 litellm/OpenAI function calling 格式的工具列表。供 Agent Loop 使用。"""
-        return list(self._tools_schema)
+        """返回只读工具的 schema 列表（OpenAI function calling 格式）。供 PCE Agent Loop 使用。"""
+        return list(self._read_tools_schema)
+
+    @property
+    def edit_tools_schema(self) -> list[dict[str, Any]]:
+        """返回写工具的 schema 列表（OpenAI function calling 格式）。供上层 Agent 透传调用。"""
+        return list(self._edit_tools_schema)
 
     @property
     def project_path(self) -> Path:
@@ -224,6 +260,7 @@ class SerenaClient:
                 "--project",
                 str(self._project_path),
             ],
+            env=_collect_serena_env(),
         )
 
         try:
@@ -245,8 +282,21 @@ class SerenaClient:
                 self._session.list_tools(), timeout=self._timeout_seconds
             )
             tools = _extract_tools(tools_result)
-            self._tools_schema = [_tool_to_openai_schema(t) for t in tools]
-            self._tool_names = {s["function"]["name"] for s in self._tools_schema}
+            all_schemas = [_tool_to_openai_schema(t) for t in tools]
+            self._tool_names = {s["function"]["name"] for s in all_schemas}
+
+            # 按职责分类：写工具（修改代码库）透传给上层，其余全部留给 PCE Agent
+            read_tools: list[dict[str, Any]] = []
+            edit_tools: list[dict[str, Any]] = []
+            for schema in all_schemas:
+                name = schema["function"]["name"]
+                if name in EDIT_TOOL_NAMES:
+                    edit_tools.append(schema)
+                else:
+                    read_tools.append(schema)
+
+            self._read_tools_schema = read_tools
+            self._edit_tools_schema = edit_tools
 
             logger.info(
                 f"Serena 连接成功: project={self._project_path}, 工具数={len(self._tool_names)}"
@@ -280,7 +330,8 @@ class SerenaClient:
             finally:
                 self._stdio_cm = None
 
-        self._tools_schema = []
+        self._read_tools_schema = []
+        self._edit_tools_schema = []
         self._tool_names = set()
         logger.debug("SerenaClient 已断开连接")
 
@@ -332,9 +383,22 @@ class SerenaClient:
     # 具名工具接口(提供参数提示,内部委托给 call)
     # ============================================================================
 
-    async def list_dir(self, relative_path: str, *, recursive: bool = False) -> Any:
+    async def list_dir(
+        self,
+        relative_path: str,
+        *,
+        recursive: bool = False,
+        skip_ignored_files: bool = False,
+    ) -> Any:
         """列出目录内容。"""
-        return await self.call("list_dir", {"relative_path": relative_path, "recursive": recursive})
+        return await self.call(
+            "list_dir",
+            {
+                "relative_path": relative_path,
+                "recursive": recursive,
+                "skip_ignored_files": skip_ignored_files,
+            },
+        )
 
     async def get_symbols_overview(self, relative_path: str, *, depth: int = 0) -> Any:
         """获取文件的符号概览(类、函数等顶层定义)。"""
