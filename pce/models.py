@@ -286,6 +286,9 @@ class StatusResponse(BaseSchema):
     index_version: Optional[NonEmptyStr] = Field(default=None, description="索引版本号")
     memory_items_count: int = Field(..., ge=0, description="记忆条目数量")
     status_message: NonEmptyStr = Field(..., description="状态描述信息")
+    insight_stats: Optional[InsightStats] = Field(
+        default=None, description="Insight Cache 统计信息（可选）"
+    )
 
 
 # ============================================================================

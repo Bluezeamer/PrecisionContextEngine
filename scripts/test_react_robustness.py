@@ -20,6 +20,11 @@
   T13 — asyncio.TimeoutError 重试耗尽 → __REACT_TIMEOUT__
   T14 — 步数耗尽 → __REACT_MAX_STEPS_EXCEEDED__
   T15 — finish_reason=tool_calls 但 tool_calls 为空（异常响应）→ 纠正后 deliver
+  T16 — spawn 成功：子 Agent deliver，结果回注父消息，父 Agent 最终 deliver
+  T17 — spawn 失败：depth=1 调用 spawn_agent → SUBAGENT_DEPTH_EXCEEDED
+  T18 — spawn 失败：父剩余预算不足最小子预算 → SUBAGENT_BUDGET_REJECTED
+  T19 — 单轮 spawn 次数超过上限：第 4 次 → SUBAGENT_INVALID_ARGS
+  T20 — spawn 参数解析失败（非法 JSON）→ SUBAGENT_INVALID_ARGS
 """
 
 from __future__ import annotations
@@ -27,9 +32,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # 加载 .env
@@ -49,6 +55,7 @@ from pce.agent import (
     _MAX_TIMEOUT_RETRIES,
     _parse_query_response,
 )
+from pce.agent_runtime.contracts import SpawnErrorCode
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -139,6 +146,10 @@ async def run_loop(
     agent: PCEAgent,
     serena: MagicMock,
     response_seq: list[tuple[MagicMock, str]],
+    *,
+    depth: int = 0,
+    deadline: float | None = None,
+    observe: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> str:
     """用 response_seq 依次替换 _completion 的返回值，运行 _run_react_loop。
 
@@ -147,15 +158,28 @@ async def run_loop(
 
     _run_react_loop 现在返回 tuple[str, str | None]，此处只取 answer 部分，
     使测试用例无需感知 confidence 字段。
+
+    额外参数（spawn 测试专用）：
+        depth:    传给 _run_react_loop 的 depth 参数（0=主 Agent，1=子 Agent）
+        deadline: 绝对截止时间；None 时由 agent.max_seconds 决定
+        observe:  每次 _completion 被调用前，将当前 messages 传入此回调，
+                  供测试用例检查已回注的 spawn 结果
     """
     seq = list(response_seq)
 
     async def fake_completion(messages, tools):
+        if observe is not None:
+            observe(messages)
         return seq.pop(0)
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=fake_completion):
-        answer, _ = await agent._run_react_loop(messages, serena)
+        answer, _ = await agent._run_react_loop(
+            messages,
+            serena,
+            depth=depth,
+            deadline=deadline,
+        )
         return answer
 
 
@@ -407,6 +431,249 @@ async def t15_finish_reason_tool_calls_but_empty():
     assert_eq("T15 finish_reason=tool_calls 但无工具 → 纠正后 deliver", result, "答案I")
 
 
+# ── spawn 测试辅助 ────────────────────────────────────────────────────────────
+
+def make_spawn_tc(task: str, allocated_seconds: float = 12.0, **extra: Any) -> dict:
+    """构造一个 spawn_agent tool_call 参数 dict。"""
+    args: dict[str, Any] = {"task": task, "allocated_seconds": allocated_seconds}
+    args.update(extra)
+    return {"name": "spawn_agent", "args": args}
+
+
+def make_raw_spawn_response(raw_arguments: str) -> tuple[MagicMock, str]:
+    """构造 spawn_agent arguments 为任意原始字符串的 _completion 返回值（用于非法 JSON 测试）。"""
+    tc = MagicMock()
+    tc.id = str(uuid.uuid4())
+    tc.type = "function"
+    fn = MagicMock()
+    fn.name = "spawn_agent"
+    fn.arguments = raw_arguments
+    tc.function = fn
+
+    message_dict: dict[str, Any] = {"role": "assistant", "content": "", "tool_calls": [tc]}
+    choice = MagicMock()
+    choice.message = message_dict
+    choice.finish_reason = "tool_calls"
+    response = MagicMock()
+    response.choices = [choice]
+    return response, "tool_calls"
+
+
+def extract_spawn_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从 messages 中提取所有 spawn_agent tool result 的 JSON 内容。"""
+    results = []
+    for msg in messages:
+        if msg.get("role") != "tool" or msg.get("name") != "spawn_agent":
+            continue
+        content = msg.get("content", "")
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                results.append(parsed)
+        except (ValueError, json.JSONDecodeError):
+            pass
+    return results
+
+
+# ── spawn 测试用例 ────────────────────────────────────────────────────────────
+
+async def t16_spawn_success_then_parent_deliver():
+    """spawn 成功：子 Agent deliver，结果回注父消息，父 Agent 最终 deliver。
+
+    response_seq 顺序（父子共享同一 patch）：
+      seq[0] 父: spawn_tc → 触发 invoke_spawn → 子循环启动
+      seq[1] 子: deliver("子答案A") → 子循环正常终止，spawn_result.ok=True
+      seq[2] 父: deliver("父答案A") → 父循环收到 spawn 回注后正常终止
+    """
+    agent = make_agent()
+    serena = make_serena_mock()
+    captured: list[dict[str, Any]] = []
+
+    def observer(messages: list[dict[str, Any]]) -> None:
+        # 每次 _completion 被调用时检查，收集所有 spawn 回注结果
+        captured.clear()
+        captured.extend(extract_spawn_results(messages))
+
+    result = await run_loop(
+        agent,
+        serena,
+        [
+            make_response(tool_calls=[make_spawn_tc("请先完成子任务A", allocated_seconds=12)]),
+            make_response(tool_calls=[make_deliver_tc("子答案A", "high")]),  # 子 Agent
+            make_response(tool_calls=[make_deliver_tc("父答案A", "high")]),  # 父 Agent
+        ],
+        observe=observer,
+    )
+
+    assert_eq("T16 父 Agent 最终 deliver", result, "父答案A")
+    _results.append(("T16 存在 spawn 回注结果", len(captured) >= 1, f"captured={captured!r}"))
+    if captured:
+        assert_eq("T16 spawn ok=True", captured[-1].get("ok"), True)
+        assert_eq("T16 子结论回注 answer", captured[-1].get("answer"), "子答案A")
+
+
+async def t17_spawn_depth_exceeded():
+    """depth=1 时调用 spawn_agent，被 invoke_spawn 拒绝为 SUBAGENT_DEPTH_EXCEEDED。
+
+    depth>=1 时 agent.py 不向 tools_schema 注入 SPAWN_AGENT_TOOL，但分拣逻辑仍然存在；
+    LLM 构造的 spawn_agent 调用会被分拣到 spawn_calls，
+    invoke_spawn(parent_depth=1) 直接返回 SUBAGENT_DEPTH_EXCEEDED 而不会启动子循环。
+    父 Agent 收到错误回注后可继续 deliver。
+    """
+    agent = make_agent()
+    serena = make_serena_mock()
+    captured: list[dict[str, Any]] = []
+
+    def observer(messages: list[dict[str, Any]]) -> None:
+        captured.clear()
+        captured.extend(extract_spawn_results(messages))
+
+    result = await run_loop(
+        agent,
+        serena,
+        [
+            make_response(tool_calls=[make_spawn_tc("不应允许递归", allocated_seconds=12)]),
+            make_response(tool_calls=[make_deliver_tc("深度受限后父级交付")]),
+        ],
+        depth=1,
+        observe=observer,
+    )
+
+    assert_eq("T17 depth=1 后父级仍可 deliver", result, "深度受限后父级交付")
+    _results.append(("T17 存在 spawn 回注结果", len(captured) >= 1, f"captured={captured!r}"))
+    if captured:
+        assert_eq(
+            "T17 错误码 SUBAGENT_DEPTH_EXCEEDED",
+            captured[-1].get("error_code"),
+            SpawnErrorCode.SUBAGENT_DEPTH_EXCEEDED.value,
+        )
+
+
+async def t18_spawn_budget_rejected():
+    """父剩余预算 < MIN_SPAWN_BUDGET(8s) 时，spawn 被拒绝为 SUBAGENT_BUDGET_REJECTED。
+
+    设置 deadline=now+2s，小于最小子预算 8s，invoke_spawn 应直接拒绝。
+    """
+    agent = make_agent()
+    serena = make_serena_mock()
+    captured: list[dict[str, Any]] = []
+
+    def observer(messages: list[dict[str, Any]]) -> None:
+        captured.clear()
+        captured.extend(extract_spawn_results(messages))
+
+    result = await run_loop(
+        agent,
+        serena,
+        [
+            make_response(tool_calls=[make_spawn_tc("预算不足场景", allocated_seconds=30)]),
+            make_response(tool_calls=[make_deliver_tc("预算不足后父级交付")]),
+        ],
+        deadline=time.monotonic() + 2.0,  # 远小于 MIN_SPAWN_BUDGET=8s
+        observe=observer,
+    )
+
+    assert_eq("T18 预算拒绝后父级可继续", result, "预算不足后父级交付")
+    _results.append(("T18 存在 spawn 回注结果", len(captured) >= 1, f"captured={captured!r}"))
+    if captured:
+        assert_eq(
+            "T18 错误码 SUBAGENT_BUDGET_REJECTED",
+            captured[-1].get("error_code"),
+            SpawnErrorCode.SUBAGENT_BUDGET_REJECTED.value,
+        )
+
+
+async def t19_spawn_limit_exceeded_in_one_round():
+    """同一轮发出 4 个 spawn_agent，第 4 次（spawn_count >= MAX_SPAWNS_PER_LOOP=3）被拒绝。
+
+    response_seq：
+      seq[0] 父: 4 个 spawn_tc 同一批 → 串行处理
+      seq[1~3] 子1~3: 各自 deliver
+      seq[4] 父: deliver（整合完成）
+    第 4 次 spawn 被拒绝时不消耗子 seq，spawn_count 不递增。
+    """
+    agent = make_agent()
+    serena = make_serena_mock()
+    all_captured: list[list[dict[str, Any]]] = []
+
+    def observer(messages: list[dict[str, Any]]) -> None:
+        results = extract_spawn_results(messages)
+        if results:
+            all_captured.append(list(results))
+
+    result = await run_loop(
+        agent,
+        serena,
+        [
+            make_response(
+                tool_calls=[
+                    make_spawn_tc("子任务-1", allocated_seconds=12),
+                    make_spawn_tc("子任务-2", allocated_seconds=12),
+                    make_spawn_tc("子任务-3", allocated_seconds=12),
+                    make_spawn_tc("子任务-4", allocated_seconds=12),  # 预期被拒绝
+                ]
+            ),
+            make_response(tool_calls=[make_deliver_tc("子答案1")]),  # child-1
+            make_response(tool_calls=[make_deliver_tc("子答案2")]),  # child-2
+            make_response(tool_calls=[make_deliver_tc("子答案3")]),  # child-3
+            make_response(tool_calls=[make_deliver_tc("父级整合完成")]),
+        ],
+        observe=observer,
+    )
+
+    assert_eq("T19 父 Agent 最终 deliver", result, "父级整合完成")
+
+    # 取最后一次观测到的完整列表（父循环第二轮时包含全部 4 条回注）
+    final_captured = all_captured[-1] if all_captured else []
+    _results.append(("T19 回注 4 条 spawn 结果", len(final_captured) == 4, f"len={len(final_captured)}"))
+    if len(final_captured) == 4:
+        ok_first_three = all(item.get("ok") is True for item in final_captured[:3])
+        _results.append(("T19 前 3 次 spawn 成功", ok_first_three, str(final_captured[:3])))
+        assert_eq(
+            "T19 第 4 次错误码 SUBAGENT_INVALID_ARGS",
+            final_captured[3].get("error_code"),
+            SpawnErrorCode.SUBAGENT_INVALID_ARGS.value,
+        )
+        assert_in(
+            "T19 第 4 次错误提示含'上限'",
+            "上限",
+            str(final_captured[3].get("error_message", "")),
+        )
+
+
+async def t20_spawn_invalid_json_args():
+    """spawn_agent 的 arguments 为非法 JSON，返回 SUBAGENT_INVALID_ARGS 错误结果。
+
+    父 Agent 收到错误回注后仍可继续 deliver。
+    """
+    agent = make_agent()
+    serena = make_serena_mock()
+    captured: list[dict[str, Any]] = []
+
+    def observer(messages: list[dict[str, Any]]) -> None:
+        captured.clear()
+        captured.extend(extract_spawn_results(messages))
+
+    result = await run_loop(
+        agent,
+        serena,
+        [
+            make_raw_spawn_response("{bad json"),
+            make_response(tool_calls=[make_deliver_tc("参数失败后父级交付")]),
+        ],
+        observe=observer,
+    )
+
+    assert_eq("T20 非法 JSON 后父级可继续", result, "参数失败后父级交付")
+    _results.append(("T20 存在 spawn 回注结果", len(captured) >= 1, f"captured={captured!r}"))
+    if captured:
+        assert_eq(
+            "T20 错误码 SUBAGENT_INVALID_ARGS",
+            captured[-1].get("error_code"),
+            SpawnErrorCode.SUBAGENT_INVALID_ARGS.value,
+        )
+
+
 # ── 兜底标记解析测试 ──────────────────────────────────────────────────────────
 
 def test_fallback_markers():
@@ -443,6 +710,11 @@ async def main():
         t13_timeout_exhausted,
         t14_max_steps_exceeded,
         t15_finish_reason_tool_calls_but_empty,
+        t16_spawn_success_then_parent_deliver,
+        t17_spawn_depth_exceeded,
+        t18_spawn_budget_rejected,
+        t19_spawn_limit_exceeded_in_one_round,
+        t20_spawn_invalid_json_args,
     ]
 
     print(f"\n{'='*60}")

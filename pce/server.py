@@ -29,6 +29,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from .agent import PCEAgent
+from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
 from .staging import DirtyState, FileWatcher, StagingArea
 from .memory import get_status, index_exists
@@ -241,11 +242,13 @@ class PCEContext:
         serena_path: Path,
         serena_client: SerenaClient,
         agent: PCEAgent,
+        insight_cache: InsightCache,
     ) -> None:
         self.project_path = project_path
         self.serena_path = serena_path
         self.serena_client = serena_client
         self.agent = agent
+        self.insight_cache = insight_cache
         self._sync_lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._initialized = False
@@ -387,12 +390,16 @@ class PCEContext:
         root = Path(project_path).resolve() if project_path else self.project_path
         status = await get_status(root_path=root)
         staging_summary = await self.staging.summary()
+        # 使用与当前项目对应的 InsightCache；若查询路径不同则临时构建
+        cache = self.insight_cache if root == self.project_path else InsightCache(root)
+        insight_stats = await cache.stats()
         return {
             **status,
             "initialized": await index_exists(root_path=root),
             "project_path": str(root),
             "staging": staging_summary,
             "watcher_running": self.watcher.running,
+            "insight_stats": insight_stats.model_dump(mode="json"),
         }
 
     async def handle_edit(
@@ -460,6 +467,10 @@ class PCEContext:
                 f"{snapshot.build_stats.total_files} 文件, "
                 f"{snapshot.build_stats.total_symbols} 符号"
             )
+
+        # Insight Cache stale sweep 在锁外执行，避免遍历 I/O 延长临界区
+        stale_marked = await self.insight_cache.sweep_stale()
+        logger.info(f"pce_sync: Insight Cache stale sweep 完成，新标记 {stale_marked} 条")
 
         return {
             "success": True,
@@ -544,8 +555,9 @@ async def serve() -> None:
     except Exception as e:
         logger.error(f"Serena 连接失败: {e},将在首次工具调用时重试")
 
-    agent = PCEAgent()
-    ctx = PCEContext(project_path, serena_path, serena_client, agent)
+    insight_cache = InsightCache(project_path)
+    agent = PCEAgent(insight_cache=insight_cache)
+    ctx = PCEContext(project_path, serena_path, serena_client, agent, insight_cache)
 
     # 启动文件监听
     await ctx.watcher.start()

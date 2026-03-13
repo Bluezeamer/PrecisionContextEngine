@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from pce.agent_runtime.contracts import SpawnErrorCode
 from pce.serena_client import SerenaToolError
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,42 @@ def _rule_find_file(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _rule_spawn_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """模拟 spawn_agent 返回结构，供 agent_playground 等离线场景使用。
+
+    注意：spawn_agent 在 agent.py 层直接分拣处理，不经过 MockToolProvider.call()；
+    此规则仅在需要通过 MockToolProvider 测试 spawn 工具 schema 验证或 playground 时生效。
+    """
+    task = str(args.get("task", "")).strip()
+    try:
+        allocated_seconds = float(args.get("allocated_seconds", 0.0))
+    except (TypeError, ValueError):
+        allocated_seconds = 0.0
+
+    if not task or allocated_seconds <= 0:
+        return {
+            "ok": False,
+            "task_id": "mock-spawn-invalid",
+            "status": "failed",
+            "answer": "",
+            "confidence": "low",
+            "elapsed_seconds": 0.0,
+            "error_code": SpawnErrorCode.SUBAGENT_INVALID_ARGS.value,
+            "error_message": "spawn_agent 参数无效（mock rule）",
+        }
+
+    return {
+        "ok": True,
+        "task_id": "mock-spawn-ok",
+        "status": "completed",
+        "answer": f"mock 子任务完成: {task}",
+        "confidence": "medium",
+        "elapsed_seconds": 0.01,
+        "error_code": None,
+        "error_message": None,
+    }
+
+
 DEFAULT_RULES: dict[str, RuleHandler] = {
     "find_symbol": _rule_find_symbol,
     "find_referencing_symbols": _rule_find_referencing_symbols,
@@ -271,6 +308,7 @@ DEFAULT_RULES: dict[str, RuleHandler] = {
     "search_for_pattern": _rule_search_for_pattern,
     "list_dir": _rule_list_dir,
     "find_file": _rule_find_file,
+    "spawn_agent": _rule_spawn_agent,
 }
 
 
