@@ -71,7 +71,8 @@ def assert_in(label: str, needle: str, haystack: str) -> bool:
 
 
 def make_agent(max_steps: int = 10) -> PCEAgent:
-    return PCEAgent(model="fake-model", max_steps=max_steps)
+    # PCEAgent 是时间驱动（max_seconds），给足预算使测试不触发时间截止
+    return PCEAgent(model="fake-model", max_seconds=float(max_steps * 60))
 
 
 def make_serena_mock(tool_result: str = "工具执行成功") -> MagicMock:
@@ -143,6 +144,9 @@ async def run_loop(
 
     注意：不能用 next(iter(...))，StopIteration 在 async 函数中会变成 RuntimeError。
     改用 list.pop(0)，序列耗尽时抛出 IndexError（会被测试框架捕获报告）。
+
+    _run_react_loop 现在返回 tuple[str, str | None]，此处只取 answer 部分，
+    使测试用例无需感知 confidence 字段。
     """
     seq = list(response_seq)
 
@@ -151,7 +155,8 @@ async def run_loop(
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=fake_completion):
-        return await agent._run_react_loop(messages, serena)
+        answer, _ = await agent._run_react_loop(messages, serena)
+        return answer
 
 
 # ── 测试用例 ──────────────────────────────────────────────────────────────────
@@ -335,7 +340,7 @@ async def t12_timeout_retry_success():
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=fake_completion_with_timeout):
-        result = await agent._run_react_loop(messages, serena)
+        result, _ = await agent._run_react_loop(messages, serena)
 
     assert_eq("T12 超时重试成功", result, "答案H")
     ok = call_count == 2
@@ -352,23 +357,34 @@ async def t13_timeout_exhausted():
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=always_timeout):
-        result = await agent._run_react_loop(messages, serena)
+        result, _ = await agent._run_react_loop(messages, serena)
 
     assert_eq("T13 超时耗尽", result, "__REACT_TIMEOUT__")
 
 
 async def t14_max_steps_exceeded():
-    """步数耗尽 → __REACT_MAX_STEPS_EXCEEDED__"""
-    max_steps = 3
-    agent = make_agent(max_steps=max_steps)
+    """PCEAgent 是时间驱动，无步数上限。
+    验证：第一轮成功（返回 Serena 工具调用，循环继续），
+    第二轮进入前时间预算已耗尽，返回 __REACT_TIMEOUT_BUDGET__。
+    """
+    agent = PCEAgent(model="fake-model", max_seconds=0.01)
     serena = make_serena_mock()
-    # 每步都调 Serena，永远不 deliver
-    responses = [
-        make_response(tool_calls=[make_tool_tc()], finish_reason="tool_calls")
-        for _ in range(max_steps)
-    ]
-    result = await run_loop(agent, serena, responses)
-    assert_eq("T14 步数耗尽", result, "__REACT_MAX_STEPS_EXCEEDED__")
+    call_count = 0
+
+    async def completion_that_delays(messages, tools):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # 第一轮：返回 Serena 工具调用，但先消耗足够时间让预算到下一轮时耗尽
+            await asyncio.sleep(0.02)
+            return make_response(tool_calls=[make_tool_tc()], finish_reason="tool_calls")
+        return make_response(tool_calls=[make_deliver_tc("不应到达")])
+
+    messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
+    with patch.object(agent, "_completion", side_effect=completion_that_delays):
+        result, _ = await agent._run_react_loop(messages, serena)
+
+    assert_eq("T14 时间预算耗尽", result, "__REACT_TIMEOUT_BUDGET__")
 
 
 async def t15_finish_reason_tool_calls_but_empty():

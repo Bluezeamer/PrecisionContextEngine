@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -28,7 +29,17 @@ AcknowledgeCallback = Callable[[list[str]], Awaitable[None]]
 import aiofiles
 import litellm
 
-from .models import ImpactResponse, QueryResponse, ReferenceEdge, SymbolRef
+from .agent_runtime.contracts import (
+    MAX_SPAWNS_PER_LOOP,
+    SPAWN_AGENT_TOOL,
+    SpawnErrorCode,
+    SpawnRequest,
+    SpawnResult,
+    SpawnStatus,
+)
+from .agent_runtime.spawner import invoke_spawn
+from .insight_cache import InsightCache
+from .models import ImpactResponse, InsightConfidence, QueryResponse, ReferenceEdge, SymbolRef
 from .serena_client import SerenaClient, SerenaClientError
 
 logger = logging.getLogger(__name__)
@@ -61,6 +72,28 @@ SYSTEM_PROMPT_HEADER = """\
 - 回答任何关于项目代码的问题前,必须先通过 tool_calls 调用 Serena 工具获取证据
 - 若已获取的证据不足,继续调用工具,不要凭推测作答
 - 完成推理后,必须调用 deliver 工具提交最终结论,禁止直接以文字形式回答
+
+**spawn_agent 使用策略**:
+spawn_agent 将一个"可独立求解"的子问题委托给子 Agent 推理，子 Agent 拥有独立上下文，
+完成后将核心结论以 tool result 形式返回。它不是默认路径，而是隔离复杂子任务的手段。
+
+适合 spawn 的判断标准（核心）：子问题可在不依赖主线历史的情况下独立求解，
+且自身需要多步工具检索，放在主线会显著分散推理焦点。
+
+推荐场景:
+- 需要多步追踪的局部分析（如：先定位符号再追所有引用）
+- 平行的子模块调查（如：同时了解 A 模块和 B 模块的实现）
+- 预计证据收集耗时较长、结果可被主线直接消费的任务
+
+不要使用 spawn_agent 的场景:
+- 一两次 Serena 工具调用就能完成的简单查询——直接调工具更快
+- 需要依赖主线全局上下文才能作答的任务
+- 时间预算所剩不多时，应立即整合已有信息直接 deliver
+- spawn 次数已接近上限（上限为 3 次），优先留给最复杂的子任务
+
+处理 spawn_agent 返回结果:
+- ok=true：将 answer 作为待整合的子结论，必要时补充工具验证后并入主线
+- ok=false：不要中断；根据 error_code 降级为直接调用 Serena 工具继续推理
 
 **交付格式指引**:
 上层 Agent 可在 query 中明确指定期望格式,PCE Agent 必须严格遵从。未明确指定时,按以下默认规则选择格式:
@@ -140,6 +173,13 @@ _MAX_NO_TOOL_RETRIES = 3
 _MAX_LENGTH_CONT = 2
 # 单次 LLM 调用超时的最大重试次数
 _MAX_TIMEOUT_RETRIES = 1
+# Insight Cache 注入与蒸馏参数
+_INSIGHT_TOP_K = 5
+_INSIGHT_TOKEN_BUDGET = 4000   # 字符数上限（粗略估算 token）
+_INSIGHT_MAX_SCOPES = 3        # 每次 deliver 最多写入的 scope 数量
+_INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
+# 从文本中提取形如 pce/agent.py 或 ./src/foo.py:123 的路径
+_PATH_RE = re.compile(r"(?<![\w./-])(?:\./)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::\d+)?")
 
 
 # ============================================================================
@@ -379,12 +419,120 @@ class PCEAgent:
         self,
         model: str | None = None,
         max_seconds: float = MAX_SECONDS,
+        insight_cache: InsightCache | None = None,
     ) -> None:
         self._model = model or MODEL
         self._max_seconds = max_seconds
         self._deliver_tool = DELIVER_TOOL
+        self._insight_cache = insight_cache
         # in-memory 会话存储,进程重启后丢失(MVP 范围内可接受)
         self._sessions: dict[str, list[dict[str, Any]]] = {}
+
+
+    # =========================================================================
+    # Insight 蒸馏辅助
+    # =========================================================================
+
+    @staticmethod
+    def _confidence_from_str(value: str | None) -> InsightConfidence:
+        """将 deliver 返回的置信度字符串映射为 InsightConfidence 枚举。"""
+        if value == "high":
+            return InsightConfidence.HIGH
+        if value == "low":
+            return InsightConfidence.LOW
+        return InsightConfidence.MEDIUM
+
+    def _extract_path_candidates(self, text: str) -> list[str]:
+        """从文本中提取候选相对路径（去重，保留出现顺序）。"""
+        seen: set[str] = set()
+        result: list[str] = []
+        for m in _PATH_RE.finditer(text):
+            candidate = m.group(1).removeprefix("./")
+            if candidate not in seen:
+                seen.add(candidate)
+                result.append(candidate)
+        return result
+
+    def _pick_insight_scopes(self, answer: str, question: str) -> list[str]:
+        """从 answer + question 中选出真实存在于项目根目录下的相对文件路径。
+
+        优先取 answer 中出现的路径（更贴近结论），再回退到 question。
+        最多返回 _INSIGHT_MAX_SCOPES 个。
+        """
+        if self._insight_cache is None:
+            return []
+        root = self._insight_cache.project_root
+        ordered = self._extract_path_candidates(answer) + self._extract_path_candidates(question)
+
+        scopes: list[str] = []
+        seen: set[str] = set()
+        for candidate in ordered:
+            try:
+                resolved = (root / candidate).resolve()
+                rel = resolved.relative_to(root).as_posix()
+            except (ValueError, OSError):
+                continue
+            if not resolved.is_file():
+                continue
+            if rel in seen:
+                continue
+            seen.add(rel)
+            scopes.append(rel)
+            if len(scopes) >= _INSIGHT_MAX_SCOPES:
+                break
+        return scopes
+
+    @staticmethod
+    def _distill_insight_content(question: str, answer: str, scope: str) -> str:
+        """将 question/answer 对蒸馏为与 scope 相关的紧凑 insight 内容。"""
+        # 问题截断
+        q = " ".join(question.strip().split())
+        if len(q) > 220:
+            q = q[:220].rstrip() + "..."
+
+        # 优先提取 answer 中包含 scope 的行作为核心结论
+        lines = [ln.strip() for ln in answer.splitlines() if scope in ln and ln.strip()][:8]
+        if lines:
+            core = "\n".join(f"- {ln}" for ln in lines)
+        else:
+            # 回退：取 answer 全文（空白折叠）
+            core = " ".join(answer.strip().split())
+
+        content = f"问题: {q}\n与 {scope} 相关结论:\n{core}"
+        if len(content) > _INSIGHT_MAX_CONTENT_CHARS:
+            content = content[:_INSIGHT_MAX_CONTENT_CHARS].rstrip() + "..."
+        return content
+
+    async def _persist_insights(
+        self,
+        question: str,
+        answer: str,
+        confidence: str | None,
+    ) -> None:
+        """将 deliver 结果蒸馏后写入 InsightCache。
+
+        仅在配置了 insight_cache 且 answer 不是异常兜底字符串时执行。
+        失败不抛出，仅记录警告。
+        """
+        if self._insight_cache is None:
+            return
+        if answer.startswith("__REACT_"):
+            return
+
+        scopes = self._pick_insight_scopes(answer, question)
+        if not scopes:
+            return
+
+        conf = self._confidence_from_str(confidence)
+        for scope in scopes:
+            content = self._distill_insight_content(question, answer, scope)
+            try:
+                await self._insight_cache.upsert(scope=scope, content=content, confidence=conf)
+                logger.debug(f"Insight 蒸馏写入: scope={scope}")
+            except FileNotFoundError:
+                logger.debug(f"Insight scope 文件不存在，跳过: {scope}")
+            except Exception as e:
+                logger.warning(f"Insight upsert 失败: scope={scope}: {e}")
 
     async def _read_pce_file(self, path: Path) -> str:
         """读取 .pce 目录下的文件内容,文件不存在时返回占位文本。"""
@@ -398,14 +546,17 @@ class PCEAgent:
             return f"(读取 {path.name} 失败)"
 
     async def _build_system_prompt(self, memory_root: Path | None) -> str:
-        """构建 system prompt,注入 structure.md 和 annotations.md 内容。"""
+        """构建 system prompt,注入 structure.md 和 annotations.md 内容。
+
+        若 insight_cache 已配置，在末尾追加动态认知块（top-k 条目）。
+        """
         root = memory_root or Path.cwd()
         pce_dir = root / ".pce"
 
         structure_md = await self._read_pce_file(pce_dir / "structure.md")
         annotations_md = await self._read_pce_file(pce_dir / "annotations.md")
 
-        return "\n".join([
+        sections = [
             SYSTEM_PROMPT_HEADER,
             "",
             "## 项目结构 (structure.md)",
@@ -413,7 +564,26 @@ class PCEAgent:
             "",
             "## 语义注解 (annotations.md)",
             annotations_md.strip(),
-        ])
+        ]
+
+        if self._insight_cache is not None:
+            try:
+                injected, _ = await self._insight_cache.get_top_k(
+                    k=_INSIGHT_TOP_K,
+                    token_budget=_INSIGHT_TOKEN_BUDGET,
+                )
+                if injected.strip():
+                    sections += [
+                        "",
+                        "## 动态认知提示",
+                        "以下内容来自历史会话蒸馏，可能过时；必须通过工具验证后再使用。",
+                        "",
+                        injected.strip(),
+                    ]
+            except Exception as e:
+                logger.warning(f"读取 Insight Cache 失败，忽略本轮注入: {e}")
+
+        return "\n".join(sections)
 
     async def _completion(
         self,
@@ -561,8 +731,14 @@ class PCEAgent:
         messages: list[dict[str, Any]],
         serena_client: SerenaClient,
         acknowledge_cb: AcknowledgeCallback | None = None,
-    ) -> str:
+        depth: int = 0,
+        deadline: float | None = None,
+    ) -> tuple[str, str | None]:
         """执行 ReAct 循环直到 agent 调用 deliver 或超出时长预算。
+
+        Returns:
+            (answer, confidence)，正常终止时 confidence 为 deliver 提供的置信度字符串，
+            异常终止时 confidence 为 None。
 
         终止路径:
           正常: agent 调用 deliver(answer=...)
@@ -577,24 +753,31 @@ class PCEAgent:
           length_continuations — finish_reason=length 触发续写
           timeout_retries      — 每步内独立，asyncio.TimeoutError
         """
-        # 构建工具列表：Serena 只读工具 + 虚拟终止工具 + 认知确认工具（可选）
+        # 构建工具列表：Serena 只读工具 + 虚拟终止工具 + 可选工具
         tools_schema = serena_client.tools_schema + [self._deliver_tool]
+        if depth == 0:
+            # 子 Agent（depth>=1）不能递归 spawn，仅主 Agent 注入该工具
+            tools_schema = tools_schema + [SPAWN_AGENT_TOOL]
         if acknowledge_cb is not None:
             tools_schema = tools_schema + [ACKNOWLEDGE_TOOL]
 
         no_tool_retries = 0
         length_continuations = 0
+        spawn_count = 0  # 本循环内 spawn 次数，不超过 MAX_SPAWNS_PER_SESSION
         token_used = 0
         compact_failed = False
         start = time.monotonic()
+        # 使用绝对 deadline，支持父子 Agent 共享同一时间轴
+        if deadline is None:
+            deadline = start + self._max_seconds
 
         while True:
             # ── 时间预算检查 ──────────────────────────────────────────────────
-            if time.monotonic() - start >= self._max_seconds:
+            if time.monotonic() >= deadline:
                 logger.warning(
-                    f"ReAct 循环超出总时长预算 {self._max_seconds}s，强制终止"
+                    f"ReAct 循环超出截止时间（depth={depth}），强制终止"
                 )
-                return "__REACT_TIMEOUT_BUDGET__"
+                return "__REACT_TIMEOUT_BUDGET__", None
 
             # ── 上下文 compact 检查 ───────────────────────────────────────────
             messages, token_used, compact_failed = await self._maybe_compact(
@@ -617,7 +800,7 @@ class PCEAgent:
                         )
                         continue
                     logger.warning("模型调用超时，重试次数耗尽，强制终止")
-                    return "__REACT_TIMEOUT__"
+                    return "__REACT_TIMEOUT__", None
 
             token_used = self._extract_next_prompt_size(response)
 
@@ -633,7 +816,7 @@ class PCEAgent:
                 length_continuations += 1
                 if length_continuations > _MAX_LENGTH_CONT:
                     logger.warning("输出截断续写次数耗尽，强制终止")
-                    return "__REACT_LENGTH_EXHAUSTED__"
+                    return "__REACT_LENGTH_EXHAUSTED__", None
                 if message.get("content"):
                     # 推理文字被截断：保留已有内容，追加"请继续"
                     messages.append(message)
@@ -676,12 +859,13 @@ class PCEAgent:
                     })
                 else:
                     logger.warning("无 tool_calls 纠正次数耗尽，强制终止循环")
-                    return "__REACT_NO_TOOL_EXHAUSTED__"
+                    return "__REACT_NO_TOOL_EXHAUSTED__", None
                 continue
 
-            # ── 分拣 deliver、acknowledge 与 Serena 工具调用 ──────────────────
+            # ── 分拣 deliver、acknowledge、spawn 与 Serena 工具调用 ────────────
             deliver_call = None
             acknowledge_calls = []
+            spawn_calls = []
             serena_calls = []
             for tc in tool_calls:
                 if isinstance(tc, dict):
@@ -694,6 +878,8 @@ class PCEAgent:
                     deliver_call = tc
                 elif name == "acknowledge_changes":
                     acknowledge_calls.append(tc)
+                elif name == "spawn_agent":
+                    spawn_calls.append(tc)
                 else:
                     serena_calls.append(tc)
 
@@ -704,6 +890,93 @@ class PCEAgent:
                 )
                 for result_msg in tool_results:
                     messages.append({"role": "tool", **result_msg})
+
+            # ── 处理 spawn_agent 调用（串行，避免子任务并发挤占预算）────────────
+            for tc in spawn_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    tc_id = tc.get("id") or str(uuid.uuid4())
+                    raw_args = fn.get("arguments") or tc.get("arguments")
+                else:
+                    fn = getattr(tc, "function", None)
+                    tc_id = getattr(tc, "id", None) or str(uuid.uuid4())
+                    raw_args = getattr(fn, "arguments", None)
+
+                args = _parse_tool_call_args(raw_args)
+                if args is None:
+                    spawn_result = SpawnResult(
+                        ok=False,
+                        task_id=str(uuid.uuid4()),
+                        status=SpawnStatus.FAILED,
+                        answer="",
+                        confidence="low",
+                        elapsed_seconds=0.0,
+                        error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
+                        error_message="spawn_agent 参数解析失败：无效 JSON",
+                    )
+                elif spawn_count >= MAX_SPAWNS_PER_LOOP:
+                    spawn_result = SpawnResult(
+                        ok=False,
+                        task_id=str(uuid.uuid4()),
+                        status=SpawnStatus.FAILED,
+                        answer="",
+                        confidence="low",
+                        elapsed_seconds=0.0,
+                        error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
+                        error_message=(
+                            f"本次循环 spawn 次数已达上限（max={MAX_SPAWNS_PER_LOOP}），"
+                            "请直接调用 Serena 工具或整合已有信息后 deliver。"
+                        ),
+                    )
+                else:
+                    try:
+                        request = SpawnRequest(
+                            task=str(args.get("task", "")).strip(),
+                            allocated_seconds=float(args.get("allocated_seconds", 0.0)),
+                            expected_output=str(args.get("expected_output", "") or ""),
+                            context=(
+                                args["context"]
+                                if isinstance(args.get("context"), dict)
+                                else {}
+                            ),
+                            strict=bool(args.get("strict", False)),
+                        )
+                        if not request.task:
+                            raise ValueError("task 不能为空")
+                    except Exception as exc:
+                        spawn_result = SpawnResult(
+                            ok=False,
+                            task_id=str(uuid.uuid4()),
+                            status=SpawnStatus.FAILED,
+                            answer="",
+                            confidence="low",
+                            elapsed_seconds=0.0,
+                            error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
+                            error_message=f"spawn_agent 参数无效: {exc}",
+                        )
+                    else:
+                        spawn_result = await invoke_spawn(
+                            request=request,
+                            serena_client=serena_client,
+                            parent_depth=depth,
+                            parent_deadline=deadline,
+                            run_loop_fn=self._run_react_loop,
+                        )
+                        spawn_count += 1
+                        # 子 Agent 成功结论也写入 InsightCache
+                        if spawn_result.ok:
+                            await self._persist_insights(
+                                question=request.task,
+                                answer=spawn_result.answer,
+                                confidence=spawn_result.confidence,
+                            )
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": "spawn_agent",
+                    "content": _safe_json_dumps(spawn_result.to_tool_content()),
+                })
 
             # 处理认知确认调用
             for tc in acknowledge_calls:
@@ -743,14 +1016,15 @@ class PCEAgent:
                 args = _parse_tool_call_args(raw_args)
                 if args is None:
                     logger.warning("deliver 调用参数解析失败")
-                    return "__REACT_DELIVER_EMPTY__"
+                    return "__REACT_DELIVER_EMPTY__", None
                 answer = args.get("answer")
                 if not answer:
                     logger.warning("deliver 调用缺少 answer 参数")
-                    return "__REACT_DELIVER_EMPTY__"
+                    return "__REACT_DELIVER_EMPTY__", None
+                confidence = args.get("confidence")
                 elapsed = time.monotonic() - start
                 logger.debug(f"ReAct 循环收到 deliver，正常终止（耗时 {elapsed:.1f}s）")
-                return str(answer)
+                return str(answer), str(confidence) if confidence else None
 
             # 本轮仅有 Serena 工具调用，重置无工具计数，继续下一轮
             no_tool_retries = 0
@@ -845,8 +1119,9 @@ class PCEAgent:
             messages = [{"role": "system", "content": system_content}]
 
         messages.append({"role": "user", "content": question})
-        answer = await self._run_react_loop(messages, serena_client, acknowledge_cb)
+        answer, confidence = await self._run_react_loop(messages, serena_client, acknowledge_cb)
         self._sessions[sid] = messages
+        await self._persist_insights(question=question, answer=answer, confidence=confidence)
 
         return _parse_query_response(answer, sid)
 
@@ -900,7 +1175,8 @@ class PCEAgent:
         ])
 
         messages.append({"role": "user", "content": prompt})
-        answer = await self._run_react_loop(messages, serena_client, acknowledge_cb)
+        answer, confidence = await self._run_react_loop(messages, serena_client, acknowledge_cb)
         self._sessions[sid] = messages
+        await self._persist_insights(question=prompt, answer=answer, confidence=confidence)
 
         return _parse_impact_response(answer, sid)

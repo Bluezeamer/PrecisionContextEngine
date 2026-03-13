@@ -286,3 +286,70 @@ class StatusResponse(BaseSchema):
     index_version: Optional[NonEmptyStr] = Field(default=None, description="索引版本号")
     memory_items_count: int = Field(..., ge=0, description="记忆条目数量")
     status_message: NonEmptyStr = Field(..., description="状态描述信息")
+
+
+# ============================================================================
+# Insight Cache
+# ============================================================================
+
+
+class InsightConfidence(str, Enum):
+    """Insight 条目置信度枚举。"""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class InsightEntry(BaseSchema):
+    """Insight 完整条目，用于写入 entries/{uuid}.json。"""
+
+    id: UUIDStr = Field(..., description="条目唯一 ID（UUID）")
+    scope: NonEmptyStr = Field(..., description="作用域（相对项目根的文件路径）")
+    content: NonEmptyStr = Field(..., description="蒸馏后的模块级理解内容")
+    confidence: InsightConfidence = Field(
+        default=InsightConfidence.MEDIUM, description="条目置信度"
+    )
+    created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
+    last_referenced_at: UTCDateTime = Field(..., description="最后引用时间（UTC）")
+    source_hash: NonEmptyStr = Field(..., description="创建时源文件的 SHA256 哈希")
+    supersedes: Optional[UUIDStr] = Field(
+        default=None, description="被当前条目覆盖的旧条目 ID（可选）"
+    )
+
+
+class InsightIndexRecord(BaseSchema):
+    """Insight 索引记录，不含 content，用于 index.json。"""
+
+    id: UUIDStr = Field(..., description="条目唯一 ID（UUID）")
+    scope: NonEmptyStr = Field(..., description="作用域（相对项目根的文件路径）")
+    confidence: InsightConfidence = Field(..., description="条目置信度")
+    created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
+    last_referenced_at: UTCDateTime = Field(..., description="最后引用时间（UTC）")
+    source_hash: NonEmptyStr = Field(..., description="创建时源文件的 SHA256 哈希")
+    supersedes: Optional[UUIDStr] = Field(
+        default=None, description="被当前条目覆盖的旧条目 ID（可选）"
+    )
+    stale: bool = Field(default=False, description="是否已过时")
+    stale_checked_at: Optional[UTCDateTime] = Field(
+        default=None, description="最近一次 stale 检查时间（UTC）"
+    )
+
+
+class InsightIndex(BaseSchema):
+    """Insight Cache 索引文件结构。"""
+
+    version: str = Field(default="1", description="索引版本号")
+    updated_at: UTCDateTime = Field(..., description="索引更新时间（UTC）")
+    records: dict[str, InsightIndexRecord] = Field(
+        default_factory=dict, description="索引记录映射（key 为条目 ID）"
+    )
+
+
+class InsightStats(BaseSchema):
+    """Insight Cache 统计信息（用于 pce_status）。"""
+
+    total_entries: int = Field(..., ge=0, description="条目总数")
+    active_entries: int = Field(..., ge=0, description="活跃条目数")
+    stale_entries: int = Field(..., ge=0, description="过时条目数")
+    last_updated: Optional[UTCDateTime] = Field(default=None, description="最后更新时间（UTC）")

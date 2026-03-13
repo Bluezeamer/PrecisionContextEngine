@@ -44,6 +44,7 @@ if _env_path.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 from pce.agent import PCEAgent  # noqa: E402
+from pce.insight_cache import InsightCache  # noqa: E402
 from pce.mock_tool_provider import MockToolProvider, RecordingProxy  # noqa: E402
 from pce.models import QueryResponse  # noqa: E402
 
@@ -124,9 +125,10 @@ async def run_single_query(
     model: str | None = None,
     max_seconds: float = 300,
     memory_root: Path | None = None,
+    insight_cache: InsightCache | None = None,
 ) -> tuple[QueryResponse, float]:
     """执行单次查询，新建 agent 实例（验证无状态设计）。"""
-    agent = PCEAgent(model=model, max_seconds=max_seconds)
+    agent = PCEAgent(model=model, max_seconds=max_seconds, insight_cache=insight_cache)
 
     start = time.monotonic()
     response = await agent.query(
@@ -147,11 +149,20 @@ async def run_single_query(
 async def run_mock(args: argparse.Namespace) -> None:
     """Mock 模式：使用 MockToolProvider 执行单次查询。"""
     recording_path = Path(args.recording) if args.recording else None
+    project_path = Path(args.memory_root) if args.memory_root else _project_root
     provider = MockToolProvider(
-        project_path=args.memory_root or _project_root,
+        project_path=str(project_path),
         recording_path=recording_path,
         strict=args.strict,
     )
+
+    # 若 --project-path 指定了真实项目目录，启用 InsightCache
+    insight_cache: InsightCache | None = None
+    cache_root = Path(args.project_path) if getattr(args, "project_path", None) else None
+    if cache_root and cache_root.is_dir():
+        insight_cache = InsightCache(project_root=cache_root)
+        await insight_cache.ensure_layout()
+        logger.info("InsightCache 已启用: %s", cache_root / ".pce" / "insights")
 
     logger.info(
         "Mock 模式启动 (规则: %d, 预录: %d)",
@@ -164,10 +175,15 @@ async def run_mock(args: argparse.Namespace) -> None:
         tool_provider=provider,
         model=args.model,
         max_seconds=args.max_seconds,
-        memory_root=Path(args.memory_root) if args.memory_root else None,
+        memory_root=project_path,
+        insight_cache=insight_cache,
     )
 
     _print_result(response, elapsed, provider.stats)
+
+    if insight_cache is not None:
+        stats = await insight_cache.stats()
+        print(f"\n[InsightCache] 总条目: {stats.total_entries}  活跃: {stats.active_entries}  过时: {stats.stale_entries}")
 
 
 # ============================================================================
@@ -200,13 +216,18 @@ async def run_repl(args: argparse.Namespace) -> None:
         provider = recorder
         print(f"录制模式已启用，完成后用 :save <path> 或退出时自动保存到 {args.recording}")
 
+    # 启用 InsightCache
+    insight_cache = InsightCache(project_root=project_path)
+    await insight_cache.ensure_layout()
+    print(f"InsightCache 已启用: {project_path / '.pce' / 'insights'}")
+
     # 可选的 prompt-template
     if args.prompt_template:
         _apply_prompt_template(Path(args.prompt_template))
 
     # 如果提供了 --query，先执行一次
     if args.query:
-        await _repl_run_query(args, provider, recorder)
+        await _repl_run_query(args, provider, recorder, insight_cache=insight_cache)
 
     # REPL 循环
     print("\n输入查询或特殊命令 (:reload, :save <path>, :stats, :quit)")
@@ -257,7 +278,8 @@ async def run_repl(args: argparse.Namespace) -> None:
                 tool_provider=provider,
                 model=args.model,
                 max_seconds=args.max_seconds,
-                memory_root=Path(args.memory_root) if args.memory_root else None,
+                memory_root=project_path,
+                insight_cache=insight_cache,
             )
             stats = recorder.stats if recorder else None
             _print_result(response, elapsed, stats)
@@ -278,6 +300,8 @@ async def _repl_run_query(
     args: argparse.Namespace,
     provider: Any,
     recorder: RecordingProxy | None,
+    *,
+    insight_cache: InsightCache | None = None,
 ) -> None:
     """在 REPL 模式下执行 --query 提供的首条查询。"""
     try:
@@ -286,7 +310,8 @@ async def _repl_run_query(
             tool_provider=provider,
             model=args.model,
             max_seconds=args.max_seconds,
-            memory_root=Path(args.memory_root) if args.memory_root else None,
+            memory_root=Path(args.project_path).resolve() if getattr(args, "project_path", None) else None,
+            insight_cache=insight_cache,
         )
         stats = recorder.stats if recorder else None
         _print_result(response, elapsed, stats)
