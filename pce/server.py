@@ -119,13 +119,13 @@ def _build_edit_tools(edit_tools_schema: list[dict[str, Any]]) -> list[Tool]:
 
 def _build_tools(
     *,
-    initialized: bool,
     edit_tools_schema: list[dict[str, Any]] | None = None,
 ) -> list[Tool]:
     """构建 MCP 工具定义。
 
-    未初始化时只暴露 pce_init 和 pce_status；
-    初始化完成后暴露全套工具（含写工具透传）。
+    始终暴露核心工具（含 pce_query / pce_impact / pce_sync）；
+    写工具是否暴露取决于 edit_tools_schema（需初始化后才有）。
+    未初始化时调用核心工具，call_tool 会返回 NOT_INITIALIZED 错误引导 agent 先调 pce_init。
     """
     # 始终可用：init 与 status 不依赖项目初始化
     always_available: list[Tool] = [
@@ -164,10 +164,7 @@ def _build_tools(
         ),
     ]
 
-    if not initialized:
-        return always_available
-
-    # 初始化完成后额外暴露的工具
+    # 始终暴露的核心查询/分析工具；未初始化时由 call_tool 返回 NOT_INITIALIZED 引导先调 pce_init
     post_init: list[Tool] = [
         Tool(
             name="pce_query",
@@ -180,6 +177,7 @@ def _build_tools(
                 trigger=(
                     "需要理解模块职责、查找函数/类定义、理解调用关系时调用。"
                     "也应在准备修改某段代码前使用,用于精确定位目标符号的 name_path 与行号范围。"
+                    "需先调用 pce_init 初始化项目。"
                 ),
                 replaces=(
                     "替代传统 ls + cat + grep 的多步探索链;"
@@ -209,7 +207,10 @@ def _build_tools(
                     "可在 target 字段末尾追加格式要求,例如'请以结构化列表返回每处引用点的行号、name_path 和代码片段',"
                     "便于上层 Agent 直接落地修改而无需二次检索。"
                 ),
-                trigger="上层 Agent 准备修改某个符号或文件之前调用,获取完整影响边界与精确修改位置。",
+                trigger=(
+                    "上层 Agent 准备修改某个符号或文件之前调用,获取完整影响边界与精确修改位置。"
+                    "需先调用 pce_init 初始化项目。"
+                ),
                 replaces=(
                     "替代手动追踪引用链(Cmd+Shift+F / grep -r)与反复 build 试错;"
                     "多步检索与推理在 PCE 独立上下文完成,结果以结构化形式一次性交付给上层 Agent。"
@@ -757,10 +758,7 @@ async def serve() -> None:
             if ctx.serena_client is not None
             else None
         )
-        return _build_tools(
-            initialized=ctx._init_state == "initialized",
-            edit_tools_schema=edit_schema,
-        )
+        return _build_tools(edit_tools_schema=edit_schema)
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
