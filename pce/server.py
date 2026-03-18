@@ -20,16 +20,13 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-import anyio
 from dotenv import load_dotenv
+from mcp.server.stdio import stdio_server
 from mcp.server import Server
-from mcp import types
-from mcp.shared.message import SessionMessage
 from mcp.types import CallToolResult, TextContent, Tool
 
 from .agent import PCEAgent
@@ -46,54 +43,6 @@ from .serena_client import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def _safe_stdio_server():
-    """更保守的 stdio transport，避免 anyio.AsyncFile 在复杂运行时下卡住写回。"""
-    read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
-    write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
-
-    def _readline() -> str:
-        return sys.stdin.buffer.readline().decode("utf-8")
-
-    def _write_line(line: str) -> None:
-        sys.stdout.buffer.write(line.encode("utf-8"))
-        sys.stdout.buffer.flush()
-
-    async def stdin_reader() -> None:
-        try:
-            async with read_stream_writer:
-                while True:
-                    line = await anyio.to_thread.run_sync(_readline)
-                    if not line:
-                        break
-                    try:
-                        message = types.JSONRPCMessage.model_validate_json(line)
-                    except Exception as exc:
-                        await read_stream_writer.send(exc)
-                        continue
-
-                    await read_stream_writer.send(SessionMessage(message))
-        except anyio.ClosedResourceError:
-            await anyio.lowlevel.checkpoint()
-
-    async def stdout_writer() -> None:
-        try:
-            async with write_stream_reader:
-                async for session_message in write_stream_reader:
-                    payload = (
-                        session_message.message.model_dump_json(by_alias=True, exclude_none=True)
-                        + "\n"
-                    )
-                    await anyio.to_thread.run_sync(_write_line, payload)
-        except anyio.ClosedResourceError:
-            await anyio.lowlevel.checkpoint()
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(stdin_reader)
-        tg.start_soon(stdout_writer)
-        yield read_stream, write_stream
 
 
 # ============================================================================
@@ -329,11 +278,14 @@ class PCEContext:
         self._last_init_error: str | None = None
 
         # 运行时组件（pce_init 后才创建）
-        self.serena_client: SerenaClient | None = None
         self.agent: PCEAgent | None = None
         self.insight_cache: InsightCache | None = None
         self.staging: StagingArea | None = None
         self.watcher: FileWatcher | None = None
+        # 只缓存纯数据（schema），不要跨请求持有活跃 SerenaClient。
+        # mcp/anyio 的 session/context manager 绑定创建它的任务，请求结束后跨任务复用会触发
+        # cancel scope 错位，导致 transport 被关闭。
+        self._edit_tools_schema: list[dict[str, Any]] = []
 
         # 锁与 bootstrap 信号
         self._sync_lock = asyncio.Lock()
@@ -353,15 +305,21 @@ class PCEContext:
         if self._init_state != "initialized":
             raise SerenaClientError("not initialized, call pce_init first")
 
-    async def ensure_connected(self) -> None:
-        """确保 Serena 连接已建立（断线后自动重连）。"""
+    @asynccontextmanager
+    async def serena_session(self) -> Any:
+        """在当前请求任务内建立并关闭 Serena 连接，避免跨任务持有 anyio context。"""
         self._require_initialized()
-        assert self.serena_client is not None
-        if not self.serena_client.connected:
-            logger.info("重新连接 Serena...")
-            await self.serena_client.connect(self.project_path)
+        client = SerenaClient(timeout_seconds=_get_serena_timeout())
+        try:
+            await client.connect(self.project_path)
+            yield client
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.exception("Serena 会话关闭异常")
 
-    async def _run_index_refresh(self) -> None:
+    async def _run_index_refresh(self, serena_client: SerenaClient) -> None:
         """执行索引刷新逻辑（全量或增量）。
 
         调用方负责加锁（_sync_lock）与状态位更新。
@@ -380,7 +338,7 @@ class PCEContext:
             )
             await build_index(
                 project_path=self.project_path,
-                serena_client=self.serena_client,
+                serena_client=serena_client,
                 memory_root=self.project_path,
             )
             if all_paths:
@@ -400,7 +358,7 @@ class PCEContext:
             )
             await build_index_incremental(
                 project_path=self.project_path,
-                serena_client=self.serena_client,
+                serena_client=serena_client,
                 memory_root=self.project_path,
                 changed_files=dirty.changed,
                 deleted_files=dirty.deleted,
@@ -439,30 +397,33 @@ class PCEContext:
 
         try:
             serena_timeout = _get_serena_timeout()
-            self.serena_client = SerenaClient(timeout_seconds=serena_timeout)
             self.insight_cache = InsightCache(project_path)
             self.agent = PCEAgent(insight_cache=self.insight_cache)
 
             async with self._sync_lock:
-                await self.serena_client.connect(project_path)
+                async with SerenaClient.create(
+                    project_path,
+                    timeout_seconds=serena_timeout,
+                ) as serena_client:
+                    self._edit_tools_schema = serena_client.edit_tools_schema
 
-                # 显式校验 Serena 项目激活：启动时激活失败会被静默吞掉，
-                # 再调一次可捕获失败并记录 warning，而不是直接报错
-                try:
-                    result = await self.serena_client.call(
-                        "activate_project",
-                        {"project": str(project_path)},
-                    )
-                    logger.info("Serena 项目激活成功: %s", result)
-                except Exception as e:
-                    warning = (
-                        f"Serena 项目激活失败: {e}。"
-                        "符号级索引可能不完整，请检查 Serena 项目配置。"
-                    )
-                    warnings.append(warning)
-                    logger.warning(warning)
+                    # 显式校验 Serena 项目激活：启动时激活失败会被静默吞掉，
+                    # 再调一次可捕获失败并记录 warning，而不是直接报错
+                    try:
+                        result = await serena_client.call(
+                            "activate_project",
+                            {"project": str(project_path)},
+                        )
+                        logger.info("Serena 项目激活成功: %s", result)
+                    except Exception as e:
+                        warning = (
+                            f"Serena 项目激活失败: {e}。"
+                            "符号级索引可能不完整，请检查 Serena 项目配置。"
+                        )
+                        warnings.append(warning)
+                        logger.warning(warning)
 
-                await self._run_index_refresh()
+                    await self._run_index_refresh(serena_client)
 
             self._init_state = "initialized"
             self._bootstrap_warnings = list(warnings)
@@ -493,12 +454,7 @@ class PCEContext:
             # 清理半初始化的组件，重置为 None 以便下次重试时重新创建
             self.agent = None
             self.insight_cache = None
-            if self.serena_client is not None:
-                try:
-                    await self.serena_client.disconnect()
-                except Exception:
-                    logger.exception("初始化失败后 Serena 清理异常")
-                self.serena_client = None
+            self._edit_tools_schema = []
             return InitResponse(
                 initialized=False,
                 status="init_failed",
@@ -613,7 +569,6 @@ class PCEContext:
         self._require_initialized()
         assert self.staging is not None
         assert self.agent is not None
-        assert self.serena_client is not None
 
         # 注入暂存区脏文件信息到查询上下文
         dirty = await self.staging.list_unacknowledged()
@@ -622,13 +577,14 @@ class PCEContext:
             dirty_info = self._format_dirty_context(dirty)
             enriched_query = f"{query}\n\n{dirty_info}"
 
-        response = await self.agent.query(
-            question=enriched_query,
-            session_id=session_id,
-            memory_root=self.project_path,
-            serena_client=self.serena_client,
-            acknowledge_cb=self.staging.acknowledge,
-        )
+        async with self.serena_session() as serena_client:
+            response = await self.agent.query(
+                question=enriched_query,
+                session_id=session_id,
+                memory_root=self.project_path,
+                serena_client=serena_client,
+                acknowledge_cb=self.staging.acknowledge,
+            )
         return response.model_dump(mode="json")
 
     async def handle_impact(
@@ -641,18 +597,18 @@ class PCEContext:
         """处理 pce_impact 请求。"""
         self._require_initialized()
         assert self.agent is not None
-        assert self.serena_client is not None
         assert self.staging is not None
 
         effective_target = f"{target} (file={file})" if file else target
-        response = await self.agent.impact(
-            target=effective_target,
-            change_type=change_type,
-            session_id=session_id,
-            memory_root=self.project_path,
-            serena_client=self.serena_client,
-            acknowledge_cb=self.staging.acknowledge,
-        )
+        async with self.serena_session() as serena_client:
+            response = await self.agent.impact(
+                target=effective_target,
+                change_type=change_type,
+                session_id=session_id,
+                memory_root=self.project_path,
+                serena_client=serena_client,
+                acknowledge_cb=self.staging.acknowledge,
+            )
         return response.model_dump(mode="json")
 
     async def handle_status(self) -> dict[str, Any]:
@@ -702,10 +658,10 @@ class PCEContext:
         if tool_name not in EDIT_TOOL_NAMES:
             raise SerenaClientError(f"不允许的写工具: {tool_name}")
         self._require_initialized()
-        assert self.serena_client is not None
         assert self.staging is not None
 
-        result = await self.serena_client.call(tool_name, arguments)
+        async with self.serena_session() as serena_client:
+            result = await serena_client.call(tool_name, arguments)
 
         # 从参数中提取受影响的文件路径，记录到暂存区
         affected = _extract_affected_path(tool_name, arguments)
@@ -722,42 +678,39 @@ class PCEContext:
         获取全部待索引条目，索引完成后清空暂存区。
         """
         self._require_initialized()
-        assert self.serena_client is not None
         assert self.staging is not None
         assert self.insight_cache is not None
 
         async with self._sync_lock:
-            await self.serena_client.disconnect()
-            await self.serena_client.connect(self.project_path)
-
-            dirty = await self.staging.list_pending_reindex()
-            if not dirty.empty:
-                all_paths = dirty.changed + dirty.deleted
-                # 索引前快照 hash，防止索引期间新变更被提前确认
-                hash_snapshot = await self.staging.snapshot_hashes(all_paths)
-                logger.info(
-                    f"pce_sync: 增量更新 {len(dirty.changed)} 变更, "
-                    f"{len(dirty.deleted)} 删除"
-                )
-                snapshot = await build_index_incremental(
-                    project_path=self.project_path,
-                    serena_client=self.serena_client,
-                    memory_root=self.project_path,
-                    changed_files=dirty.changed,
-                    deleted_files=dirty.deleted,
-                )
-                await self.staging.acknowledge_after_reindex(
-                    all_paths, expected_hashes=hash_snapshot,
-                )
-                message = "Serena 已重连，PCE 索引增量更新完成"
-            else:
-                logger.info("pce_sync: 暂存区无变更，执行全量重建")
-                snapshot = await build_index(
-                    project_path=self.project_path,
-                    serena_client=self.serena_client,
-                    memory_root=self.project_path,
-                )
-                message = "Serena 已重连，PCE 索引全量重建完成"
+            async with self.serena_session() as serena_client:
+                dirty = await self.staging.list_pending_reindex()
+                if not dirty.empty:
+                    all_paths = dirty.changed + dirty.deleted
+                    # 索引前快照 hash，防止索引期间新变更被提前确认
+                    hash_snapshot = await self.staging.snapshot_hashes(all_paths)
+                    logger.info(
+                        f"pce_sync: 增量更新 {len(dirty.changed)} 变更, "
+                        f"{len(dirty.deleted)} 删除"
+                    )
+                    snapshot = await build_index_incremental(
+                        project_path=self.project_path,
+                        serena_client=serena_client,
+                        memory_root=self.project_path,
+                        changed_files=dirty.changed,
+                        deleted_files=dirty.deleted,
+                    )
+                    await self.staging.acknowledge_after_reindex(
+                        all_paths, expected_hashes=hash_snapshot,
+                    )
+                    message = "Serena 已重连，PCE 索引增量更新完成"
+                else:
+                    logger.info("pce_sync: 暂存区无变更，执行全量重建")
+                    snapshot = await build_index(
+                        project_path=self.project_path,
+                        serena_client=serena_client,
+                        memory_root=self.project_path,
+                    )
+                    message = "Serena 已重连，PCE 索引全量重建完成"
 
             self._init_state = "initialized"
             logger.info(
@@ -819,12 +772,7 @@ async def serve() -> None:
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        edit_schema = (
-            ctx.serena_client.edit_tools_schema
-            if ctx.serena_client is not None
-            else None
-        )
-        return _build_tools(edit_tools_schema=edit_schema)
+        return _build_tools(edit_tools_schema=ctx._edit_tools_schema)
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent] | CallToolResult:
@@ -845,8 +793,6 @@ async def serve() -> None:
                     "NOT_INITIALIZED",
                     "not initialized, call pce_init first",
                 )
-
-            await ctx.ensure_connected()
 
             if name == "pce_query":
                 query = arguments.get("query", "")
@@ -892,7 +838,7 @@ async def serve() -> None:
             return _error_response("INTERNAL_ERROR", f"内部错误: {e}")
 
     try:
-        async with _safe_stdio_server() as (read_stream, write_stream):
+        async with stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream,
                 write_stream,
@@ -905,11 +851,6 @@ async def serve() -> None:
                 await ctx.watcher.stop()
             except Exception:
                 logger.exception("watcher 停止异常")
-        if ctx.serena_client is not None:
-            try:
-                await ctx.serena_client.disconnect()
-            except Exception:
-                logger.exception("serena_client 断开异常")
 
 
 def main() -> None:
