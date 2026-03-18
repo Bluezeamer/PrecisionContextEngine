@@ -43,6 +43,7 @@ from .models import (
     SymbolRef,
 )
 from .serena_client import SerenaClient, SerenaClientError
+from ._env import get_completion_overrides, get_env_text
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +84,6 @@ HIGH_LEVEL_KINDS = frozenset({
 })
 
 DEFAULT_CONCURRENCY = 10
-# litellm 模型名格式参考 pce/agent.py 中的说明
-DEFAULT_MODEL = os.getenv("PCE_ANNOTATION_MODEL", "openrouter/stepfun/step-3.5-flash:free")
 
 
 # ============================================================================
@@ -398,6 +397,15 @@ async def _generate_annotations(
     if not entries:
         return None
 
+    effective_model = (
+        model
+        or get_env_text("PCE_ANNOTATION_MODEL")
+        or get_env_text("PCE_MODEL")
+    )
+    if not effective_model:
+        logger.warning("未配置 PCE_ANNOTATION_MODEL 或 PCE_MODEL，跳过语义注解生成")
+        return None
+
     prompt = _build_annotation_prompt(entries, project_meta)
     messages = [
         {"role": "system", "content": "你是软件架构助手,擅长总结模块职责与依赖关系。"},
@@ -407,9 +415,10 @@ async def _generate_annotations(
     try:
         response = await asyncio.to_thread(
             litellm.completion,
-            model=model or DEFAULT_MODEL,
+            model=effective_model,
             messages=messages,
             temperature=0.2,
+            **get_completion_overrides(),
         )
         # 提取响应文本
         content = ""

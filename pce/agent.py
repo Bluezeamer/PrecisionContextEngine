@@ -42,6 +42,7 @@ from .agent_runtime.spawner import invoke_spawn
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse, ReferenceEdge, SymbolRef
 from .serena_client import SerenaClient, SerenaClientError
+from ._env import get_completion_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +51,8 @@ MAX_SECONDS = 600  # 默认推理时间上限（秒），10 分钟
 _COMPACT_THRESHOLD = 0.80
 # step-3.5-flash 的上下文窗口大小（token 数），可通过环境变量覆盖
 _CONTEXT_WINDOW = int(os.getenv("PCE_CONTEXT_WINDOW", "256000"))
-# litellm 模型名格式: "<provider_prefix>/<model_name>"
-# 示例: "step-3.5-flash"            (直接调用 StepFun API)
-#        "openrouter/stepfun/step-3.5-flash:free"  (通过 OpenRouter)
-#        "anthropic/claude-3-haiku"  (通过 Anthropic)
-MODEL = os.getenv("PCE_MODEL", "openrouter/stepfun/step-3.5-flash:free")
+# 通过 PCE_MODEL 环境变量配置（必填），运行时读取，支持所有 litellm 供应商
+# 示例: "openai/gpt-4o-mini"  "anthropic/claude-3-haiku"  "openrouter/..."
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +71,6 @@ def _parse_model_fallbacks(raw: str) -> list[str]:
     return result
 
 
-MODEL_FALLBACKS: list[str] = _parse_model_fallbacks(
-    os.getenv("PCE_MODEL_FALLBACKS", "")
-)
 
 
 class LLMCompletionError(RuntimeError):
@@ -506,9 +501,18 @@ class PCEAgent:
         max_seconds: float = MAX_SECONDS,
         insight_cache: InsightCache | None = None,
     ) -> None:
-        self._model = model or MODEL
+        self._model = model or os.getenv("PCE_MODEL", "").strip() or None
+        if not self._model:
+            raise ValueError(
+                "未配置 PCE_MODEL，请通过 MCP config env、系统环境变量"
+                "或项目 .env 设置模型名（如 openai/gpt-4o-mini）。"
+            )
         # 降级链：去掉与主模型相同的候选项
-        raw_fallbacks = model_fallbacks if model_fallbacks is not None else MODEL_FALLBACKS
+        raw_fallbacks = (
+            model_fallbacks
+            if model_fallbacks is not None
+            else _parse_model_fallbacks(os.getenv("PCE_MODEL_FALLBACKS", ""))
+        )
         self._model_fallbacks = [m for m in raw_fallbacks if m and m != self._model]
         self._max_seconds = max_seconds
         self._deliver_tool = DELIVER_TOOL
@@ -693,6 +697,7 @@ class PCEAgent:
         """
         # litellm.Timeout 不是 asyncio.TimeoutError 的子类，统一转换
         _timeout_types = (asyncio.TimeoutError, litellm_exc.Timeout)
+        completion_overrides = get_completion_overrides()
 
         model_chain = [self._model, *self._model_fallbacks]
 
@@ -705,6 +710,7 @@ class PCEAgent:
                         model=self._model,
                         messages=messages,
                         tools=tools if tools else None,
+                        **completion_overrides,
                         temperature=0.2,
                     ),
                     timeout=60.0,
@@ -723,6 +729,7 @@ class PCEAgent:
                         model=model,
                         messages=messages,
                         tools=tools if tools else None,
+                        **completion_overrides,
                         temperature=0.2,
                     ),
                     timeout=60.0,

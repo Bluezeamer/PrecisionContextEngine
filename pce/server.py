@@ -372,6 +372,10 @@ class PCEContext:
         if not self.watcher.running:
             await self.watcher.start()
 
+        # 加载项目级 .env（不覆盖已有环境变量）
+        # 优先级：MCP config env > 系统环境变量 > 项目 .env
+        load_dotenv(dotenv_path=project_path / ".env", override=False)
+
         try:
             serena_timeout = _get_serena_timeout()
             self.serena_client = SerenaClient(timeout_seconds=serena_timeout)
@@ -725,16 +729,14 @@ class PCEContext:
 async def serve() -> None:
     """启动 PCE MCP Server (stdio 模式)。
 
-    读取环境变量:
+    读取环境变量：
         PCE_LOG_LEVEL:      日志级别（默认 INFO）
         PCE_SERENA_TIMEOUT: Serena MCP 超时秒数（默认 180）
 
     项目路径由 agent 在会话开始时通过 pce_init 工具传入，无需环境变量配置。
+    API Key / Base URL 可通过 MCP config env 或系统环境变量设置。
+    项目目录下的 .env 文件在 pce_init 时自动加载（优先级低于 MCP config env）。
     """
-    # 加载 PCE 根目录的 .env（不覆盖已有环境变量，调用方的 env/export 优先）
-    pce_root = Path(__file__).parent.parent
-    load_dotenv(dotenv_path=pce_root / ".env")
-
     log_level = os.getenv("PCE_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),

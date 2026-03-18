@@ -4,9 +4,9 @@
 
 ## 项目定位
 
-PCE 是一个运行在上层 Agent（如 Claude Code）与 Serena 之间的 **MCP Server**，通过以下能力提升代码理解效率：
+PCE 是一个代码库分析MCP工具，通过对serena的封装以及agent机制，实现基于语义的代码库分析和相关代码片段的精确定位和修改范围影响边界的分析，同时通过以下设计提升代码理解效率：
 
-1. **上下文压缩** — 将代码库背景理解的 token 开销从 50-60% 压缩到 10-15%
+1. **上下文压缩** — 将代码库背景理解的 token 开销降低
 2. **影响边界分析** — 在修改前给出完整的符号引用链，消除 build 试错循环
 3. **知识积累** — 建立项目索引 + InsightCache 跨会话认知缓存，随使用加深对项目的理解
 
@@ -22,7 +22,7 @@ PCE 通过 `uvx` 按需运行，无需克隆仓库或手动安装依赖：
 
 ```bash
 # 验证是否可运行（可选）
-uvx --from git+<repository-url> pce serve
+uvx --from git+https://github.com/Bluezeamer/PrecisionContextEngine pce serve
 
 # 配置 API Key（在目标项目目录下创建 .env 文件）
 echo "OPENROUTER_API_KEY=sk-or-..." > .env
@@ -41,13 +41,17 @@ echo "OPENROUTER_API_KEY=sk-or-..." > .env
   "mcpServers": {
     "pce": {
       "command": "uvx",
-      "args": ["--from", "git+<repository-url>", "pce", "serve"]
+      "args": ["--from", "git+<repository-url>", "pce", "serve"],
+      "env": {
+        "PCE_MODEL": "openrouter/openai/gpt-4o-mini",
+        "PCE_API_KEY": "sk-or-..."
+      }
     }
   }
 }
 ```
 
-> API Key 从目标项目根目录的 `.env` 文件自动加载，无需在 MCP 配置中重复填写。
+> 也可以不在 MCP config 中设置 `env`，将 `PCE_MODEL` / `PCE_API_KEY` 等写入目标项目根目录的 `.env` 文件，PCE 在 `pce_init` 时自动加载（优先级低于 MCP env）。
 
 ### 在 Claude Code 中使用
 
@@ -130,15 +134,19 @@ pce/
 
 ## 环境变量
 
+> 推荐通过 MCP config 的 `env` 段设置，避免明文写入磁盘文件。
+> 也支持系统环境变量或项目根目录的 `.env` 文件（优先级：MCP env > 系统 env > `.env`）。
+
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
-| `PCE_MODEL` | Agent 推理模型 | `openrouter/stepfun/step-3.5-flash:free` |
+| `PCE_MODEL` | Agent 推理模型（**必填**，无默认值） | — |
 | `PCE_MODEL_FALLBACKS` | 模型降级链（逗号分隔） | 空（不降级） |
 | `PCE_ANNOTATION_MODEL` | 索引构建时的语义注解模型 | 同 `PCE_MODEL` |
+| `PCE_API_KEY` | litellm 通用 API Key（覆盖供应商默认 key） | — |
+| `PCE_API_BASE` | litellm 通用 Base URL（OpenAI 兼容端点） | — |
 | `PCE_SERENA_TIMEOUT` | Serena 连接/工具调用超时（秒） | `180` |
 | `PCE_CONTEXT_WINDOW` | 上下文窗口大小（token） | `256000` |
 | `PCE_LOG_LEVEL` | 日志级别 | `INFO` |
-| `OPENROUTER_API_KEY` | OpenRouter API 密钥 | — |
 
 ### 模型降级路由
 
@@ -149,23 +157,49 @@ pce/
 PCE_MODEL_FALLBACKS=openrouter/free
 ```
 
-### 供应商切换示例
+### 供应商配置示例
+
+PCE 底层使用 litellm，支持所有主流供应商。推荐在 MCP config 的 `env` 段配置：
+
+```json
+{
+  "mcpServers": {
+    "pce": {
+      "command": "uvx",
+      "args": ["--from", "git+<repository-url>", "pce", "serve"],
+      "env": {
+        "PCE_MODEL": "openai/gpt-4o-mini",
+        "PCE_API_KEY": "sk-...",
+        "PCE_API_BASE": "https://api.openai.com/v1"
+      }
+    }
+  }
+}
+```
+
+常用供应商写法：
 
 ```bash
-# OpenRouter (默认，免费额度)
-export OPENROUTER_API_KEY="sk-or-..."
+# OpenRouter
+PCE_MODEL=openrouter/openai/gpt-4o-mini
+PCE_API_KEY=sk-or-...
 
-# StepFun 直连
-export STEPFUN_API_KEY="your-key"
-export PCE_MODEL="step-3.5-flash"
+# OpenAI 直连
+PCE_MODEL=openai/gpt-4o-mini
+PCE_API_KEY=sk-...
 
 # Anthropic Claude
-export ANTHROPIC_API_KEY="your-key"
-export PCE_MODEL="anthropic/claude-3-haiku-20240307"
+PCE_MODEL=anthropic/claude-3-haiku-20240307
+PCE_API_KEY=sk-ant-...
 
-# OpenAI
-export OPENAI_API_KEY="your-key"
-export PCE_MODEL="gpt-4o-mini"
+# OpenAI 兼容自建端点（如 vLLM / LocalAI）
+PCE_MODEL=openai/your-model-name
+PCE_API_KEY=your-key
+PCE_API_BASE=http://localhost:8000/v1
+
+# StepFun 直连（litellm 原生支持）
+PCE_MODEL=stepfun/step-3.5-flash
+PCE_API_KEY=your-stepfun-key
 ```
 
 ## 开发
