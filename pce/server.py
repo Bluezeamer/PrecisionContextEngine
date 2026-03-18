@@ -21,7 +21,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from mcp.server import Server
@@ -31,8 +31,9 @@ from mcp.types import TextContent, Tool
 from .agent import PCEAgent
 from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
+from .models import InitResponse
 from .staging import DirtyState, FileWatcher, StagingArea
-from .memory import get_status, index_exists
+from .memory import get_status, index_exists, load_index
 from .serena_client import (
     DEFAULT_TIMEOUT_SECONDS,
     SerenaClient,
@@ -116,9 +117,58 @@ def _build_edit_tools(edit_tools_schema: list[dict[str, Any]]) -> list[Tool]:
     return tools
 
 
-def _build_tools(edit_tools_schema: list[dict[str, Any]] | None = None) -> list[Tool]:
-    """构建 MCP 工具定义（含写工具透传与索引同步信号）。"""
-    base_tools = [
+def _build_tools(
+    *,
+    initialized: bool,
+    edit_tools_schema: list[dict[str, Any]] | None = None,
+) -> list[Tool]:
+    """构建 MCP 工具定义。
+
+    未初始化时只暴露 pce_init 和 pce_status；
+    初始化完成后暴露全套工具（含写工具透传）。
+    """
+    # 始终可用：init 与 status 不依赖项目初始化
+    always_available: list[Tool] = [
+        Tool(
+            name="pce_init",
+            description=_make_tool_description(
+                summary="初始化 PCE 与目标项目的绑定，启动 Serena 并构建代码索引。",
+                trigger=(
+                    "会话开始后首次使用前调用一次。"
+                    "调用成功前，pce_query / pce_impact / pce_sync 及写工具均不可用。"
+                ),
+                replaces=(
+                    "替代通过环境变量传入项目路径的启动方式；"
+                    "将项目绑定延迟到会话运行时显式完成，支持全局安装、零配置部署。"
+                ),
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "目标项目根路径（绝对路径）",
+                    },
+                },
+                "required": ["project_path"],
+            },
+        ),
+        Tool(
+            name="pce_status",
+            description=_make_tool_description(
+                summary="返回当前项目的 PCE 状态：初始化阶段、索引统计、暂存区信息。",
+                trigger="诊断或调试时调用；也可在 pce_init 前后确认服务状态。",
+                replaces="替代手动检查 .pce/ 目录文件与日志。",
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    ]
+
+    if not initialized:
+        return always_available
+
+    # 初始化完成后额外暴露的工具
+    post_init: list[Tool] = [
         Tool(
             name="pce_query",
             description=_make_tool_description(
@@ -190,42 +240,18 @@ def _build_tools(edit_tools_schema: list[dict[str, Any]] | None = None) -> list[
             },
         ),
         Tool(
-            name="pce_status",
+            name="pce_sync",
             description=_make_tool_description(
-                summary="返回当前项目的 PCE 状态:索引是否存在、建立时间、基本统计信息。",
-                trigger="诊断或调试时调用,例如确认索引是否需要刷新。",
-                replaces="替代手动检查 .pce/ 目录文件。",
+                summary="通知 PCE 代码库已发生变更，触发 Serena 重连并重建 PCE 索引。后续 pce_query/pce_impact 将看到最新代码。",
+                trigger="上层 Agent 完成一批代码修改后调用，确保 PCE 索引与代码库同步。",
+                replaces="替代手动重启 PCE 服务或等待索引自动失效。",
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_path": {
-                        "type": "string",
-                        "description": "项目根路径(可选,默认为启动时配置的项目路径)",
-                    },
-                },
-            },
+            inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
-    # 写工具：从 Serena edit_tools_schema 动态生成
     edit_tools = _build_edit_tools(edit_tools_schema or [])
-
-    # 索引同步信号
-    sync_tool = Tool(
-        name="pce_sync",
-        description=_make_tool_description(
-            summary="通知 PCE 代码库已发生变更，触发 Serena 重连并重建 PCE 索引。后续 pce_query/pce_impact 将看到最新代码。",
-            trigger="上层 Agent 完成一批代码修改后调用，确保 PCE 索引与代码库同步。",
-            replaces="替代手动重启 PCE 服务或等待索引自动失效。",
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
-    )
-
-    return [*base_tools, *edit_tools, sync_tool]
+    return [*always_available, *post_init, *edit_tools]
 
 
 # ============================================================================
@@ -236,34 +262,46 @@ def _build_tools(edit_tools_schema: list[dict[str, Any]] | None = None) -> list[
 class PCEContext:
     """持有 Server 的全局上下文,供工具处理器使用。"""
 
-    def __init__(
-        self,
-        project_path: Path,
-        serena_path: Path,
-        serena_client: SerenaClient,
-        agent: PCEAgent,
-        insight_cache: InsightCache,
-    ) -> None:
-        self.project_path = project_path
-        self.serena_path = serena_path
-        self.serena_client = serena_client
-        self.agent = agent
-        self.insight_cache = insight_cache
+    def __init__(self) -> None:
+        # 项目绑定状态
+        self._bound_path: Path | None = None
+        self._init_state: Literal[
+            "uninitialized", "initializing", "initialized", "failed"
+        ] = "uninitialized"
+        self._last_init_error: str | None = None
+
+        # 运行时组件（pce_init 后才创建）
+        self.serena_client: SerenaClient | None = None
+        self.agent: PCEAgent | None = None
+        self.insight_cache: InsightCache | None = None
+        self.staging: StagingArea | None = None
+        self.watcher: FileWatcher | None = None
+
+        # 锁与 bootstrap 信号
         self._sync_lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
-        self._initialized = False
-        # bootstrap 状态：eager 初始化完成信号 + 过程中收集的 warning
         self._bootstrap_event = asyncio.Event()
         self._bootstrap_warnings: list[str] = []
-        # 文件变更暂存区与监听
-        self.staging = StagingArea(project_path)
-        self.watcher = FileWatcher(self.staging)
+
+    @property
+    def project_path(self) -> Path:
+        """返回已绑定的项目路径；未初始化时抛出异常。"""
+        if self._bound_path is None:
+            raise SerenaClientError("not initialized, call pce_init first")
+        return self._bound_path
+
+    def _require_initialized(self) -> None:
+        """断言服务已完成初始化；否则抛出统一的错误。"""
+        if self._init_state != "initialized":
+            raise SerenaClientError("not initialized, call pce_init first")
 
     async def ensure_connected(self) -> None:
-        """确保 Serena 连接已建立。"""
+        """确保 Serena 连接已建立（断线后自动重连）。"""
+        self._require_initialized()
+        assert self.serena_client is not None
         if not self.serena_client.connected:
             logger.info("重新连接 Serena...")
-            await self.serena_client.connect(self.project_path, self.serena_path)
+            await self.serena_client.connect(self.project_path)
 
     async def _run_index_refresh(self) -> None:
         """执行索引刷新逻辑（全量或增量）。
@@ -314,72 +352,183 @@ class PCEContext:
             )
             logger.info("增量索引更新完成")
 
-    async def _bootstrap(self) -> None:
-        """后台 bootstrap 任务：校验 Serena 项目激活 + 构建索引。
+    async def _bootstrap(
+        self,
+        project_path: Path,
+        init_mode: Literal["full_build", "retry_after_failure"],
+    ) -> InitResponse:
+        """执行初始化：创建运行时对象 → 连接 Serena → 激活项目 → 构建索引。
 
-        不依赖 LLM，纯程序化。失败仅记录 warning，不阻塞 event 置位。
-        pce_query / pce_impact 通过 await _bootstrap_event.wait() 等待此任务完成。
+        同步阻塞到完成或失败。_bootstrap_event 由 handle_init 在状态切换时 clear，
+        此处只负责在结束时 set（成功或失败都要 set，避免并发等待方永久挂住）。
         """
-        if self._bootstrap_event.is_set():
-            return
+        warnings: list[str] = []
+        self._bootstrap_warnings = []
+        self._last_init_error = None
+        # 注意：不在此处 clear event，handle_init 在切换到 initializing 时已 clear。
 
-        async with self._init_lock:
-            if self._bootstrap_event.is_set():
-                return
+        # FileWatcher 在路径校验通过后立即启动，避免初始化期间遗漏文件变更
+        if self.staging is None:
+            self.staging = StagingArea(project_path)
+        if self.watcher is None:
+            self.watcher = FileWatcher(self.staging)
+        if not self.watcher.running:
+            await self.watcher.start()
 
-            try:
-                async with self._sync_lock:
-                    # 1. 显式校验 Serena 项目激活
-                    #    Serena 启动参数已带 --project，但启动时激活失败会被静默吞掉。
-                    #    再调一次 activate_project 可捕获激活失败并记录 warning。
-                    try:
-                        result = await self.serena_client.call(
-                            "activate_project",
-                            {"project": str(self.project_path)},
-                        )
-                        logger.info("Serena 项目激活校验成功: %s", result)
-                    except Exception as e:
-                        warning = (
-                            f"Serena 项目激活校验失败: {e}。"
-                            "符号级索引可能不完整，请检查 .serena/project.yml 配置。"
-                        )
-                        self._bootstrap_warnings.append(warning)
-                        logger.warning(warning)
+        try:
+            serena_timeout = _get_serena_timeout()
+            self.serena_client = SerenaClient(timeout_seconds=serena_timeout)
+            self.insight_cache = InsightCache(project_path)
+            self.agent = PCEAgent(insight_cache=self.insight_cache)
 
-                    # 2. 构建索引
-                    try:
-                        await self._run_index_refresh()
-                    except Exception as e:
-                        warning = f"Bootstrap 索引构建失败: {e}"
-                        self._bootstrap_warnings.append(warning)
-                        logger.warning(warning)
-            except Exception as e:
-                self._bootstrap_warnings.append(f"Bootstrap 异常: {e}")
-                logger.exception("Bootstrap 异常")
-            finally:
-                # 只有索引确实存在时才标记 initialized，否则后续可通过
-                # _ensure_initialized 补救
-                if await index_exists(root_path=self.project_path):
-                    self._initialized = True
-                # event 无论如何都 set，避免 pce_query/pce_impact 永远挂住
-                self._bootstrap_event.set()
-                if self._bootstrap_warnings:
-                    logger.warning(
-                        "Bootstrap 完成（有 %d 条 warning）", len(self._bootstrap_warnings)
-                    )
-                else:
-                    logger.info("Bootstrap 完成（无 warning）")
-
-    async def _ensure_initialized(self) -> None:
-        """按需执行索引初始化（保留给 pce_sync 重连后使用）。"""
-        if self._initialized:
-            return
-        async with self._init_lock:
-            if self._initialized:
-                return
             async with self._sync_lock:
+                await self.serena_client.connect(project_path)
+
+                # 显式校验 Serena 项目激活：启动时激活失败会被静默吞掉，
+                # 再调一次可捕获失败并记录 warning，而不是直接报错
+                try:
+                    result = await self.serena_client.call(
+                        "activate_project",
+                        {"project": str(project_path)},
+                    )
+                    logger.info("Serena 项目激活成功: %s", result)
+                except Exception as e:
+                    warning = (
+                        f"Serena 项目激活失败: {e}。"
+                        "符号级索引可能不完整，请检查 Serena 项目配置。"
+                    )
+                    warnings.append(warning)
+                    logger.warning(warning)
+
                 await self._run_index_refresh()
-                self._initialized = True
+
+            self._init_state = "initialized"
+            self._bootstrap_warnings = list(warnings)
+            self._bootstrap_event.set()
+            logger.info(
+                "Bootstrap 完成%s",
+                f"（{len(warnings)} 条 warning）" if warnings else "（无 warning）",
+            )
+
+            snapshot = await load_index(root_path=project_path)
+            file_count = snapshot.project_meta.file_count if snapshot else 0
+            return InitResponse(
+                initialized=True,
+                status="initialized",
+                project_path=str(project_path),
+                project_name=project_path.name,
+                file_count=file_count,
+                init_mode=init_mode,
+                warnings=self._bootstrap_warnings,
+            )
+
+        except Exception as e:
+            self._init_state = "failed"
+            self._last_init_error = str(e)
+            self._bootstrap_warnings = list(warnings)
+            self._bootstrap_event.set()
+            logger.exception("PCE 初始化失败")
+            # 清理半初始化的组件，重置为 None 以便下次重试时重新创建
+            self.agent = None
+            self.insight_cache = None
+            if self.serena_client is not None:
+                try:
+                    await self.serena_client.disconnect()
+                except Exception:
+                    logger.exception("初始化失败后 Serena 清理异常")
+                self.serena_client = None
+            return InitResponse(
+                initialized=False,
+                status="init_failed",
+                project_path=str(project_path),
+                project_name=project_path.name,
+                file_count=0,
+                init_mode=init_mode,
+                warnings=self._bootstrap_warnings,
+                error=str(e),
+            )
+
+    async def handle_init(self, project_path_str: str) -> dict[str, Any]:
+        """处理 pce_init 请求，同步阻塞到初始化完成。
+
+        状态转换：
+          uninitialized / failed → initializing → initialized | failed
+          initialized（同路径）→ 直接返回（幂等）
+          initialized / initializing（不同路径）→ 报错，需重启
+        """
+        if not project_path_str.strip():
+            raise SerenaClientError("project_path 参数不能为空")
+
+        resolved = Path(project_path_str).expanduser().resolve()
+        if not resolved.exists():
+            raise SerenaClientError(f"project path does not exist: {resolved}")
+        if not resolved.is_dir():
+            raise SerenaClientError(f"project path is not a directory: {resolved}")
+
+        wait_for_existing = False
+        init_mode: Literal["full_build", "retry_after_failure"] = "full_build"
+
+        async with self._init_lock:
+            # 路径冲突检查：只允许同路径操作
+            if self._bound_path is not None and self._bound_path != resolved:
+                raise SerenaClientError(
+                    f"already bound to {self._bound_path}, restart to switch"
+                )
+
+            if self._init_state == "initialized":
+                # 已完成：幂等快速返回
+                snapshot = await load_index(root_path=resolved)
+                return InitResponse(
+                    initialized=True,
+                    status="already_initialized",
+                    project_path=str(resolved),
+                    project_name=resolved.name,
+                    file_count=snapshot.project_meta.file_count if snapshot else 0,
+                    init_mode="reused",
+                    warnings=list(self._bootstrap_warnings),
+                ).model_dump(mode="json")
+
+            elif self._init_state == "initializing":
+                # 并发 init：等待正在进行的 bootstrap 完成
+                wait_for_existing = True
+
+            else:
+                # "uninitialized" 或 "failed"：执行初始化
+                init_mode = (
+                    "retry_after_failure" if self._init_state == "failed" else "full_build"
+                )
+                self._bound_path = resolved
+                self._init_state = "initializing"
+                self._bootstrap_event.clear()
+
+        if wait_for_existing:
+            # 等待并发 init 结束后读取结果
+            await self._bootstrap_event.wait()
+            snapshot = await load_index(root_path=resolved)
+            if self._init_state == "initialized":
+                return InitResponse(
+                    initialized=True,
+                    status="already_initialized",
+                    project_path=str(resolved),
+                    project_name=resolved.name,
+                    file_count=snapshot.project_meta.file_count if snapshot else 0,
+                    init_mode="reused",
+                    warnings=list(self._bootstrap_warnings),
+                ).model_dump(mode="json")
+            else:
+                return InitResponse(
+                    initialized=False,
+                    status="init_failed",
+                    project_path=str(resolved),
+                    project_name=resolved.name,
+                    file_count=0,
+                    init_mode="retry_after_failure",
+                    warnings=list(self._bootstrap_warnings),
+                    error=self._last_init_error,
+                ).model_dump(mode="json")
+
+        response = await self._bootstrap(resolved, init_mode)
+        return response.model_dump(mode="json")
 
     @staticmethod
     def _format_dirty_context(dirty: DirtyState) -> str:
@@ -399,9 +548,10 @@ class PCEContext:
         self, query: str, session_id: str | None
     ) -> dict[str, Any]:
         """处理 pce_query 请求。"""
-        await self._bootstrap_event.wait()
-        # bootstrap 可能失败（索引未建成），此时 _ensure_initialized 会补救
-        await self._ensure_initialized()
+        self._require_initialized()
+        assert self.staging is not None
+        assert self.agent is not None
+        assert self.serena_client is not None
 
         # 注入暂存区脏文件信息到查询上下文
         dirty = await self.staging.list_unacknowledged()
@@ -427,11 +577,12 @@ class PCEContext:
         file: str | None,
     ) -> dict[str, Any]:
         """处理 pce_impact 请求。"""
-        await self._bootstrap_event.wait()
-        await self._ensure_initialized()
-        # 将 file 参数附加到 target 描述中
-        effective_target = f"{target} (file={file})" if file else target
+        self._require_initialized()
+        assert self.agent is not None
+        assert self.serena_client is not None
+        assert self.staging is not None
 
+        effective_target = f"{target} (file={file})" if file else target
         response = await self.agent.impact(
             target=effective_target,
             change_type=change_type,
@@ -442,23 +593,40 @@ class PCEContext:
         )
         return response.model_dump(mode="json")
 
-    async def handle_status(self, project_path: str | None) -> dict[str, Any]:
-        """处理 pce_status 请求。"""
-        root = Path(project_path).resolve() if project_path else self.project_path
-        status = await get_status(root_path=root)
-        staging_summary = await self.staging.summary()
-        # 使用与当前项目对应的 InsightCache；若查询路径不同则临时构建
-        cache = self.insight_cache if root == self.project_path else InsightCache(root)
-        insight_stats = await cache.stats()
+    async def handle_status(self) -> dict[str, Any]:
+        """处理 pce_status 请求（无需初始化，随时可调用）。"""
+        root = self._bound_path
+        status = (
+            await get_status(root_path=root)
+            if root is not None
+            else {"last_index_time": None, "index_version": None, "memory_items_count": 0}
+        )
+        staging_summary = (
+            await self.staging.summary()
+            if self.staging is not None
+            else {
+                "pending_reindex": 0,
+                "pending_changed": 0,
+                "pending_deleted": 0,
+                "session_acknowledged": 0,
+            }
+        )
+        insight_stats = (
+            await self.insight_cache.stats() if self.insight_cache is not None else None
+        )
         return {
             **status,
-            "initialized": await index_exists(root_path=root),
-            "bootstrapping": not self._bootstrap_event.is_set(),
+            "initialized": self._init_state == "initialized",
+            "init_state": self._init_state,
+            "bootstrapping": self._init_state == "initializing",
+            "last_init_error": self._last_init_error,
             "bootstrap_warnings": list(self._bootstrap_warnings),
-            "project_path": str(root),
+            "project_path": str(root) if root is not None else None,
             "staging": staging_summary,
-            "watcher_running": self.watcher.running,
-            "insight_stats": insight_stats.model_dump(mode="json"),
+            "watcher_running": self.watcher.running if self.watcher is not None else False,
+            "insight_stats": (
+                insight_stats.model_dump(mode="json") if insight_stats is not None else None
+            ),
         }
 
     async def handle_edit(
@@ -471,6 +639,10 @@ class PCEContext:
         """
         if tool_name not in EDIT_TOOL_NAMES:
             raise SerenaClientError(f"不允许的写工具: {tool_name}")
+        self._require_initialized()
+        assert self.serena_client is not None
+        assert self.staging is not None
+
         result = await self.serena_client.call(tool_name, arguments)
 
         # 从参数中提取受影响的文件路径，记录到暂存区
@@ -487,9 +659,14 @@ class PCEContext:
         请立即将 Memory 更新到最新"。因此使用 list_pending_reindex
         获取全部待索引条目，索引完成后清空暂存区。
         """
+        self._require_initialized()
+        assert self.serena_client is not None
+        assert self.staging is not None
+        assert self.insight_cache is not None
+
         async with self._sync_lock:
             await self.serena_client.disconnect()
-            await self.serena_client.connect(self.project_path, self.serena_path)
+            await self.serena_client.connect(self.project_path)
 
             dirty = await self.staging.list_pending_reindex()
             if not dirty.empty:
@@ -520,7 +697,7 @@ class PCEContext:
                 )
                 message = "Serena 已重连，PCE 索引全量重建完成"
 
-            self._initialized = True
+            self._init_state = "initialized"
             logger.info(
                 f"pce_sync: 完成 — "
                 f"{snapshot.build_stats.total_files} 文件, "
@@ -543,31 +720,6 @@ class PCEContext:
 # ============================================================================
 
 
-async def _ensure_serena(serena_path: Path) -> None:
-    """确保 Serena 代码库已就绪,不存在时自动从 GitHub clone。
-
-    前置要求: git 已安装并在 PATH 中。
-    uv 会在首次 `uv run` 时自动安装 Serena 的 Python 依赖,无需手动操作。
-    """
-    if serena_path.is_dir():
-        return
-
-    logger.info(f"Serena 未安装,正在自动 clone 到 {serena_path} (需要 git 和网络连接)...")
-    process = await asyncio.create_subprocess_exec(
-        "git", "clone", "--depth=1",
-        "https://github.com/oraios/serena.git",
-        str(serena_path),
-    )
-    returncode = await process.wait()
-    if returncode != 0:
-        raise RuntimeError(
-            f"Serena 自动安装失败(返回码 {returncode})。"
-            "请检查: 1) git 是否已安装 2) 网络连接是否正常 "
-            "3) 或手动指定已安装的 Serena 路径: SERENA_PATH=/path/to/serena"
-        )
-    logger.info("Serena clone 完成")
-
-
 # ============================================================================
 # 主服务函数
 # ============================================================================
@@ -577,15 +729,15 @@ async def serve() -> None:
     """启动 PCE MCP Server (stdio 模式)。
 
     读取环境变量:
-        PCE_PROJECT_PATH: 目标项目根路径(默认当前目录)
-        SERENA_PATH:      Serena 安装路径(默认 <PCE根目录>/serena,不存在时自动 clone)
-        PCE_LOG_LEVEL:    日志级别(默认 INFO)
+        PCE_LOG_LEVEL:      日志级别（默认 INFO）
+        PCE_SERENA_TIMEOUT: Serena MCP 超时秒数（默认 180）
+
+    项目路径由 agent 在会话开始时通过 pce_init 工具传入，无需环境变量配置。
     """
-    # 加载 PCE 根目录的 .env(不覆盖已有的环境变量,由调用方的 env/export 优先)
+    # 加载 PCE 根目录的 .env（不覆盖已有环境变量，调用方的 env/export 优先）
     pce_root = Path(__file__).parent.parent
     load_dotenv(dotenv_path=pce_root / ".env")
 
-    # 配置日志
     log_level = os.getenv("PCE_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
@@ -593,50 +745,43 @@ async def serve() -> None:
         handlers=[logging.StreamHandler()],
     )
 
-    project_path = Path(os.getenv("PCE_PROJECT_PATH", str(Path.cwd()))).resolve()
-    # 默认 Serena 路径为 PCE 包根目录下的 serena/,首次运行时自动 clone
-    default_serena = str(pce_root / "serena")
-    serena_path = Path(os.getenv("SERENA_PATH", default_serena)).resolve()
+    logger.info("PCE Server 启动（等待 pce_init 绑定项目）")
+    ctx = PCEContext()
 
-    logger.info(f"PCE Server 启动: project={project_path}, serena={serena_path}")
-
-    # 确保 Serena 已安装(不存在时自动 clone；失败时记录日志并继续，首次工具调用时会报错)
-    try:
-        await _ensure_serena(serena_path)
-    except Exception as e:
-        logger.error(f"Serena 自动安装失败: {e}")
-
-    # 初始化组件
-    serena_timeout = _get_serena_timeout()
-    serena_client = SerenaClient(timeout_seconds=serena_timeout)
-    try:
-        await serena_client.connect(project_path, serena_path)
-    except Exception as e:
-        logger.error(f"Serena 连接失败: {e},将在首次工具调用时重试")
-
-    insight_cache = InsightCache(project_path)
-    agent = PCEAgent(insight_cache=insight_cache)
-    ctx = PCEContext(project_path, serena_path, serena_client, agent, insight_cache)
-
-    # 启动文件监听
-    await ctx.watcher.start()
-
-    # eager bootstrap：启动后立即后台校验 Serena 项目激活并构建索引
-    # pce_query / pce_impact 会 await _bootstrap_event.wait() 等待完成
-    # pce_status 不阻塞，可随时查询 bootstrapping 状态和 warnings
-    bootstrap_task = asyncio.create_task(ctx._bootstrap())
-
-    # 创建并配置 MCP Server
     server = Server("pce")
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        # 动态构建：写工具 schema 在 Serena 连接成功后才可用
-        return _build_tools(ctx.serena_client.edit_tools_schema)
+        edit_schema = (
+            ctx.serena_client.edit_tools_schema
+            if ctx.serena_client is not None
+            else None
+        )
+        return _build_tools(
+            initialized=ctx._init_state == "initialized",
+            edit_tools_schema=edit_schema,
+        )
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         try:
+            # pce_init 和 pce_status 不依赖项目初始化，优先分流
+            if name == "pce_init":
+                project_path = arguments.get("project_path", "")
+                result = await ctx.handle_init(project_path)
+                return _text_response(result)
+
+            if name == "pce_status":
+                result = await ctx.handle_status()
+                return _text_response(result)
+
+            # 其余工具在未初始化时统一返回错误
+            if ctx._init_state != "initialized":
+                return _error_response(
+                    "NOT_INITIALIZED",
+                    "not initialized, call pce_init first",
+                )
+
             await ctx.ensure_connected()
 
             if name == "pce_query":
@@ -662,10 +807,6 @@ async def serve() -> None:
                 )
                 return _text_response(result)
 
-            if name == "pce_status":
-                result = await ctx.handle_status(arguments.get("project_path"))
-                return _text_response(result)
-
             if name == "pce_sync":
                 result = await ctx.handle_sync()
                 return _text_response(result)
@@ -686,7 +827,6 @@ async def serve() -> None:
             logger.exception(f"工具调用异常: {name}")
             return _error_response("INTERNAL_ERROR", f"内部错误: {e}")
 
-    # 运行 stdio Server
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -695,12 +835,17 @@ async def serve() -> None:
                 server.create_initialization_options(),
             )
     finally:
-        bootstrap_task.cancel()
-        try:
-            await bootstrap_task
-        except asyncio.CancelledError:
-            pass
-        await ctx.watcher.stop()
+        # 各自独立清理，互不干扰
+        if ctx.watcher is not None:
+            try:
+                await ctx.watcher.stop()
+            except Exception:
+                logger.exception("watcher 停止异常")
+        if ctx.serena_client is not None:
+            try:
+                await ctx.serena_client.disconnect()
+            except Exception:
+                logger.exception("serena_client 断开异常")
 
 
 def main() -> None:

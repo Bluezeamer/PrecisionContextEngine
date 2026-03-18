@@ -4,12 +4,12 @@
 
 使用方式:
     client = SerenaClient()
-    await client.connect(project_path="/path/to/project", serena_install_path="/path/to/serena")
+    await client.connect(project_path="/path/to/project")
     result = await client.list_dir(".", recursive=False)
     await client.disconnect()
 
 或使用上下文管理器:
-    async with SerenaClient.create(project_path, serena_install_path) as client:
+    async with SerenaClient.create(project_path) as client:
         result = await client.list_dir(".", recursive=False)
 """
 
@@ -27,7 +27,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = 180
 _PROXY_ENV_KEYS = {
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -214,48 +214,40 @@ class SerenaClient:
     async def create(
         cls,
         project_path: str | Path,
-        serena_install_path: str | Path,
+        *,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-    ) -> AsyncIterator[SerenaClient]:
-        """工厂方法,作为异步上下文管理器使用,自动管理连接生命周期。
-
-        Usage:
-            async with SerenaClient.create(project_path, serena_install_path) as client:
-                result = await client.list_dir(".", recursive=False)
-        """
+    ) -> AsyncIterator["SerenaClient"]:
+        """创建已连接的 SerenaClient 上下文管理器。"""
         client = cls(timeout_seconds=timeout_seconds)
-        await client.connect(project_path, serena_install_path)
+        await client.connect(project_path)
         try:
             yield client
         finally:
             await client.disconnect()
 
-    async def connect(
-        self, project_path: str | Path, serena_install_path: str | Path
-    ) -> None:
-        """拉起 Serena 子进程并建立 MCP 连接,拉取工具 schema。
+    async def connect(self, project_path: str | Path) -> None:
+        """拉起 Serena 子进程并建立 MCP 连接，拉取工具 schema。
+
+        通过 uvx 按需下载并运行 Serena MCP 服务端（首次调用会下载，后续使用缓存）。
 
         Args:
             project_path: 目标项目根路径
-            serena_install_path: Serena 的安装目录(含 pyproject.toml)
 
         Raises:
             SerenaConnectionError: 连接或初始化失败
             SerenaTimeoutError: 初始化超时
         """
         if self.connected:
-            logger.debug("SerenaClient 已连接,跳过重复 connect")
+            logger.debug("SerenaClient 已连接，跳过重复 connect")
             return
 
         self._project_path = Path(project_path).resolve()
-        serena_path = Path(serena_install_path).resolve()
 
         server_params = StdioServerParameters(
-            command="uv",
+            command="uvx",
             args=[
-                "run",
-                "--project",
-                str(serena_path),
+                "--from",
+                "git+https://github.com/oraios/serena",
                 "serena-mcp-server",
                 "--project",
                 str(self._project_path),

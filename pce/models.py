@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import (
     AfterValidator,
@@ -238,6 +238,19 @@ class ErrorResponse(BaseSchema):
     error_code: NonEmptyStr = Field(..., description="错误代码（如 INDEX_NOT_FOUND）")
     error_message: NonEmptyStr = Field(..., description="人类可读的错误信息")
     details: Optional[NonEmptyStr] = Field(default=None, description="详细错误信息（可选）")
+
+
+class InitResponse(BaseModel):
+    """pce_init 工具的响应结果。"""
+
+    initialized: bool
+    status: Literal["initialized", "already_initialized", "init_failed"]
+    project_path: str
+    project_name: str
+    file_count: int
+    init_mode: Literal["full_build", "reused", "retry_after_failure"]
+    warnings: list[str]
+    error: str | None = None
 
 
 class QueryRequest(BaseSchema):
