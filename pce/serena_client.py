@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -57,6 +58,11 @@ def _collect_serena_env() -> dict[str, str]:
         if key.startswith("UV_") or key in _PROXY_ENV_KEYS:
             env[key] = value
     return env
+
+
+def _get_serena_python_spec() -> str:
+    """让 Serena 的 uvx 运行时跟随当前 PCE 解释器主次版本。"""
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 # ============================================================================
@@ -246,6 +252,8 @@ class SerenaClient:
         server_params = StdioServerParameters(
             command="uvx",
             args=[
+                "--python",
+                _get_serena_python_spec(),
                 "--from",
                 "git+https://github.com/oraios/serena",
                 "serena-mcp-server",

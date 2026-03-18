@@ -20,13 +20,17 @@ import asyncio
 import json
 import logging
 import os
+import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import anyio
 from dotenv import load_dotenv
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp import types
+from mcp.shared.message import SessionMessage
+from mcp.types import CallToolResult, TextContent, Tool
 
 from .agent import PCEAgent
 from .insight_cache import InsightCache
@@ -42,6 +46,54 @@ from .serena_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _safe_stdio_server():
+    """更保守的 stdio transport，避免 anyio.AsyncFile 在复杂运行时下卡住写回。"""
+    read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
+    write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
+
+    def _readline() -> str:
+        return sys.stdin.buffer.readline().decode("utf-8")
+
+    def _write_line(line: str) -> None:
+        sys.stdout.buffer.write(line.encode("utf-8"))
+        sys.stdout.buffer.flush()
+
+    async def stdin_reader() -> None:
+        try:
+            async with read_stream_writer:
+                while True:
+                    line = await anyio.to_thread.run_sync(_readline)
+                    if not line:
+                        break
+                    try:
+                        message = types.JSONRPCMessage.model_validate_json(line)
+                    except Exception as exc:
+                        await read_stream_writer.send(exc)
+                        continue
+
+                    await read_stream_writer.send(SessionMessage(message))
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async def stdout_writer() -> None:
+        try:
+            async with write_stream_reader:
+                async for session_message in write_stream_reader:
+                    payload = (
+                        session_message.message.model_dump_json(by_alias=True, exclude_none=True)
+                        + "\n"
+                    )
+                    await anyio.to_thread.run_sync(_write_line, payload)
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stdin_reader)
+        tg.start_soon(stdout_writer)
+        yield read_stream, write_stream
 
 
 # ============================================================================
@@ -70,6 +122,15 @@ def _error_response(error_code: str, message: str) -> list[TextContent]:
         "error_code": error_code,
         "error_message": message,
     })
+
+
+def _structured_tool_result(content: dict[str, Any], *, is_error: bool = False) -> CallToolResult:
+    """返回带 structuredContent 的 MCP 工具结果。"""
+    return CallToolResult(
+        content=_text_response(content),
+        structuredContent=content,
+        isError=is_error,
+    )
 
 
 def _get_serena_timeout() -> int:
@@ -766,13 +827,13 @@ async def serve() -> None:
         return _build_tools(edit_tools_schema=edit_schema)
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent] | CallToolResult:
         try:
             # pce_init 和 pce_status 不依赖项目初始化，优先分流
             if name == "pce_init":
                 project_path = arguments.get("project_path", "")
                 result = await ctx.handle_init(project_path)
-                return _text_response(result)
+                return _structured_tool_result(result)
 
             if name == "pce_status":
                 result = await ctx.handle_status()
@@ -831,7 +892,7 @@ async def serve() -> None:
             return _error_response("INTERNAL_ERROR", f"内部错误: {e}")
 
     try:
-        async with stdio_server() as (read_stream, write_stream):
+        async with _safe_stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream,
                 write_stream,
