@@ -28,6 +28,7 @@ AcknowledgeCallback = Callable[[list[str]], Awaitable[None]]
 
 import aiofiles
 import litellm
+import litellm.exceptions as litellm_exc
 
 from .agent_runtime.contracts import (
     MAX_SPAWNS_PER_LOOP,
@@ -54,6 +55,87 @@ _CONTEXT_WINDOW = int(os.getenv("PCE_CONTEXT_WINDOW", "256000"))
 #        "openrouter/stepfun/step-3.5-flash:free"  (通过 OpenRouter)
 #        "anthropic/claude-3-haiku"  (通过 Anthropic)
 MODEL = os.getenv("PCE_MODEL", "openrouter/stepfun/step-3.5-flash:free")
+
+
+# ---------------------------------------------------------------------------
+# 模型降级路由（fallback chain）
+# ---------------------------------------------------------------------------
+
+def _parse_model_fallbacks(raw: str) -> list[str]:
+    """解析逗号分隔的 fallback 模型列表，按出现顺序去重。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in raw.split(","):
+        model = item.strip()
+        if model and model not in seen:
+            seen.add(model)
+            result.append(model)
+    return result
+
+
+MODEL_FALLBACKS: list[str] = _parse_model_fallbacks(
+    os.getenv("PCE_MODEL_FALLBACKS", "")
+)
+
+
+class LLMCompletionError(RuntimeError):
+    """所有候选模型均失败时抛出，携带完整降级记录。"""
+
+    def __init__(self, attempts: list[dict[str, str]]) -> None:
+        self.attempts = attempts
+        self.models = [a["model"] for a in attempts]
+        parts = [f'{a["model"]}({a["error_type"]}): {a["reason"]}' for a in attempts]
+        super().__init__(
+            f"LLM fallback chain exhausted; models={self.models}; " + " | ".join(parts)
+        )
+
+
+def _should_fallback_model(exc: Exception) -> bool:
+    """判断是否应切换到下一个模型（不可恢复的模型级错误）。
+
+    仅对以下情况触发 fallback，不在同一模型上重复重试（litellm 已重试过）：
+    - 限流（429）
+    - 鉴权/权限（401/403）
+    - 模型不存在（404 或特征文本）
+    """
+    # 优先使用 isinstance 判断（稳定、不受类名重命名影响）
+    if isinstance(exc, (
+        litellm_exc.RateLimitError,
+        litellm_exc.AuthenticationError,
+        litellm_exc.PermissionDeniedError,
+        litellm_exc.NotFoundError,
+    )):
+        return True
+    if isinstance(exc, (litellm_exc.BadRequestError, litellm_exc.InvalidRequestError)):
+        msg = _stringify_error(exc).lower()
+        return any(k in msg for k in (
+            "model not found", "unknown model", "invalid model",
+            "does not exist", "no deployments available",
+        ))
+    return False
+
+
+def _stringify_error(exc: Exception) -> str:
+    """提取稳定、可读的异常原因字符串。"""
+    return str(getattr(exc, "message", None) or exc or type(exc).__name__)
+
+
+def _extract_finish_reason(response: Any) -> str:
+    """从 litellm 响应中提取 finish_reason，缺失时默认 'stop'。"""
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices", [])
+    if choices:
+        choice = choices[0]
+        raw = (
+            getattr(choice, "finish_reason", None)
+            if not isinstance(choice, dict)
+            else choice.get("finish_reason")
+        )
+        if raw:
+            return str(raw)
+    return "stop"
+
 
 SYSTEM_PROMPT_HEADER = """\
 你是 PCE (Precision Context Engine) 的核心 Agent。
@@ -300,6 +382,7 @@ def _parse_query_response(content: str, session_id: str) -> QueryResponse:
         "__REACT_DELIVER_EMPTY__": "Agent 提交了空结论，推理可能不完整，请重试。",
         "__REACT_LENGTH_EXHAUSTED__": "Agent 输出被多次截断且续写次数耗尽，请重试或缩小问题范围。",
         "__REACT_TIMEOUT__": "Agent 调用模型超时且重试耗尽，请稍后重试。",
+        "__REACT_LLM_EXHAUSTED__": "Agent 的模型降级链已全部失败，请检查模型配置或限流状态后重试。",
     }
     if content in _FALLBACK_ANSWERS:
         return QueryResponse(
@@ -354,6 +437,7 @@ def _parse_impact_response(content: str, session_id: str) -> ImpactResponse:
         "__REACT_DELIVER_EMPTY__": "Agent 提交了空结论，分析可能不完整，请重试。",
         "__REACT_LENGTH_EXHAUSTED__": "Agent 输出被多次截断且续写次数耗尽，请重试或缩小分析范围。",
         "__REACT_TIMEOUT__": "Agent 调用模型超时且重试耗尽，请稍后重试。",
+        "__REACT_LLM_EXHAUSTED__": "Agent 的模型降级链已全部失败，请检查模型配置或限流状态后重试。",
     }
     if content in _FALLBACK_RISKS:
         return ImpactResponse(
@@ -418,10 +502,14 @@ class PCEAgent:
     def __init__(
         self,
         model: str | None = None,
+        model_fallbacks: list[str] | None = None,
         max_seconds: float = MAX_SECONDS,
         insight_cache: InsightCache | None = None,
     ) -> None:
         self._model = model or MODEL
+        # 降级链：去掉与主模型相同的候选项
+        raw_fallbacks = model_fallbacks if model_fallbacks is not None else MODEL_FALLBACKS
+        self._model_fallbacks = [m for m in raw_fallbacks if m and m != self._model]
         self._max_seconds = max_seconds
         self._deliver_tool = DELIVER_TOOL
         self._insight_cache = insight_cache
@@ -592,34 +680,84 @@ class PCEAgent:
     ) -> tuple[Any, str]:
         """调用 litellm.completion，返回 (response, finish_reason)。
 
+        支持模型降级路由：当主模型遇到不可恢复的模型级错误（限流、鉴权、模型不存在等）时，
+        依次尝试 fallback 模型。litellm 本身已有重试机制，此处不对同一模型重复重试。
+
         finish_reason 取值: "stop" | "tool_calls" | "length" | 其他
         缺失时默认 "stop"。
+
+        Raises:
+            asyncio.TimeoutError: 单步超时（由上层 _run_react_loop 处理）
+            LLMCompletionError: 所有候选模型均失败（fallback chain 非空时）
+            其他 litellm 异常: fallback chain 为空时原样透传
         """
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                litellm.completion,
-                model=self._model,
-                messages=messages,
-                tools=tools if tools else None,
-                temperature=0.2,
-            ),
-            timeout=60.0,
-        )
-        # 从 response.choices[0].finish_reason 中提取，兼容 Pydantic 对象和 dict
-        finish_reason = "stop"
-        choices = getattr(response, "choices", None)
-        if choices is None and isinstance(response, dict):
-            choices = response.get("choices", [])
-        if choices:
-            choice = choices[0]
-            raw = (
-                getattr(choice, "finish_reason", None)
-                if not isinstance(choice, dict)
-                else choice.get("finish_reason")
-            )
-            if raw:
-                finish_reason = str(raw)
-        return response, finish_reason
+        # litellm.Timeout 不是 asyncio.TimeoutError 的子类，统一转换
+        _timeout_types = (asyncio.TimeoutError, litellm_exc.Timeout)
+
+        model_chain = [self._model, *self._model_fallbacks]
+
+        # fallback 为空时保持原行为：直接调用，异常原样透传
+        if len(model_chain) == 1:
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        litellm.completion,
+                        model=self._model,
+                        messages=messages,
+                        tools=tools if tools else None,
+                        temperature=0.2,
+                    ),
+                    timeout=60.0,
+                )
+            except litellm_exc.Timeout:
+                raise asyncio.TimeoutError("litellm.Timeout -> asyncio.TimeoutError")
+            return response, _extract_finish_reason(response)
+
+        # 有 fallback 时：逐个尝试，记录每次失败
+        attempts: list[dict[str, str]] = []
+        for idx, model in enumerate(model_chain):
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        litellm.completion,
+                        model=model,
+                        messages=messages,
+                        tools=tools if tools else None,
+                        temperature=0.2,
+                    ),
+                    timeout=60.0,
+                )
+                if idx > 0:
+                    logger.info("模型降级成功: %s (第 %d 候选)", model, idx + 1)
+                return response, _extract_finish_reason(response)
+            except _timeout_types:
+                # 超时由上层统一处理，不纳入降级逻辑
+                raise asyncio.TimeoutError("timeout in _completion")
+            except Exception as exc:
+                if not _should_fallback_model(exc):
+                    # 非模型级错误（如网络中断、JSON 解析失败等），直接透传
+                    raise
+
+                attempts.append({
+                    "model": model,
+                    "error_type": type(exc).__name__,
+                    "reason": _stringify_error(exc),
+                })
+
+                if idx < len(model_chain) - 1:
+                    next_model = model_chain[idx + 1]
+                    logger.warning(
+                        "模型调用失败，触发降级: %s -> %s (%s)",
+                        model, next_model, attempts[-1]["error_type"],
+                    )
+                    continue
+
+                # 所有模型均已尝试
+                logger.warning("模型降级链耗尽: %s", [a["model"] for a in attempts])
+                raise LLMCompletionError(attempts) from exc
+
+        # 理论上不可达，但类型检查需要
+        raise LLMCompletionError(attempts)
 
     @staticmethod
     def _extract_next_prompt_size(response: Any) -> int:
@@ -705,6 +843,9 @@ class PCEAgent:
             summary_msg = _extract_message(summary_response)
             summary_text = str(summary_msg.get("content") or "").strip()
             compact_tokens = self._extract_next_prompt_size(summary_response)
+        except LLMCompletionError:
+            # 模型降级链耗尽，不应被 compact 吞掉，让上层处理
+            raise
         except Exception as e:
             logger.warning(f"compact 摘要生成失败，跳过压缩（本轮不再重试）: {e}")
             return messages, token_used, True  # 标记失败，本轮不再重试
@@ -746,6 +887,7 @@ class PCEAgent:
                 __REACT_NO_TOOL_EXHAUSTED__   — 无 tool_calls 纠正次数耗尽
                 __REACT_LENGTH_EXHAUSTED__    — length 截断续写次数耗尽
                 __REACT_TIMEOUT__             — 单步超时重试次数耗尽
+                __REACT_LLM_EXHAUSTED__       — 模型降级链耗尽
                 __REACT_DELIVER_EMPTY__       — deliver 参数为空或解析失败
 
         计数器独立，互不干扰:
@@ -780,9 +922,13 @@ class PCEAgent:
                 return "__REACT_TIMEOUT_BUDGET__", None
 
             # ── 上下文 compact 检查 ───────────────────────────────────────────
-            messages, token_used, compact_failed = await self._maybe_compact(
-                messages, token_used, compact_failed
-            )
+            try:
+                messages, token_used, compact_failed = await self._maybe_compact(
+                    messages, token_used, compact_failed
+                )
+            except LLMCompletionError as e:
+                logger.warning("compact 阶段模型降级链耗尽，终止 ReAct 循环: %s", e)
+                return "__REACT_LLM_EXHAUSTED__", None
 
             # ── LLM 调用，内嵌超时重试（每步独立计数）────────────────────────
             timeout_retries = 0
@@ -792,6 +938,9 @@ class PCEAgent:
                         messages, tools_schema
                     )
                     break
+                except LLMCompletionError as e:
+                    logger.warning("模型降级链耗尽，终止 ReAct 循环: %s", e)
+                    return "__REACT_LLM_EXHAUSTED__", None
                 except asyncio.TimeoutError:
                     timeout_retries += 1
                     if timeout_retries <= _MAX_TIMEOUT_RETRIES:

@@ -685,6 +685,7 @@ def test_fallback_markers():
         "__REACT_DELIVER_EMPTY__": "空结论",
         "__REACT_LENGTH_EXHAUSTED__": "截断",
         "__REACT_TIMEOUT__": "超时",
+        "__REACT_LLM_EXHAUSTED__": "降级链",
     }
     for marker, keyword in markers.items():
         r = _parse_query_response(marker, sid)
