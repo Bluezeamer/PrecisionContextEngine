@@ -177,7 +177,6 @@ def _build_tools(
                 trigger=(
                     "需要理解模块职责、查找函数/类定义、理解调用关系时调用。"
                     "也应在准备修改某段代码前使用,用于精确定位目标符号的 name_path 与行号范围。"
-                    "需先调用 pce_init 初始化项目。"
                 ),
                 replaces=(
                     "替代传统 ls + cat + grep 的多步探索链;"
@@ -207,10 +206,7 @@ def _build_tools(
                     "可在 target 字段末尾追加格式要求,例如'请以结构化列表返回每处引用点的行号、name_path 和代码片段',"
                     "便于上层 Agent 直接落地修改而无需二次检索。"
                 ),
-                trigger=(
-                    "上层 Agent 准备修改某个符号或文件之前调用,获取完整影响边界与精确修改位置。"
-                    "需先调用 pce_init 初始化项目。"
-                ),
+                trigger="上层 Agent 准备修改某个符号或文件之前调用,获取完整影响边界与精确修改位置。",
                 replaces=(
                     "替代手动追踪引用链(Cmd+Shift+F / grep -r)与反复 build 试错;"
                     "多步检索与推理在 PCE 独立上下文完成,结果以结构化形式一次性交付给上层 Agent。"
@@ -749,7 +745,14 @@ async def serve() -> None:
     logger.info("PCE Server 启动（等待 pce_init 绑定项目）")
     ctx = PCEContext()
 
-    server = Server("pce")
+    server = Server(
+        "pce",
+        instructions=(
+            "PCE 工作流: 第一步必须调用 pce_init 绑定并初始化项目。\n"
+            "初始化完成后,再使用 pce_query、pce_impact、pce_sync 及相关写工具。\n"
+            "若未初始化就调用其他工具,会返回 NOT_INITIALIZED 错误。"
+        ),
+    )
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
