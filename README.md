@@ -14,27 +14,23 @@ PCE 是一个运行在上层 Agent（如 Claude Code）与 Serena 之间的 **MC
 
 ### 环境要求
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) 包管理器
-- [git](https://git-scm.com/)（用于自动安装 Serena）
+- [uv](https://docs.astral.sh/uv/) 包管理器（用于 `uvx` 命令）
 
 ### 安装
 
+PCE 通过 `uvx` 按需运行，无需克隆仓库或手动安装依赖：
+
 ```bash
-# 克隆项目
-git clone <repository-url>
-cd PrecisionContextEngine
+# 验证是否可运行（可选）
+uvx --from git+<repository-url> pce serve
 
-# 安装依赖
-uv sync
-
-# 配置 API Key
-cp .env.example .env
-# 编辑 .env，填入 OPENROUTER_API_KEY（或其他供应商的 Key）
+# 配置 API Key（在目标项目目录下创建 .env 文件）
+echo "OPENROUTER_API_KEY=sk-or-..." > .env
 ```
 
-> **说明**: Serena 无需手动安装。首次运行时会自动 clone 到 `serena/` 目录。
-> 项目索引也无需手动初始化——PCE 启动时会自动完成 bootstrap（项目激活校验 + 索引构建）。
+> **说明**：Serena（PCE 的代码分析后端）和 PCE 本身均通过 `uvx` 自动获取与缓存，首次运行时会自动下载，后续复用缓存。
+> 项目索引在 Agent 调用 `pce_init` 工具后自动构建，无需手动操作。
+> 通过 Claude Code 使用时，MCP 配置会自动启动 PCE，通常无需手动在终端执行上面的命令。
 
 ### 配置 Claude Code
 
@@ -44,27 +40,40 @@ cp .env.example .env
 {
   "mcpServers": {
     "pce": {
-      "command": "uv",
-      "args": ["run", "--project", "/path/to/PrecisionContextEngine", "pce", "serve"],
-      "env": {
-        "PCE_PROJECT_PATH": "/path/to/your/project"
-      }
+      "command": "uvx",
+      "args": ["--from", "git+<repository-url>", "pce", "serve"]
     }
   }
 }
 ```
 
-> API Key 从 `.env` 文件自动加载，无需在 MCP 配置中重复填写。
+> API Key 从目标项目根目录的 `.env` 文件自动加载，无需在 MCP 配置中重复填写。
 
 ### 在 Claude Code 中使用
+
+每个会话开始时，**首先调用 `pce_init` 绑定目标项目**（仅需调用一次）：
+
+```
+> 使用 pce_init(project_path="/path/to/your/project") 初始化项目
+```
+
+初始化完成后，即可使用其余工具：
 
 ```
 > 使用 pce_query 查询: "认证逻辑的入口在哪里?"
 > 使用 pce_impact 分析修改影响: target="UserSession", change_type="modify"
-> 使用 pce_status 查看当前索引状态和 bootstrap warnings
+> 使用 pce_status 查看当前索引状态和 warnings
 ```
 
+> 若未调用 `pce_init`，`pce_query` / `pce_impact` / `pce_sync` 及写工具均不可用；`pce_status` 可在初始化前后随时调用。
+
 ## MCP 工具
+
+### `pce_init`
+绑定目标项目并触发初始化。**每个会话开始时首先调用一次**，传入目标项目的绝对路径。
+
+- 内部流程：路径校验 → 状态机检查 → Serena 连接（`uvx` 拉起）→ `activate_project` 校验 → 全量/增量索引构建
+- 同一路径重复调用可直接复用（幂等）；若已绑定其他路径则返回错误，需重启服务切换项目
 
 ### `pce_query`
 自然语言查询代码库。PCE 内部通过 ReAct 循环驱动 Serena 工具检索代码结构，返回经过推理的结构化答案。
@@ -87,14 +96,14 @@ PCE 还会透传 Serena 的符号编辑工具（加 `pce_` 前缀）：`pce_repl
 
 ```
 上层 Agent (Claude Code 等)
-    ↓ MCP (pce_query / pce_impact / pce_status / pce_sync)
+    ↓ MCP (pce_init / pce_query / pce_impact / pce_status / pce_sync)
 PCE MCP Server
     ├─ PCEAgent (ReAct 循环，时间预算制)
     │   ├─ SubAgent spawn (深度限制 depth≤1)
     │   └─ InsightCache (跨会话认知缓存)
-    ├─ Bootstrap (eager 初始化 + activate_project 校验)
+    ├─ Bootstrap（pce_init 驱动：路径校验 → Serena 连接 → activate_project → 索引构建）
     ├─ FileWatcher + StagingArea (实时文件变更追踪)
-    └─ SerenaClient (MCP stdio 通信)
+    └─ SerenaClient (MCP stdio 通信，uvx 按需拉起)
         ↓ MCP
 Serena MCP Server (LSP + 文件系统)
 ```
@@ -126,11 +135,9 @@ pce/
 | `PCE_MODEL` | Agent 推理模型 | `openrouter/stepfun/step-3.5-flash:free` |
 | `PCE_MODEL_FALLBACKS` | 模型降级链（逗号分隔） | 空（不降级） |
 | `PCE_ANNOTATION_MODEL` | 索引构建时的语义注解模型 | 同 `PCE_MODEL` |
-| `PCE_SERENA_TIMEOUT` | Serena 连接/工具调用超时（秒） | `30` |
+| `PCE_SERENA_TIMEOUT` | Serena 连接/工具调用超时（秒） | `180` |
 | `PCE_CONTEXT_WINDOW` | 上下文窗口大小（token） | `256000` |
 | `PCE_LOG_LEVEL` | 日志级别 | `INFO` |
-| `PCE_PROJECT_PATH` | 目标项目根路径 | 当前工作目录 |
-| `SERENA_PATH` | Serena 安装路径 | `<PCE根目录>/serena` |
 | `OPENROUTER_API_KEY` | OpenRouter API 密钥 | — |
 
 ### 模型降级路由

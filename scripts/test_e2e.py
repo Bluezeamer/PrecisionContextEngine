@@ -1,7 +1,7 @@
 """
 PCE 端到端集成测试 — 进程内直连，跑通真实 Serena + 真实 LLM。
 
-跳过 stdio MCP Server 层，直接构造 PCEContext 并调用 handle_query / handle_impact。
+跳过 stdio MCP Server 层，直接构造 PCEContext 并调用 handle_init / handle_query / handle_impact。
 即使单个场景失败，也会继续后续场景。
 
 运行：
@@ -22,16 +22,12 @@ from typing import Any, Awaitable, Callable
 
 from dotenv import load_dotenv
 
-from pce.agent import PCEAgent
-from pce.insight_cache import InsightCache
-from pce.serena_client import SerenaClient
 from pce.server import PCEContext
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-MAX_SECONDS = 120.0  # 单次推理时间上限
-SERENA_TIMEOUT = 30  # Serena 启动/初始化超时
+MAX_SECONDS = 120.0  # 单次推理时间上限（当前仅用于配置展示）
 
 logger = logging.getLogger("pce.e2e")
 
@@ -77,19 +73,19 @@ async def _run_case(
         return payload
 
 
-async def _cleanup(
-    ctx: PCEContext | None, client: SerenaClient | None
-) -> None:
+async def _cleanup(ctx: PCEContext | None) -> None:
     """容错清理：即使某步失败也尽量完成后续清理。"""
-    if ctx is not None:
+    if ctx is None:
+        return
+    if ctx.watcher is not None:
         try:
             await ctx.watcher.stop()
             logger.info("FileWatcher 已停止")
         except Exception as exc:
             logger.warning("FileWatcher 停止失败: %s", exc)
-    if client is not None:
+    if ctx.serena_client is not None:
         try:
-            await client.disconnect()
+            await ctx.serena_client.disconnect()
             logger.info("Serena 已断开")
         except Exception as exc:
             logger.warning("Serena 断开失败: %s", exc)
@@ -109,12 +105,10 @@ async def main() -> None:
     )
 
     project_path = Path(os.getenv("PCE_PROJECT_PATH", str(root))).resolve()
-    serena_path = Path(os.getenv("SERENA_PATH", str(root / "serena"))).resolve()
 
     _banner("PCE 端到端集成测试")
     _pprint("配置", {
         "project_path": str(project_path),
-        "serena_path": str(serena_path),
         "model": os.getenv("PCE_MODEL", "(default)"),
         "max_seconds": MAX_SECONDS,
         "openrouter_key": "已设置" if os.getenv("OPENROUTER_API_KEY") else "未设置",
@@ -122,40 +116,24 @@ async def main() -> None:
 
     if not os.getenv("OPENROUTER_API_KEY"):
         raise RuntimeError("OPENROUTER_API_KEY 未配置，请检查 .env")
-    if not serena_path.exists():
-        raise RuntimeError(f"Serena 目录不存在: {serena_path}")
 
-    client: SerenaClient | None = None
     ctx: PCEContext | None = None
     results: list[dict[str, Any]] = []
 
     try:
-        # ── 初始化 ──────────────────────────────────────────────
+        # ── 初始化（通过 pce_init 驱动，与 serve() 中 agent 调用行为一致）──
         t0 = time.perf_counter()
-        client = SerenaClient(timeout_seconds=SERENA_TIMEOUT)
-        await client.connect(project_path, serena_path)
-
-        cache = InsightCache(project_path)
-        agent = PCEAgent(max_seconds=MAX_SECONDS, insight_cache=cache)
-        ctx = PCEContext(
-            project_path=project_path,
-            serena_path=serena_path,
-            serena_client=client,
-            agent=agent,
-            insight_cache=cache,
-        )
-        await ctx.watcher.start()
-
-        # 触发 bootstrap（与 serve() 中行为一致）
-        await ctx._bootstrap()
+        ctx = PCEContext()
+        init_result = await ctx.handle_init(str(project_path))
 
         init_elapsed = round(time.perf_counter() - t0, 2)
         _pprint("初始化完成", {
             "elapsed_s": init_elapsed,
-            "serena_connected": client.connected,
-            "watcher_running": ctx.watcher.running,
-            "bootstrap_warnings": list(ctx._bootstrap_warnings),
+            "init_result": init_result,
         })
+
+        if not init_result.get("initialized"):
+            raise RuntimeError(f"初始化失败: {init_result.get('error', '未知原因')}")
 
         # ── 场景 1: pce_query ───────────────────────────────────
         query_sid = str(uuid.uuid4())
@@ -192,7 +170,7 @@ async def main() -> None:
             ],
         })
     finally:
-        await _cleanup(ctx, client)
+        await _cleanup(ctx)
 
 
 if __name__ == "__main__":
