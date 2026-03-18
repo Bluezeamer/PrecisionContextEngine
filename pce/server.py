@@ -252,6 +252,9 @@ class PCEContext:
         self._sync_lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._initialized = False
+        # bootstrap 状态：eager 初始化完成信号 + 过程中收集的 warning
+        self._bootstrap_event = asyncio.Event()
+        self._bootstrap_warnings: list[str] = []
         # 文件变更暂存区与监听
         self.staging = StagingArea(project_path)
         self.watcher = FileWatcher(self.staging)
@@ -262,69 +265,120 @@ class PCEContext:
             logger.info("重新连接 Serena...")
             await self.serena_client.connect(self.project_path, self.serena_path)
 
-    async def _ensure_initialized(self) -> None:
-        """确保 PCE 索引可用（会话内仅执行一次）。
+    async def _run_index_refresh(self) -> None:
+        """执行索引刷新逻辑（全量或增量）。
 
-        会话首次调用时：
+        调用方负责加锁（_sync_lock）与状态位更新。
         1. 索引不存在 → 全量构建 + 清空暂存区
         2. 索引存在但暂存区有累积变更 → 增量更新 + 清空暂存区
-        3. 索引存在且无变更 → 直接可用
-
-        完成后设置 _initialized = True，后续调用直接跳过。
-        会话中间的新变更由脏文件上下文注入 + Agent 实时读取补偿，
-        留待下次会话开始时再统一沉淀到 Memory。
+        3. 索引存在且无变更 → 直接跳过
         """
+        if not await index_exists(root_path=self.project_path):
+            logger.info("PCE 索引不存在，开始全量构建...")
+            dirty = await self.staging.list_pending_reindex()
+            all_paths = dirty.changed + dirty.deleted
+            hash_snapshot = (
+                await self.staging.snapshot_hashes(all_paths)
+                if all_paths
+                else None
+            )
+            await build_index(
+                project_path=self.project_path,
+                serena_client=self.serena_client,
+                memory_root=self.project_path,
+            )
+            if all_paths:
+                await self.staging.acknowledge_after_reindex(
+                    all_paths, expected_hashes=hash_snapshot,
+                )
+            logger.info("PCE 索引全量构建完成")
+            return
+
+        dirty = await self.staging.list_pending_reindex()
+        if not dirty.empty:
+            all_paths = dirty.changed + dirty.deleted
+            hash_snapshot = await self.staging.snapshot_hashes(all_paths)
+            logger.info(
+                f"检测到 {len(dirty.changed)} 个变更、"
+                f"{len(dirty.deleted)} 个删除，执行增量索引更新"
+            )
+            await build_index_incremental(
+                project_path=self.project_path,
+                serena_client=self.serena_client,
+                memory_root=self.project_path,
+                changed_files=dirty.changed,
+                deleted_files=dirty.deleted,
+            )
+            await self.staging.acknowledge_after_reindex(
+                all_paths, expected_hashes=hash_snapshot
+            )
+            logger.info("增量索引更新完成")
+
+    async def _bootstrap(self) -> None:
+        """后台 bootstrap 任务：校验 Serena 项目激活 + 构建索引。
+
+        不依赖 LLM，纯程序化。失败仅记录 warning，不阻塞 event 置位。
+        pce_query / pce_impact 通过 await _bootstrap_event.wait() 等待此任务完成。
+        """
+        if self._bootstrap_event.is_set():
+            return
+
+        async with self._init_lock:
+            if self._bootstrap_event.is_set():
+                return
+
+            try:
+                async with self._sync_lock:
+                    # 1. 显式校验 Serena 项目激活
+                    #    Serena 启动参数已带 --project，但启动时激活失败会被静默吞掉。
+                    #    再调一次 activate_project 可捕获激活失败并记录 warning。
+                    try:
+                        result = await self.serena_client.call(
+                            "activate_project",
+                            {"project": str(self.project_path)},
+                        )
+                        logger.info("Serena 项目激活校验成功: %s", result)
+                    except Exception as e:
+                        warning = (
+                            f"Serena 项目激活校验失败: {e}。"
+                            "符号级索引可能不完整，请检查 .serena/project.yml 配置。"
+                        )
+                        self._bootstrap_warnings.append(warning)
+                        logger.warning(warning)
+
+                    # 2. 构建索引
+                    try:
+                        await self._run_index_refresh()
+                    except Exception as e:
+                        warning = f"Bootstrap 索引构建失败: {e}"
+                        self._bootstrap_warnings.append(warning)
+                        logger.warning(warning)
+            except Exception as e:
+                self._bootstrap_warnings.append(f"Bootstrap 异常: {e}")
+                logger.exception("Bootstrap 异常")
+            finally:
+                # 只有索引确实存在时才标记 initialized，否则后续可通过
+                # _ensure_initialized 补救
+                if await index_exists(root_path=self.project_path):
+                    self._initialized = True
+                # event 无论如何都 set，避免 pce_query/pce_impact 永远挂住
+                self._bootstrap_event.set()
+                if self._bootstrap_warnings:
+                    logger.warning(
+                        "Bootstrap 完成（有 %d 条 warning）", len(self._bootstrap_warnings)
+                    )
+                else:
+                    logger.info("Bootstrap 完成（无 warning）")
+
+    async def _ensure_initialized(self) -> None:
+        """按需执行索引初始化（保留给 pce_sync 重连后使用）。"""
         if self._initialized:
             return
         async with self._init_lock:
-            # double-check: 可能在等锁期间被另一个并发调用完成
             if self._initialized:
                 return
             async with self._sync_lock:
-                if not await index_exists(root_path=self.project_path):
-                    logger.info("PCE 索引不存在，开始全量构建...")
-                    # 全量构建前快照 hash，防止构建期间新变更被提前确认
-                    dirty = await self.staging.list_pending_reindex()
-                    all_paths = dirty.changed + dirty.deleted
-                    hash_snapshot = (
-                        await self.staging.snapshot_hashes(all_paths)
-                        if all_paths
-                        else None
-                    )
-                    await build_index(
-                        project_path=self.project_path,
-                        serena_client=self.serena_client,
-                        memory_root=self.project_path,
-                    )
-                    # 全量构建完成后，确认并清理暂存区
-                    if all_paths:
-                        await self.staging.acknowledge_after_reindex(
-                            all_paths, expected_hashes=hash_snapshot,
-                        )
-                    logger.info("PCE 索引全量构建完成")
-                else:
-                    # 索引已存在，检查暂存区是否有待索引的变更
-                    dirty = await self.staging.list_pending_reindex()
-                    if not dirty.empty:
-                        all_paths = dirty.changed + dirty.deleted
-                        hash_snapshot = await self.staging.snapshot_hashes(all_paths)
-
-                        logger.info(
-                            f"检测到 {len(dirty.changed)} 个变更、"
-                            f"{len(dirty.deleted)} 个删除，执行增量索引更新"
-                        )
-                        await build_index_incremental(
-                            project_path=self.project_path,
-                            serena_client=self.serena_client,
-                            memory_root=self.project_path,
-                            changed_files=dirty.changed,
-                            deleted_files=dirty.deleted,
-                        )
-                        await self.staging.acknowledge_after_reindex(
-                            all_paths, expected_hashes=hash_snapshot
-                        )
-                        logger.info("增量索引更新完成")
-
+                await self._run_index_refresh()
                 self._initialized = True
 
     @staticmethod
@@ -345,6 +399,8 @@ class PCEContext:
         self, query: str, session_id: str | None
     ) -> dict[str, Any]:
         """处理 pce_query 请求。"""
+        await self._bootstrap_event.wait()
+        # bootstrap 可能失败（索引未建成），此时 _ensure_initialized 会补救
         await self._ensure_initialized()
 
         # 注入暂存区脏文件信息到查询上下文
@@ -371,6 +427,7 @@ class PCEContext:
         file: str | None,
     ) -> dict[str, Any]:
         """处理 pce_impact 请求。"""
+        await self._bootstrap_event.wait()
         await self._ensure_initialized()
         # 将 file 参数附加到 target 描述中
         effective_target = f"{target} (file={file})" if file else target
@@ -396,6 +453,8 @@ class PCEContext:
         return {
             **status,
             "initialized": await index_exists(root_path=root),
+            "bootstrapping": not self._bootstrap_event.is_set(),
+            "bootstrap_warnings": list(self._bootstrap_warnings),
             "project_path": str(root),
             "staging": staging_summary,
             "watcher_running": self.watcher.running,
@@ -562,6 +621,11 @@ async def serve() -> None:
     # 启动文件监听
     await ctx.watcher.start()
 
+    # eager bootstrap：启动后立即后台校验 Serena 项目激活并构建索引
+    # pce_query / pce_impact 会 await _bootstrap_event.wait() 等待完成
+    # pce_status 不阻塞，可随时查询 bootstrapping 状态和 warnings
+    bootstrap_task = asyncio.create_task(ctx._bootstrap())
+
     # 创建并配置 MCP Server
     server = Server("pce")
 
@@ -631,6 +695,11 @@ async def serve() -> None:
                 server.create_initialization_options(),
             )
     finally:
+        bootstrap_task.cancel()
+        try:
+            await bootstrap_task
+        except asyncio.CancelledError:
+            pass
         await ctx.watcher.stop()
 
 

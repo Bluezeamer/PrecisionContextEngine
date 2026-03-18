@@ -146,11 +146,15 @@ async def main() -> None:
         )
         await ctx.watcher.start()
 
+        # 触发 bootstrap（与 serve() 中行为一致）
+        await ctx._bootstrap()
+
         init_elapsed = round(time.perf_counter() - t0, 2)
         _pprint("初始化完成", {
             "elapsed_s": init_elapsed,
             "serena_connected": client.connected,
             "watcher_running": ctx.watcher.running,
+            "bootstrap_warnings": list(ctx._bootstrap_warnings),
         })
 
         # ── 场景 1: pce_query ───────────────────────────────────
