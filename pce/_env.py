@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import os
 from typing import Any
-
-
 def get_env_text(name: str) -> str | None:
     """读取环境变量文本，去除首尾空白；空字符串视为未配置，返回 None。"""
     value = os.getenv(name)
@@ -31,3 +29,56 @@ def get_completion_overrides() -> dict[str, Any]:
     if (api_base := get_env_text("PCE_API_BASE")) is not None:
         overrides["api_base"] = api_base
     return overrides
+
+
+def normalize_litellm_model(model: str | None, *, api_base: str | None = None) -> str | None:
+    """按当前配置补全 LiteLLM provider 前缀。
+
+    规则：
+    - 若模型已显式包含 provider 前缀，则原样返回
+    - 若设置了 PCE_LITELLM_PROVIDER，则补成 <provider>/<model>
+    - 否则，只要配置了 api_base，就按最通用的 OpenAI 兼容端点补成 openai/<model>
+    """
+    if model is None:
+        return None
+
+    text = model.strip()
+    if not text:
+        return None
+
+    provider_override = get_env_text("PCE_LITELLM_PROVIDER")
+    if provider_override:
+        provider = provider_override.strip()
+        if provider and not text.startswith(f"{provider}/"):
+            return f"{provider}/{text}"
+        return text
+
+    provider_prefixes = {
+        "openai",
+        "openrouter",
+        "anthropic",
+        "azure",
+        "bedrock",
+        "gemini",
+        "vertex_ai",
+        "huggingface",
+        "ollama",
+        "groq",
+        "mistral",
+        "deepseek",
+        "fireworks_ai",
+        "together_ai",
+        "xai",
+        "cerebras",
+        "cohere",
+        "replicate",
+    }
+    head = text.split("/", 1)[0]
+    if head in provider_prefixes:
+        return text
+
+    effective_api_base = api_base or get_env_text("PCE_API_BASE")
+    if effective_api_base:
+        return f"openai/{text}"
+
+    return text

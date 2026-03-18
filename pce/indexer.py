@@ -43,7 +43,7 @@ from .models import (
     SymbolRef,
 )
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import get_completion_overrides, get_env_text
+from ._env import get_completion_overrides, get_env_text, normalize_litellm_model
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +402,7 @@ async def _generate_annotations(
         or get_env_text("PCE_ANNOTATION_MODEL")
         or get_env_text("PCE_MODEL")
     )
+    effective_model = normalize_litellm_model(effective_model)
     if not effective_model:
         logger.warning("未配置 PCE_ANNOTATION_MODEL 或 PCE_MODEL，跳过语义注解生成")
         return None

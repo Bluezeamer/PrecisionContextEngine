@@ -42,7 +42,7 @@ from .agent_runtime.spawner import invoke_spawn
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse, ReferenceEdge, SymbolRef
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import get_completion_overrides
+from ._env import get_completion_overrides, normalize_litellm_model
 
 logger = logging.getLogger(__name__)
 
@@ -698,8 +698,13 @@ class PCEAgent:
         # litellm.Timeout 不是 asyncio.TimeoutError 的子类，统一转换
         _timeout_types = (asyncio.TimeoutError, litellm_exc.Timeout)
         completion_overrides = get_completion_overrides()
+        api_base = completion_overrides.get("api_base")
 
-        model_chain = [self._model, *self._model_fallbacks]
+        model_chain: list[str] = []
+        for model in [self._model, *self._model_fallbacks]:
+            normalized = normalize_litellm_model(model, api_base=api_base)
+            if normalized:
+                model_chain.append(normalized)
 
         # fallback 为空时保持原行为：直接调用，异常原样透传
         if len(model_chain) == 1:
