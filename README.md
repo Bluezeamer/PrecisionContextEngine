@@ -1,14 +1,14 @@
 # PCE (Precision Context Engine)
 
-> 有状态推理中间层,为代码理解提供上下文压缩和影响边界分析
+> 有状态推理中间层，为代码理解提供上下文压缩和影响边界分析
 
 ## 项目定位
 
-PCE 是一个运行在 Claude Code 与 Serena 之间的 **MCP Server**,通过以下能力提升代码理解效率:
+PCE 是一个运行在上层 Agent（如 Claude Code）与 Serena 之间的 **MCP Server**，通过以下能力提升代码理解效率：
 
-1. **上下文压缩** - 将代码库背景理解的 token 开销从 50-60% 压缩到 10-15%
-2. **影响边界分析** - 在修改前给出完整的符号引用链,消除 build 试错循环
-3. **知识积累** - 建立项目索引,跨会话复用,随使用时间加深对项目的理解
+1. **上下文压缩** — 将代码库背景理解的 token 开销从 50-60% 压缩到 10-15%
+2. **影响边界分析** — 在修改前给出完整的符号引用链，消除 build 试错循环
+3. **知识积累** — 建立项目索引 + InsightCache 跨会话认知缓存，随使用加深对项目的理解
 
 ## 快速开始
 
@@ -30,24 +30,15 @@ uv sync
 
 # 配置 API Key
 cp .env.example .env
-# 编辑 .env,填入 OPENROUTER_API_KEY(或其他供应商的 Key)
-# 若 Serena 启动较慢,可设置 PCE_SERENA_TIMEOUT(秒)
-# 若 PyPI 访问受限,可设置 UV_DEFAULT_INDEX(镜像) 并按需配置 NO_PROXY/HTTP(S)_PROXY
+# 编辑 .env，填入 OPENROUTER_API_KEY（或其他供应商的 Key）
 ```
 
-> **说明**: Serena 无需手动安装。首次运行 `pce serve` 时会自动 clone 到 `serena/` 目录。
+> **说明**: Serena 无需手动安装。首次运行时会自动 clone 到 `serena/` 目录。
+> 项目索引也无需手动初始化——PCE 启动时会自动完成 bootstrap（项目激活校验 + 索引构建）。
 
-### 使用
+### 配置 Claude Code
 
-#### 1. 初始化项目索引
-
-```bash
-uv run pce init --project /path/to/your/project
-```
-
-#### 2. 配置 Claude Code
-
-在 Claude Code 的 MCP 配置中添加:
+在 Claude Code 的 MCP 配置中添加：
 
 ```json
 {
@@ -63,92 +54,112 @@ uv run pce init --project /path/to/your/project
 }
 ```
 
-> 注意: API Key 从 `.env` 文件自动加载,无需在 MCP 配置中重复填写。
+> API Key 从 `.env` 文件自动加载，无需在 MCP 配置中重复填写。
 
-#### 3. 在 Claude Code 中使用
+### 在 Claude Code 中使用
 
 ```
 > 使用 pce_query 查询: "认证逻辑的入口在哪里?"
 > 使用 pce_impact 分析修改影响: target="UserSession", change_type="modify"
+> 使用 pce_status 查看当前索引状态和 bootstrap warnings
 ```
 
-## 核心工具
-
-PCE 提供 4 个 MCP 工具:
-
-### `pce_init`
-初始化项目索引,建立结构索引和引用索引
+## MCP 工具
 
 ### `pce_query`
-自然语言查询代码库,返回经过推理的结构化答案
+自然语言查询代码库。PCE 内部通过 ReAct 循环驱动 Serena 工具检索代码结构，返回经过推理的结构化答案。
 
 ### `pce_impact`
-影响边界分析,给出完整的引用链和建议修改顺序
+变更影响分析。给出完整的引用链、风险清单和建议修改顺序。
 
 ### `pce_status`
-查询 PCE 当前状态和索引信息
+查询 PCE 当前状态，包括索引信息、bootstrap 状态、warnings、InsightCache 统计。
+
+### `pce_sync`
+通知 PCE 代码库已发生大量变更。触发 Serena 重连 + 索引重建 + InsightCache 过期清理。适用于上层 Agent 完成一批修改后的批量沉淀。
+
+> 日常小改动无需调用 `pce_sync` — PCE 的 FileWatcher 会实时追踪变更，查询时自动注入脏文件上下文。
+
+### 写工具（透传）
+PCE 还会透传 Serena 的符号编辑工具（加 `pce_` 前缀）：`pce_replace_symbol_body`、`pce_insert_after_symbol`、`pce_insert_before_symbol`、`pce_rename_symbol`。
 
 ## 技术架构
 
 ```
-Claude Code (上层 Agent)
-    ↓ MCP
+上层 Agent (Claude Code 等)
+    ↓ MCP (pce_query / pce_impact / pce_status / pce_sync)
 PCE MCP Server
-    ├─ Agent Loop (ReAct)
-    ├─ Memory 管理
-    └─ Serena Client
+    ├─ PCEAgent (ReAct 循环，时间预算制)
+    │   ├─ SubAgent spawn (深度限制 depth≤1)
+    │   └─ InsightCache (跨会话认知缓存)
+    ├─ Bootstrap (eager 初始化 + activate_project 校验)
+    ├─ FileWatcher + StagingArea (实时文件变更追踪)
+    └─ SerenaClient (MCP stdio 通信)
         ↓ MCP
 Serena MCP Server (LSP + 文件系统)
 ```
 
-**技术栈**:
-- Python 3.11 + uv
-- litellm (多供应商 LLM 调用)
-- MCP 官方 Python SDK
-- Pydantic (数据模型)
+### 核心模块
 
-## 模型配置
+```
+pce/
+├── agent.py               ReAct Agent（模型降级路由 + SubAgent spawn）
+├── agent_runtime/
+│   ├── contracts.py       SpawnRequest/Result/schema/常量
+│   └── spawner.py         invoke_spawn() 执行器
+├── insight_cache.py       持久化认知缓存（跨会话知识积累）
+├── serena_client.py       Serena MCP 客户端
+├── tool_provider.py       ToolProvider Protocol
+├── mock_tool_provider.py  离线 Mock（含 spawn_agent mock 规则）
+├── models.py              Pydantic 数据模型
+├── indexer.py             代码索引构建（全量/增量）
+├── staging.py             文件变更暂存区 + FileWatcher
+├── memory.py              Memory 读写管理
+├── server.py              MCP Server 入口（bootstrap + 工具路由）
+└── cli.py                 CLI 入口
+```
 
-PCE 通过 [litellm](https://docs.litellm.ai/) 支持多种 LLM 供应商。模型名称格式遵循 litellm 约定: `<provider_prefix>/<model_name>`。
-
-### 环境变量
+## 环境变量
 
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
-| `PCE_MODEL` | Agent 推理使用的模型 | `openrouter/stepfun/step-3.5-flash:free` |
-| `PCE_ANNOTATION_MODEL` | 索引构建时生成语义注解的模型 | `openrouter/stepfun/step-3.5-flash:free` |
+| `PCE_MODEL` | Agent 推理模型 | `openrouter/stepfun/step-3.5-flash:free` |
+| `PCE_MODEL_FALLBACKS` | 模型降级链（逗号分隔） | 空（不降级） |
+| `PCE_ANNOTATION_MODEL` | 索引构建时的语义注解模型 | 同 `PCE_MODEL` |
+| `PCE_SERENA_TIMEOUT` | Serena 连接/工具调用超时（秒） | `30` |
+| `PCE_CONTEXT_WINDOW` | 上下文窗口大小（token） | `256000` |
+| `PCE_LOG_LEVEL` | 日志级别 | `INFO` |
+| `PCE_PROJECT_PATH` | 目标项目根路径 | 当前工作目录 |
+| `SERENA_PATH` | Serena 安装路径 | `<PCE根目录>/serena` |
 | `OPENROUTER_API_KEY` | OpenRouter API 密钥 | — |
+
+### 模型降级路由
+
+当主模型遇到限流（429）、鉴权失败（401/403）或模型不存在（404）时，PCE 会自动切换到 `PCE_MODEL_FALLBACKS` 中的下一个候选模型。litellm 自身已有单模型重试机制，PCE 只做模型级切换。
+
+```bash
+# 示例：主模型限流时自动切换到 openrouter/free
+PCE_MODEL_FALLBACKS=openrouter/free
+```
 
 ### 供应商切换示例
 
 ```bash
-# OpenRouter (默认,免费额度)
+# OpenRouter (默认，免费额度)
 export OPENROUTER_API_KEY="sk-or-..."
-# 模型名无需额外配置,默认值已适配 OpenRouter
 
 # StepFun 直连
 export STEPFUN_API_KEY="your-key"
 export PCE_MODEL="step-3.5-flash"
-export PCE_ANNOTATION_MODEL="step-3.5-flash"
 
 # Anthropic Claude
 export ANTHROPIC_API_KEY="your-key"
 export PCE_MODEL="anthropic/claude-3-haiku-20240307"
-export PCE_ANNOTATION_MODEL="anthropic/claude-3-haiku-20240307"
 
 # OpenAI
 export OPENAI_API_KEY="your-key"
 export PCE_MODEL="gpt-4o-mini"
-export PCE_ANNOTATION_MODEL="gpt-4o-mini"
 ```
-
-**核心模块**:
-- `models.py` - 数据模型定义
-- `memory.py` - Memory 读写管理
-- `serena_client.py` - Serena MCP 客户端
-- `indexer.py` - 索引构建
-- `agent.py` - ReAct Agent Loop
-- `server.py` - MCP Server 入口
 
 ## 开发
 
@@ -161,39 +172,28 @@ uv sync --all-extras
 ### 代码风格
 
 ```bash
-# 格式化
-uv run black pce tests
-
-# Lint
-uv run ruff check pce tests
-
-# 类型检查
+uv run black pce
+uv run ruff check pce
 uv run mypy pce
 ```
 
 ### 运行测试
 
 ```bash
-uv run pytest
+# 单元测试（43 个场景，含 ReAct 循环健壮性 + spawn 路径 + fallback markers）
+uv run python scripts/test_react_robustness.py
+
+# 端到端集成测试（需要真实 Serena + LLM API Key）
+uv run python scripts/test_e2e.py
 ```
 
 ## 文档
 
 - [设计文档](docs/PCE_design.md)
+- [SubAgent 架构设计](docs/design_subagent_architecture.md)
 - [实施计划](docs/implementation_plan.md)
-
-## MVP 交付标准
-
-1. `pce_init` 在 60 秒内完成中型项目索引
-2. `pce_query` 返回正确定位,上下文消耗 < 3k tokens
-3. `pce_impact` 返回完整引用链,无遗漏
-4. 上层 Agent 无需执行 `ls`/`find`/`cat` 命令
-5. 整体上下文开销降低 > 40%
+- [开发进度](docs/progress.md)
 
 ## License
 
 MIT
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request!
