@@ -180,13 +180,17 @@ def _build_tools(
             name="pce_query",
             description=_make_tool_description(
                 summary=(
-                    "以自然语言提问,PCE 返回经过推理的结构化答案。"
-                    "可在 query 中指定输出格式,例如要求返回 {file, line_range, name_path} 的符号定位列表,"
-                    "或 file:line 格式的精确位置——尤其适合在执行代码修改前定位手术靶点。"
+                    "以自然语言提问,PCE 返回经过多步推理的结构化答案。"
+                    "最佳实践: 先把问题收敛到「定位定义点 / 梳理调用关系 / 确认模块职责」之一;"
+                    "如需直接落地修改,在 query 中明确要求返回 {file, line_range, name_path} 或 file:line,"
+                    "让上层 Agent 无需二次检索。"
+                    "示例: '认证逻辑的入口在哪里？请返回 {file, line_range, name_path} 列表';"
+                    "'PCEAgent.impact 的 JSON 解析逻辑在哪？请给出 file:line 和相关函数'。"
                 ),
                 trigger=(
-                    "需要理解模块职责、查找函数/类定义、理解调用关系时调用。"
-                    "也应在准备修改某段代码前使用,用于精确定位目标符号的 name_path 与行号范围。"
+                    "需要理解模块职责、查找函数/类定义、理解调用关系,"
+                    "或在动手修改前先做「术前定位」时调用。"
+                    "若问题涉及多个候选文件或符号,先用 pce_query 缩小范围,再进入 pce_impact。"
                 ),
                 replaces=(
                     "替代传统 ls + cat + grep 的多步探索链;"
@@ -208,11 +212,20 @@ def _build_tools(
             name="pce_impact",
             description=_make_tool_description(
                 summary=(
-                    "给定修改目标,返回完整影响边界:所有直接引用点、类型依赖与建议修改顺序。"
-                    "可在 target 字段末尾追加格式要求,例如'请以结构化列表返回每处引用点的行号、name_path 和代码片段',"
-                    "便于上层 Agent 直接落地修改而无需二次检索。"
+                    "给定修改目标,返回完整影响边界:所有直接引用点(含 file/line/snippet)、"
+                    "边界符号列表与建议修改顺序。"
+                    "最佳实践: 修改符号、接口、字段或文件前调用;明确 change_type,"
+                    "必要时补充 file 缩小歧义。可在 target 中追加输出要求。"
+                    "示例: target='build_index_incremental', change_type='change_signature', "
+                    "file='pce/indexer.py';"
+                    "target='SymbolRef 请返回每处引用点的行号、snippet 和建议修改顺序', "
+                    "change_type='change_signature', file='pce/models.py'。"
                 ),
-                trigger="上层 Agent 准备修改某个符号或文件之前调用,获取完整影响边界与精确修改位置。",
+                trigger=(
+                    "上层 Agent 准备修改某个符号、重命名接口、调整签名、删除字段或替换实现前调用,"
+                    "先拿到完整影响边界与精确修改位置。"
+                    "若目标本身尚未定位清楚,应先调用 pce_query 再做 impact。"
+                ),
                 replaces=(
                     "替代手动追踪引用链(Cmd+Shift+F / grep -r)与反复 build 试错;"
                     "多步检索与推理在 PCE 独立上下文完成,结果以结构化形式一次性交付给上层 Agent。"

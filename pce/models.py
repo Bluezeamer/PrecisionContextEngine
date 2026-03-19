@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
     AfterValidator,
@@ -265,7 +265,7 @@ class QueryResponse(BaseSchema):
 
     answer: NonEmptyStr = Field(..., description="查询答案正文")
     evidence: list[NonEmptyStr] = Field(default_factory=list, description="证据摘要列表")
-    related_symbols: list[SymbolRef] = Field(default_factory=list, description="相关符号列表")
+    related_symbols: list[dict[str, Any]] = Field(default_factory=list, description="相关符号列表（轻量 dict）")
     related_files: list[Path] = Field(default_factory=list, description="相关文件路径列表")
 
 
@@ -280,8 +280,8 @@ class ImpactRequest(BaseSchema):
 class ImpactResponse(BaseSchema):
     """pce_impact 工具的响应结果。"""
 
-    impact_chain: list[ReferenceEdge] = Field(default_factory=list, description="完整影响链路")
-    boundary: list[SymbolRef] = Field(default_factory=list, description="影响边界符号列表")
+    impact_chain: list[dict[str, Any]] = Field(default_factory=list, description="影响链路引用点列表（轻量 dict）")
+    boundary: list[dict[str, Any]] = Field(default_factory=list, description="影响边界符号列表（轻量 dict）")
     risks: list[NonEmptyStr] = Field(default_factory=list, description="风险提示列表")
     unknowns: list[NonEmptyStr] = Field(default_factory=list, description="不确定项列表")
 

@@ -186,28 +186,64 @@ spawn_agent 将一个"可独立求解"的子问题委托给子 Agent 推理，�
 - ok=false：不要中断；根据 error_code 降级为直接调用 Serena 工具继续推理
 
 **交付格式指引**:
-上层 Agent 可在 query 中明确指定期望格式,PCE Agent 必须严格遵从。未明确指定时,按以下默认规则选择格式:
+上层 Agent 可在 query 中补充字段要求或格式细节,PCE Agent 必须在下述 JSON schema 内表达最终结果。
+无论是 query 还是 impact,最终都必须调用 `deliver(answer=..., confidence=...)`。
+其中 `deliver(answer=...)` 的 `answer` 必须是**严格 JSON 字符串**:
+- 只能包含一个合法 JSON object
+- 不得包含 Markdown 代码块、注释、解释性前后缀或省略号
+- 字段名必须与 schema 一致;未知字段可省略,不要伪造 UUID
 
-- 定位类任务(查找函数/类/变量在哪里):
-  返回结构化列表,每项包含:
-    file: 相对路径(如 pce/agent.py)
-    line_range: [start, end]
-    name_path: 符号路径(如 PCEAgent/_run_react_loop,遵循 Parent/child 格式)
+query 任务默认 schema:
+{
+  "answer": "基于工具证据的结论（自然语言,凡提及代码位置必须附 file:line）",
+  "evidence": ["证据 1: file:line ...", "证据 2: file:line ..."],
+  "related_symbols": [
+    {
+      "name": "符号名",
+      "kind": "function|class|method|variable|module|import",
+      "file_path": "相对路径",
+      "line_start": 10,
+      "line_end": 24,
+      "name_path": "Parent/child"
+    }
+  ],
+  "related_files": ["相对路径1", "相对路径2"]
+}
 
-- 影响分析类任务(pce_impact):
-  返回含行号的引用点列表,每项包含:
-    file: 相对路径
-    line: 引用所在行
-    referencing_symbol: 引用该符号的所属函数/方法名
-    snippet: 该行附近的代码片段（上下各 2 行）
-  并在列表末尾给出建议修改顺序(叶节点优先)
+impact 任务默认 schema:
+{
+  "impact_chain": [
+    {
+      "file": "引用点所在相对路径",
+      "line": 123,
+      "referencing_symbol": "包含该引用的函数/方法/模块名",
+      "snippet": "引用点附近代码片段",
+      "relation": "calls|imports|uses|inherits"
+    }
+  ],
+  "boundary": [
+    {
+      "name": "受影响符号名",
+      "kind": "function|class|method|variable|module|import",
+      "file_path": "定义所在相对路径",
+      "line_start": 10,
+      "line_end": 20
+    }
+  ],
+  "risks": ["真实风险、回归面或建议修改顺序"],
+  "unknowns": ["证据不足或工具未覆盖的项"]
+}
 
-- 问答/理解类任务:
-  自然语言回答;凡提及代码位置,必须附上 file:line 格式
+impact 任务交付示例（注意 answer 是纯 JSON 字符串,无 Markdown 包裹）:
+deliver(
+  answer='{"impact_chain":[{"file":"pce/server.py","line":351,"referencing_symbol":"PCEContext/_run_index_refresh","snippet":"await build_index_incremental(","relation":"calls"},{"file":"pce/server.py","line":682,"referencing_symbol":"PCEContext/handle_sync","snippet":"snapshot = await build_index_incremental(","relation":"calls"},{"file":"pce/server.py","line":34,"referencing_symbol":"(module)","snippet":"from .indexer import build_index, build_index_incremental","relation":"imports"}],"boundary":[{"name":"_run_index_refresh","kind":"method","file_path":"pce/server.py","line_start":314,"line_end":361},{"name":"handle_sync","kind":"method","file_path":"pce/server.py","line_start":660,"line_end":717}],"risks":["先更新 handle_sync 和 _run_index_refresh 的调用签名,再更新 import 语句"],"unknowns":[]}',
+  confidence="high"
+)
 
 输出要求:
 - 回答简洁精准,优先给出文件路径和行号定位
-- 影响分析时列出所有直接引用点,不要遗漏\
+- 影响分析时列出所有直接引用点,不要遗漏
+- 若某字段无法确认,将其写入 unknowns,不要编造或伪造 UUID\
 """
 
 # deliver 是一个虚拟工具,不转发给 Serena,由循环内部拦截处理
@@ -216,11 +252,17 @@ DELIVER_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "deliver",
-        "description": "提交最终结论并结束当前任务。完成推理后必须调用此工具,不得直接以文字回答。",
+        "description": (
+            "提交最终结论并结束当前任务。完成推理后必须调用此工具,不得直接以文字回答。"
+            "answer 必须是严格 JSON 字符串,不得包含 Markdown 代码块或额外说明。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "answer": {"type": "string", "description": "最终结论内容"},
+                "answer": {
+                    "type": "string",
+                    "description": "最终结论内容，必须是严格 JSON 字符串",
+                },
                 "confidence": {
                     "type": "string",
                     "enum": ["high", "medium", "low"],
@@ -480,6 +522,110 @@ def _parse_tool_call_args(raw_args: Any) -> dict[str, Any] | None:
 
 
 # ============================================================================
+# 响应解析辅助
+# ============================================================================
+
+
+def _norm_text(value: Any) -> str | None:
+    """将任意输入归一化为非空字符串。"""
+    if isinstance(value, Path):
+        text = value.as_posix()
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    return text or None
+
+
+def _norm_line(value: Any) -> int | None:
+    """将任意输入归一化为合法行号（>= 1）。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+        return parsed if parsed >= 1 else None
+    return None
+
+
+def _extract_lightweight_symbol(item: dict[str, Any]) -> dict[str, Any] | None:
+    """从 LLM 输出中提取轻量符号信息（不要求 UUID）。"""
+    sym: dict[str, Any] = {}
+
+    name = _norm_text(item.get("name"))
+    name_path = _norm_text(item.get("name_path"))
+    if name:
+        sym["name"] = name
+    elif name_path:
+        derived = name_path.split("/")[-1]
+        if not derived:
+            return None  # name_path 尾部为空，无法提取有效名称
+        sym["name"] = derived
+    else:
+        return None  # 至少需要名字
+
+    kind = _norm_text(item.get("kind"))
+    if kind:
+        sym["kind"] = kind
+    file_path = _norm_text(item.get("file_path") or item.get("file"))
+    if file_path:
+        sym["file_path"] = file_path
+    if name_path:
+        sym["name_path"] = name_path
+
+    line_range = item.get("line_range")
+    line_start = _norm_line(item.get("line_start")) or _norm_line(item.get("line"))
+    if line_start is None and isinstance(line_range, (list, tuple)) and line_range:
+        line_start = _norm_line(line_range[0])
+    if line_start is not None:
+        sym["line_start"] = line_start
+
+    line_end = _norm_line(item.get("line_end"))
+    if line_end is None and isinstance(line_range, (list, tuple)) and len(line_range) >= 2:
+        line_end = _norm_line(line_range[1])
+    if line_end is None and line_start is not None:
+        line_end = line_start
+    if line_end is not None:
+        sym["line_end"] = max(line_end, line_start or line_end)
+
+    signature = _norm_text(item.get("signature"))
+    if signature:
+        sym["signature"] = signature
+    return sym
+
+
+def _extract_lightweight_edge(item: dict[str, Any]) -> dict[str, Any] | None:
+    """从 LLM 输出中提取 impact_chain 的轻量引用边信息。"""
+    edge: dict[str, Any] = {}
+
+    file_path = _norm_text(item.get("file") or item.get("file_path"))
+    if file_path:
+        edge["file"] = file_path
+
+    line = _norm_line(item.get("line")) or _norm_line(item.get("line_start"))
+    if line is not None:
+        edge["line"] = line
+
+    ref_sym = _norm_text(
+        item.get("referencing_symbol") or item.get("from_symbol") or item.get("source_symbol")
+    )
+    if ref_sym:
+        edge["referencing_symbol"] = ref_sym
+
+    snippet = _norm_text(item.get("snippet") or item.get("evidence"))
+    if snippet:
+        edge["snippet"] = snippet
+
+    relation = _norm_text(item.get("relation"))
+    if relation:
+        edge["relation"] = relation
+
+    # 至少需要 file 字段才算有效引用点
+    return edge if "file" in edge else None
+
+
+# ============================================================================
 # 响应解析
 # ============================================================================
 
@@ -508,17 +654,19 @@ def _parse_query_response(content: str) -> QueryResponse:
     if isinstance(payload, dict):
         answer = str(payload.get("answer") or payload.get("content") or content)
 
-        related_symbols = []
+        related_symbols: list[dict[str, Any]] = []
         for item in payload.get("related_symbols") or []:
             if isinstance(item, dict):
-                try:
-                    related_symbols.append(SymbolRef.model_validate(item))
-                except Exception:
-                    continue
+                normalized = _extract_lightweight_symbol(item)
+                if normalized:
+                    related_symbols.append(normalized)
 
-        related_files = [
-            Path(p) for p in (payload.get("related_files") or []) if isinstance(p, str)
-        ]
+        related_files: list[Path] = []
+        for item in payload.get("related_files") or payload.get("files") or []:
+            path_text = _norm_text(item)
+            if path_text:
+                related_files.append(Path(path_text))
+
         evidence = [str(e) for e in (payload.get("evidence") or []) if e]
 
         return QueryResponse(
@@ -558,21 +706,19 @@ def _parse_impact_response(content: str) -> ImpactResponse:
     payload = _try_parse_json(content)
 
     if isinstance(payload, dict):
-        impact_chain = []
+        impact_chain: list[dict[str, Any]] = []
         for item in payload.get("impact_chain") or []:
             if isinstance(item, dict):
-                try:
-                    impact_chain.append(ReferenceEdge.model_validate(item))
-                except Exception:
-                    continue
+                normalized = _extract_lightweight_edge(item)
+                if normalized:
+                    impact_chain.append(normalized)
 
-        boundary = []
+        boundary: list[dict[str, Any]] = []
         for item in payload.get("boundary") or []:
             if isinstance(item, dict):
-                try:
-                    boundary.append(SymbolRef.model_validate(item))
-                except Exception:
-                    continue
+                normalized = _extract_lightweight_symbol(item)
+                if normalized:
+                    boundary.append(normalized)
 
         risks = [str(r) for r in (payload.get("risks") or []) if r]
         unknowns = [str(u) for u in (payload.get("unknowns") or []) if u]
@@ -1514,13 +1660,42 @@ class PCEAgent:
                 [
                     f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
                     "",
-                    "请使用 Serena 工具查找所有引用,然后以 JSON 格式输出:",
+                    "任务要求:",
+                    "1. 必须先使用 Serena 工具定位目标定义、所有直接引用点及直接受影响的边界符号。",
+                    "2. 最终必须调用 deliver(answer=..., confidence=...)；"
+                    "其中 answer 必须是严格 JSON 字符串，不得包含 Markdown、注释或额外解释。",
+                    "3. 只返回已被工具证实的信息；无法确认的内容写入 unknowns，不要编造 UUID。",
+                    "",
+                    "deliver(answer=...) 的 JSON schema:",
                     "{",
-                    '  "impact_chain": [...],  // 影响链路中的 ReferenceEdge 列表',
-                    '  "boundary": [...],      // 影响边界的 SymbolRef 列表',
-                    '  "risks": [...],         // 风险提示字符串列表',
-                    '  "unknowns": [...]       // 不确定项字符串列表',
+                    '  "impact_chain": [',
+                    "    {",
+                    '      "file": "引用点所在相对路径",',
+                    '      "line": 123,',
+                    '      "referencing_symbol": "包含该引用的函数/方法/模块名",',
+                    '      "snippet": "引用点附近代码片段",',
+                    '      "relation": "calls|imports|uses|inherits"',
+                    "    }",
+                    "  ],",
+                    '  "boundary": [',
+                    "    {",
+                    '      "name": "受影响符号名",',
+                    '      "kind": "function|class|method|variable|module|import",',
+                    '      "file_path": "定义所在相对路径",',
+                    '      "name_path": "Parent/child 格式的符号路径(可选)",',
+                    '      "line_start": 10,',
+                    '      "line_end": 20',
+                    "    }",
+                    "  ],",
+                    '  "risks": ["真实风险、回归面或建议修改顺序"],',
+                    '  "unknowns": ["证据不足或工具未覆盖的项"]',
                     "}",
+                    "",
+                    "字段说明:",
+                    "- impact_chain: 所有直接引用点；每项必须含 file/line/referencing_symbol/snippet/relation，不要返回 UUID。",
+                    "- boundary: 需要联动检查的定义点；每项只含 name/kind/file_path/line_start/line_end。",
+                    "- risks: 真实风险，并给出建议修改顺序（叶节点优先，再适配层，最后核心定义）。",
+                    "- unknowns: 仅记录工具证据不足的事项。",
                 ]
             )
             messages.append({"role": "user", "content": prompt})
