@@ -42,7 +42,7 @@ from .agent_runtime.spawner import invoke_spawn
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse, ReferenceEdge, SymbolRef
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import get_completion_overrides, normalize_litellm_model
+from ._env import build_litellm_model, get_completion_overrides, get_env_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +51,17 @@ MAX_SECONDS = 600  # 默认推理时间上限（秒），10 分钟
 _COMPACT_THRESHOLD = 0.80
 # step-3.5-flash 的上下文窗口大小（token 数），可通过环境变量覆盖
 _CONTEXT_WINDOW = int(os.getenv("PCE_CONTEXT_WINDOW", "256000"))
-# 通过 PCE_MODEL 环境变量配置（必填），运行时读取，支持所有 litellm 供应商
-# 示例: "openai/gpt-4o-mini"  "anthropic/claude-3-haiku"  "openrouter/..."
+# 通过 PCE_PROVIDER + PCE_MODEL 环境变量配置（必填），运行时读取。
+# 示例:
+#   PCE_PROVIDER=openrouter  PCE_MODEL=openai/gpt-4o-mini
+#   PCE_PROVIDER=openai      PCE_MODEL=gpt-4o-mini
+#   PCE_PROVIDER=anthropic   PCE_MODEL=claude-3-haiku-20240307
 
 
 # ---------------------------------------------------------------------------
 # 模型降级路由（fallback chain）
 # ---------------------------------------------------------------------------
+
 
 def _parse_model_fallbacks(raw: str) -> list[str]:
     """解析逗号分隔的 fallback 模型列表，按出现顺序去重。"""
@@ -69,8 +73,6 @@ def _parse_model_fallbacks(raw: str) -> list[str]:
             seen.add(model)
             result.append(model)
     return result
-
-
 
 
 class LLMCompletionError(RuntimeError):
@@ -94,19 +96,28 @@ def _should_fallback_model(exc: Exception) -> bool:
     - 模型不存在（404 或特征文本）
     """
     # 优先使用 isinstance 判断（稳定、不受类名重命名影响）
-    if isinstance(exc, (
-        litellm_exc.RateLimitError,
-        litellm_exc.AuthenticationError,
-        litellm_exc.PermissionDeniedError,
-        litellm_exc.NotFoundError,
-    )):
+    if isinstance(
+        exc,
+        (
+            litellm_exc.RateLimitError,
+            litellm_exc.AuthenticationError,
+            litellm_exc.PermissionDeniedError,
+            litellm_exc.NotFoundError,
+        ),
+    ):
         return True
     if isinstance(exc, (litellm_exc.BadRequestError, litellm_exc.InvalidRequestError)):
         msg = _stringify_error(exc).lower()
-        return any(k in msg for k in (
-            "model not found", "unknown model", "invalid model",
-            "does not exist", "no deployments available",
-        ))
+        return any(
+            k in msg
+            for k in (
+                "model not found",
+                "unknown model",
+                "invalid model",
+                "does not exist",
+                "no deployments available",
+            )
+        )
     return False
 
 
@@ -252,8 +263,8 @@ _MAX_LENGTH_CONT = 2
 _MAX_TIMEOUT_RETRIES = 1
 # Insight Cache 注入与蒸馏参数
 _INSIGHT_TOP_K = 5
-_INSIGHT_TOKEN_BUDGET = 4000   # 字符数上限（粗略估算 token）
-_INSIGHT_MAX_SCOPES = 3        # 每次 deliver 最多写入的 scope 数量
+_INSIGHT_TOKEN_BUDGET = 4000  # 字符数上限（粗略估算 token）
+_INSIGHT_MAX_SCOPES = 3  # 每次 deliver 最多写入的 scope 数量
 _INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
 # 从文本中提取形如 pce/agent.py 或 ./src/foo.py:123 的路径
 _PATH_RE = re.compile(r"(?<![\w./-])(?:\./)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::\d+)?")
@@ -334,13 +345,15 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     if function_call is not None and hasattr(function_call, "name"):
         name = getattr(function_call, "name", None)
         if name:
-            return [{
-                "id": str(uuid.uuid4()),
-                "function": {
-                    "name": name,
-                    "arguments": getattr(function_call, "arguments", None),
-                },
-            }]
+            return [
+                {
+                    "id": str(uuid.uuid4()),
+                    "function": {
+                        "name": name,
+                        "arguments": getattr(function_call, "arguments", None),
+                    },
+                }
+            ]
     return []
 
 
@@ -360,7 +373,6 @@ def _parse_tool_call_args(raw_args: Any) -> dict[str, Any] | None:
         except (ValueError, json.JSONDecodeError):
             return None
     return None
-
 
 
 # ============================================================================
@@ -497,16 +509,28 @@ class PCEAgent:
     def __init__(
         self,
         model: str | None = None,
+        provider: str | None = None,
         model_fallbacks: list[str] | None = None,
         max_seconds: float = MAX_SECONDS,
         insight_cache: InsightCache | None = None,
     ) -> None:
-        self._model = model or os.getenv("PCE_MODEL", "").strip() or None
-        if not self._model:
-            raise ValueError(
-                "未配置 PCE_MODEL，请通过 MCP config env、系统环境变量"
-                "或项目 .env 设置模型名（如 openai/gpt-4o-mini）。"
-            )
+        explicit_model = model.strip() if model else None
+        explicit_provider = provider.strip() if provider else None
+
+        if explicit_model is None:
+            self._provider = get_env_text("PCE_PROVIDER")
+            self._model = get_env_text("PCE_MODEL")
+            if not self._provider or not self._model:
+                raise ValueError(
+                    "未配置 PCE_PROVIDER / PCE_MODEL，请通过 MCP config env、系统环境变量"
+                    "或项目 .env 设置，例如 PCE_PROVIDER=openrouter, "
+                    "PCE_MODEL=openai/gpt-4o-mini。"
+                )
+        else:
+            # 显式传参保留灵活性：用于测试或调试脚本时，可直接传完整 LiteLLM model。
+            self._provider = explicit_provider
+            self._model = explicit_model
+
         # 降级链：去掉与主模型相同的候选项
         raw_fallbacks = (
             model_fallbacks
@@ -519,7 +543,6 @@ class PCEAgent:
         self._insight_cache = insight_cache
         # in-memory 会话存储,进程重启后丢失(MVP 范围内可接受)
         self._sessions: dict[str, list[dict[str, Any]]] = {}
-
 
     # =========================================================================
     # Insight 蒸馏辅助
@@ -698,13 +721,10 @@ class PCEAgent:
         # litellm.Timeout 不是 asyncio.TimeoutError 的子类，统一转换
         _timeout_types = (asyncio.TimeoutError, litellm_exc.Timeout)
         completion_overrides = get_completion_overrides()
-        api_base = completion_overrides.get("api_base")
 
         model_chain: list[str] = []
         for model in [self._model, *self._model_fallbacks]:
-            normalized = normalize_litellm_model(model, api_base=api_base)
-            if normalized:
-                model_chain.append(normalized)
+            model_chain.append(build_litellm_model(self._provider, model))
 
         # fallback 为空时保持原行为：直接调用，异常原样透传
         if len(model_chain) == 1:
@@ -712,7 +732,7 @@ class PCEAgent:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         litellm.completion,
-                        model=self._model,
+                        model=model_chain[0],
                         messages=messages,
                         tools=tools if tools else None,
                         **completion_overrides,
@@ -750,17 +770,21 @@ class PCEAgent:
                     # 非模型级错误（如网络中断、JSON 解析失败等），直接透传
                     raise
 
-                attempts.append({
-                    "model": model,
-                    "error_type": type(exc).__name__,
-                    "reason": _stringify_error(exc),
-                })
+                attempts.append(
+                    {
+                        "model": model,
+                        "error_type": type(exc).__name__,
+                        "reason": _stringify_error(exc),
+                    }
+                )
 
                 if idx < len(model_chain) - 1:
                     next_model = model_chain[idx + 1]
                     logger.warning(
                         "模型调用失败，触发降级: %s -> %s (%s)",
-                        model, next_model, attempts[-1]["error_type"],
+                        model,
+                        next_model,
+                        attempts[-1]["error_type"],
                     )
                     continue
 
@@ -786,11 +810,7 @@ class PCEAgent:
             return 0
 
         def _get(attr: str) -> int:
-            v = (
-                getattr(usage, attr, None)
-                if not isinstance(usage, dict)
-                else usage.get(attr)
-            )
+            v = getattr(usage, attr, None) if not isinstance(usage, dict) else usage.get(attr)
             return int(v) if v else 0
 
         total = _get("total_tokens")
@@ -830,24 +850,22 @@ class PCEAgent:
 
         # 提取原始用户问题（第一条 user 消息），让摘要不丢失任务目标
         system_msgs = [m for m in messages if m.get("role") == "system"]
-        first_user = next(
-            (m for m in messages if m.get("role") == "user"), None
-        )
-        task_hint = (
-            f"\n\n当前任务：{first_user['content']}" if first_user else ""
-        )
+        first_user = next((m for m in messages if m.get("role") == "user"), None)
+        task_hint = f"\n\n当前任务：{first_user['content']}" if first_user else ""
 
         # 仅传 system + 摘要请求，避免在 token 接近满时再塞满历史
-        compact_request: list[dict[str, Any]] = system_msgs + [{
-            "role": "user",
-            "content": (
-                f"请用简洁的自然语言总结目前的推理进展，包括：\n"
-                "1. 已确认的关键事实与结论\n"
-                "2. 尚未完成的子任务及下一步行动\n"
-                "输出应足够精炼，以便在新对话窗口中直接继续推理。"
-                f"{task_hint}"
-            ),
-        }]
+        compact_request: list[dict[str, Any]] = system_msgs + [
+            {
+                "role": "user",
+                "content": (
+                    f"请用简洁的自然语言总结目前的推理进展，包括：\n"
+                    "1. 已确认的关键事实与结论\n"
+                    "2. 尚未完成的子任务及下一步行动\n"
+                    "输出应足够精炼，以便在新对话窗口中直接继续推理。"
+                    f"{task_hint}"
+                ),
+            }
+        ]
 
         try:
             # 不传工具列表，让模型自由输出摘要文本
@@ -867,13 +885,16 @@ class PCEAgent:
             return messages, token_used, True
 
         # 重建消息列表：system prompt + 摘要注入（作为新窗口的起点）
-        new_messages: list[dict[str, Any]] = system_msgs + [{
-            "role": "user",
-            "content": f"[上下文摘要 — 基于前序推理]\n{summary_text}",
-        }, {
-            "role": "assistant",
-            "content": "已了解前序推理摘要，继续执行剩余任务。",
-        }]
+        new_messages: list[dict[str, Any]] = system_msgs + [
+            {
+                "role": "user",
+                "content": f"[上下文摘要 — 基于前序推理]\n{summary_text}",
+            },
+            {
+                "role": "assistant",
+                "content": "已了解前序推理摘要，继续执行剩余任务。",
+            },
+        ]
 
         logger.info(f"compact 完成，新窗口消息数: {len(new_messages)}")
         # compact 调用本身消耗了 compact_tokens，以此作为新窗口的基线；重置失败标记
@@ -928,9 +949,7 @@ class PCEAgent:
         while True:
             # ── 时间预算检查 ──────────────────────────────────────────────────
             if time.monotonic() >= deadline:
-                logger.warning(
-                    f"ReAct 循环超出截止时间（depth={depth}），强制终止"
-                )
+                logger.warning(f"ReAct 循环超出截止时间（depth={depth}），强制终止")
                 return "__REACT_TIMEOUT_BUDGET__", None
 
             # ── 上下文 compact 检查 ───────────────────────────────────────────
@@ -946,9 +965,7 @@ class PCEAgent:
             timeout_retries = 0
             while True:
                 try:
-                    response, finish_reason = await self._completion(
-                        messages, tools_schema
-                    )
+                    response, finish_reason = await self._completion(messages, tools_schema)
                     break
                 except LLMCompletionError as e:
                     logger.warning("模型降级链耗尽，终止 ReAct 循环: %s", e)
@@ -956,9 +973,7 @@ class PCEAgent:
                 except asyncio.TimeoutError:
                     timeout_retries += 1
                     if timeout_retries <= _MAX_TIMEOUT_RETRIES:
-                        logger.warning(
-                            f"模型调用超时(第 {timeout_retries} 次),正在重试当前步骤"
-                        )
+                        logger.warning(f"模型调用超时(第 {timeout_retries} 次),正在重试当前步骤")
                         continue
                     logger.warning("模型调用超时，重试次数耗尽，强制终止")
                     return "__REACT_TIMEOUT__", None
@@ -982,17 +997,17 @@ class PCEAgent:
                     # 推理文字被截断：保留已有内容，追加"请继续"
                     messages.append(message)
                     messages.append({"role": "user", "content": "请继续"})
-                    logger.warning(
-                        f"输出被截断(content,第 {length_continuations} 次),追加续写指令"
-                    )
+                    logger.warning(f"输出被截断(content,第 {length_continuations} 次),追加续写指令")
                 else:
                     # tool_call JSON 被截断：追加空占位 assistant 保持对话结构连续，
                     # 再追加 user 纠正，避免产生"孤立 user 消息"的非法序列
                     messages.append({"role": "assistant", "content": ""})
-                    messages.append({
-                        "role": "user",
-                        "content": "刚才的工具调用格式不完整，请重新完整地调用工具。",
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "刚才的工具调用格式不完整，请重新完整地调用工具。",
+                        }
+                    )
                     logger.warning(
                         f"输出被截断(tool_call,第 {length_continuations} 次),要求重新调用"
                     )
@@ -1010,14 +1025,16 @@ class PCEAgent:
                         f"无 tool_calls 输出(第 {no_tool_retries} 次),"
                         f"finish_reason={finish_reason},追加强化纠正指令"
                     )
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "你刚才直接用文字回答，这违反了强制流程。"
-                            "必须先通过 tool_calls 调用工具获取证据，"
-                            "完成推理后再用 deliver 提交最终结论，禁止直接回答。"
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "你刚才直接用文字回答，这违反了强制流程。"
+                                "必须先通过 tool_calls 调用工具获取证据，"
+                                "完成推理后再用 deliver 提交最终结论，禁止直接回答。"
+                            ),
+                        }
+                    )
                 else:
                     logger.warning("无 tool_calls 纠正次数耗尽，强制终止循环")
                     return "__REACT_NO_TOOL_EXHAUSTED__", None
@@ -1096,9 +1113,7 @@ class PCEAgent:
                             allocated_seconds=float(args.get("allocated_seconds", 0.0)),
                             expected_output=str(args.get("expected_output", "") or ""),
                             context=(
-                                args["context"]
-                                if isinstance(args.get("context"), dict)
-                                else {}
+                                args["context"] if isinstance(args.get("context"), dict) else {}
                             ),
                             strict=bool(args.get("strict", False)),
                         )
@@ -1132,12 +1147,14 @@ class PCEAgent:
                                 confidence=spawn_result.confidence,
                             )
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": "spawn_agent",
-                    "content": _safe_json_dumps(spawn_result.to_tool_content()),
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": "spawn_agent",
+                        "content": _safe_json_dumps(spawn_result.to_tool_content()),
+                    }
+                )
 
             # 处理认知确认调用
             for tc in acknowledge_calls:
@@ -1159,12 +1176,14 @@ class PCEAgent:
                         ack_result = f"认知确认失败: {e}"
                 else:
                     ack_result = "无需确认（无变更文件或回调未配置）"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": "acknowledge_changes",
-                    "content": ack_result,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": "acknowledge_changes",
+                        "content": ack_result,
+                    }
+                )
 
             # deliver 到来，提取结论并正常终止
             if deliver_call is not None:
@@ -1323,17 +1342,19 @@ class PCEAgent:
             messages = [{"role": "system", "content": system_content}]
 
         # 构造影响分析专用提示词
-        prompt = "\n".join([
-            f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
-            "",
-            "请使用 Serena 工具查找所有引用,然后以 JSON 格式输出:",
-            "{",
-            '  "impact_chain": [...],  // 影响链路中的 ReferenceEdge 列表',
-            '  "boundary": [...],      // 影响边界的 SymbolRef 列表',
-            '  "risks": [...],         // 风险提示字符串列表',
-            '  "unknowns": [...]       // 不确定项字符串列表',
-            "}",
-        ])
+        prompt = "\n".join(
+            [
+                f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
+                "",
+                "请使用 Serena 工具查找所有引用,然后以 JSON 格式输出:",
+                "{",
+                '  "impact_chain": [...],  // 影响链路中的 ReferenceEdge 列表',
+                '  "boundary": [...],      // 影响边界的 SymbolRef 列表',
+                '  "risks": [...],         // 风险提示字符串列表',
+                '  "unknowns": [...]       // 不确定项字符串列表',
+                "}",
+            ]
+        )
 
         messages.append({"role": "user", "content": prompt})
         answer, confidence = await self._run_react_loop(messages, serena_client, acknowledge_cb)

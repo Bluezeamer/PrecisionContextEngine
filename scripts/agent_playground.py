@@ -123,12 +123,18 @@ async def run_single_query(
     tool_provider: Any,
     *,
     model: str | None = None,
+    provider: str | None = None,
     max_seconds: float = 300,
     memory_root: Path | None = None,
     insight_cache: InsightCache | None = None,
 ) -> tuple[QueryResponse, float]:
     """执行单次查询，新建 agent 实例（验证无状态设计）。"""
-    agent = PCEAgent(model=model, max_seconds=max_seconds, insight_cache=insight_cache)
+    agent = PCEAgent(
+        model=model,
+        provider=provider,
+        max_seconds=max_seconds,
+        insight_cache=insight_cache,
+    )
 
     start = time.monotonic()
     response = await agent.query(
@@ -174,6 +180,7 @@ async def run_mock(args: argparse.Namespace) -> None:
         question=args.query,
         tool_provider=provider,
         model=args.model,
+        provider=args.provider,
         max_seconds=args.max_seconds,
         memory_root=project_path,
         insight_cache=insight_cache,
@@ -183,7 +190,9 @@ async def run_mock(args: argparse.Namespace) -> None:
 
     if insight_cache is not None:
         stats = await insight_cache.stats()
-        print(f"\n[InsightCache] 总条目: {stats.total_entries}  活跃: {stats.active_entries}  过时: {stats.stale_entries}")
+        print(
+            f"\n[InsightCache] 总条目: {stats.total_entries}  活跃: {stats.active_entries}  过时: {stats.stale_entries}"
+        )
 
 
 # ============================================================================
@@ -277,6 +286,7 @@ async def run_repl(args: argparse.Namespace) -> None:
                 question=user_input,
                 tool_provider=provider,
                 model=args.model,
+                provider=args.provider,
                 max_seconds=args.max_seconds,
                 memory_root=project_path,
                 insight_cache=insight_cache,
@@ -309,8 +319,11 @@ async def _repl_run_query(
             question=args.query,
             tool_provider=provider,
             model=args.model,
+            provider=args.provider,
             max_seconds=args.max_seconds,
-            memory_root=Path(args.project_path).resolve() if getattr(args, "project_path", None) else None,
+            memory_root=(
+                Path(args.project_path).resolve() if getattr(args, "project_path", None) else None
+            ),
             insight_cache=insight_cache,
         )
         stats = recorder.stats if recorder else None
@@ -372,9 +385,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="查询内容（mock 模式必选，repl 模式可选作首条查询）",
     )
     parser.add_argument(
+        "--provider",
+        default=None,
+        help="覆盖 PCE_PROVIDER 环境变量（如 openrouter / openai / anthropic）",
+    )
+    parser.add_argument(
         "--model",
         default=None,
-        help="覆盖 PCE_MODEL 环境变量（如 openrouter/stepfun/step-3.5-flash:free）",
+        help="覆盖 PCE_MODEL 环境变量（如 openai/gpt-5 或 gpt-4o-mini）",
     )
     parser.add_argument(
         "--max-seconds",

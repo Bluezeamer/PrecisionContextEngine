@@ -24,8 +24,12 @@ PCE 通过 `uvx` 按需运行，无需克隆仓库或手动安装依赖：
 # 验证是否可运行（可选）
 uvx --from git+https://github.com/Bluezeamer/PrecisionContextEngine pce serve
 
-# 配置 API Key（在目标项目目录下创建 .env 文件）
-echo "OPENROUTER_API_KEY=sk-or-..." > .env
+# 在目标项目目录下创建 .env 文件
+cat > .env <<'EOF'
+PCE_PROVIDER=openrouter
+PCE_MODEL=openai/gpt-4o-mini
+PCE_API_KEY=sk-or-...
+EOF
 ```
 
 > **说明**：Serena（PCE 的代码分析后端）和 PCE 本身均通过 `uvx` 自动获取与缓存，首次运行时会自动下载，后续复用缓存。
@@ -43,7 +47,8 @@ echo "OPENROUTER_API_KEY=sk-or-..." > .env
       "command": "uvx",
       "args": ["--from", "git+<repository-url>", "pce", "serve"],
       "env": {
-        "PCE_MODEL": "openrouter/openai/gpt-4o-mini",
+        "PCE_PROVIDER": "openrouter",
+        "PCE_MODEL": "openai/gpt-4o-mini",
         "PCE_API_KEY": "sk-or-..."
       }
     }
@@ -51,7 +56,7 @@ echo "OPENROUTER_API_KEY=sk-or-..." > .env
 }
 ```
 
-> 也可以不在 MCP config 中设置 `env`，将 `PCE_MODEL` / `PCE_API_KEY` 等写入目标项目根目录的 `.env` 文件，PCE 在 `pce_init` 时自动加载（优先级低于 MCP env）。
+> 也可以不在 MCP config 中设置 `env`，将 `PCE_PROVIDER` / `PCE_MODEL` / `PCE_API_KEY` 等写入目标项目根目录的 `.env` 文件，PCE 在 `pce_init` 时自动加载（优先级低于 MCP env）。
 
 ### 在 Claude Code 中使用
 
@@ -139,22 +144,25 @@ pce/
 
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
-| `PCE_MODEL` | Agent 推理模型（**必填**，无默认值） | — |
-| `PCE_MODEL_FALLBACKS` | 模型降级链（逗号分隔） | 空（不降级） |
-| `PCE_ANNOTATION_MODEL` | 索引构建时的语义注解模型 | 同 `PCE_MODEL` |
+| `PCE_PROVIDER` | LiteLLM provider（**必填**，如 `openrouter` / `openai` / `anthropic`） | — |
+| `PCE_MODEL` | 该 provider 下的模型名（**必填**） | — |
+| `PCE_MODEL_FALLBACKS` | 同 provider 下的降级模型名列表（逗号分隔，可选） | 空（不降级） |
 | `PCE_API_KEY` | litellm 通用 API Key（覆盖供应商默认 key） | — |
-| `PCE_API_BASE` | litellm 通用 Base URL（OpenAI 兼容端点） | — |
+| `PCE_BASE_URL` | 自定义 Base URL（可选，常用于第三方中转或兼容端点） | — |
+| `PCE_API_BASE` | `PCE_BASE_URL` 的兼容别名 | — |
 | `PCE_SERENA_TIMEOUT` | Serena 连接/工具调用超时（秒） | `180` |
 | `PCE_CONTEXT_WINDOW` | 上下文窗口大小（token） | `256000` |
 | `PCE_LOG_LEVEL` | 日志级别 | `INFO` |
 
 ### 模型降级路由
 
-当主模型遇到限流（429）、鉴权失败（401/403）或模型不存在（404）时，PCE 会自动切换到 `PCE_MODEL_FALLBACKS` 中的下一个候选模型。litellm 自身已有单模型重试机制，PCE 只做模型级切换。
+当主模型遇到限流（429）、鉴权失败（401/403）或模型不存在（404）时，PCE 会自动切换到 `PCE_MODEL_FALLBACKS` 中的下一个候选模型。这里的 fallback 只写“模型名”部分，provider / base URL / API key 沿用主模型配置。litellm 自身已有单模型重试机制，PCE 只做模型级切换。
 
 ```bash
-# 示例：主模型限流时自动切换到 openrouter/free
-PCE_MODEL_FALLBACKS=openrouter/free
+# OpenRouter 示例：在同一 provider=openrouter 下切换模型
+PCE_PROVIDER=openrouter
+PCE_MODEL=openai/gpt-4o-mini
+PCE_MODEL_FALLBACKS=anthropic/claude-3.5-haiku,google/gemini-2.0-flash-001
 ```
 
 ### 供应商配置示例
@@ -168,9 +176,10 @@ PCE 底层使用 litellm，支持所有主流供应商。推荐在 MCP config �
       "command": "uvx",
       "args": ["--from", "git+<repository-url>", "pce", "serve"],
       "env": {
-        "PCE_MODEL": "openai/gpt-4o-mini",
+        "PCE_PROVIDER": "openai",
+        "PCE_MODEL": "gpt-4o-mini",
         "PCE_API_KEY": "sk-...",
-        "PCE_API_BASE": "https://api.openai.com/v1"
+        "PCE_BASE_URL": "https://api.openai.com/v1"
       }
     }
   }
@@ -181,25 +190,36 @@ PCE 底层使用 litellm，支持所有主流供应商。推荐在 MCP config �
 
 ```bash
 # OpenRouter
-PCE_MODEL=openrouter/openai/gpt-4o-mini
+PCE_PROVIDER=openrouter
+PCE_MODEL=openai/gpt-4o-mini
 PCE_API_KEY=sk-or-...
 
 # OpenAI 直连
-PCE_MODEL=openai/gpt-4o-mini
+PCE_PROVIDER=openai
+PCE_MODEL=gpt-4o-mini
 PCE_API_KEY=sk-...
 
 # Anthropic Claude
-PCE_MODEL=anthropic/claude-3-haiku-20240307
+PCE_PROVIDER=anthropic
+PCE_MODEL=claude-3-haiku-20240307
 PCE_API_KEY=sk-ant-...
 
 # OpenAI 兼容自建端点（如 vLLM / LocalAI）
-PCE_MODEL=openai/your-model-name
+PCE_PROVIDER=openai
+PCE_MODEL=your-model-name
 PCE_API_KEY=your-key
-PCE_API_BASE=http://localhost:8000/v1
+PCE_BASE_URL=http://localhost:8000/v1
 
-# StepFun 直连（litellm 原生支持）
-PCE_MODEL=stepfun/step-3.5-flash
-PCE_API_KEY=your-stepfun-key
+# OpenRouter 下选择其他上游模型（模型名本身可带斜杠）
+PCE_PROVIDER=openrouter
+PCE_MODEL=anthropic/claude-sonnet-4
+PCE_API_KEY=sk-or-...
+
+# Anthropic 协议兼容中转
+PCE_PROVIDER=anthropic
+PCE_MODEL=claude-3-7-sonnet-latest
+PCE_API_KEY=your-key
+PCE_BASE_URL=https://your-anthropic-proxy.example.com
 ```
 
 ## 开发

@@ -43,7 +43,7 @@ from .models import (
     SymbolRef,
 )
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import get_completion_overrides, get_env_text, normalize_litellm_model
+from ._env import build_litellm_model, get_completion_overrides, get_env_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +51,34 @@ logger = logging.getLogger(__name__)
 # 常量配置
 # ============================================================================
 
-CODE_EXTENSIONS = frozenset({
-    ".py", ".ts", ".js", ".tsx", ".jsx",
-    ".go", ".java", ".rs", ".cpp", ".c", ".h",
-})
+CODE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".ts",
+        ".js",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".java",
+        ".rs",
+        ".cpp",
+        ".c",
+        ".h",
+    }
+)
 
-SKIP_DIRS = frozenset({
-    ".git", "node_modules", "dist", "build",
-    "__pycache__", ".venv", "venv", ".pce",
-})
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".pce",
+    }
+)
 
 LANGUAGE_MAP: dict[str, str] = {
     ".py": "python",
@@ -76,12 +95,14 @@ LANGUAGE_MAP: dict[str, str] = {
 }
 
 # 只对这些符号类型构建引用索引(避免过多 LLM 调用)
-HIGH_LEVEL_KINDS = frozenset({
-    SymbolKind.CLASS,
-    SymbolKind.FUNCTION,
-    SymbolKind.METHOD,
-    SymbolKind.MODULE,
-})
+HIGH_LEVEL_KINDS = frozenset(
+    {
+        SymbolKind.CLASS,
+        SymbolKind.FUNCTION,
+        SymbolKind.METHOD,
+        SymbolKind.MODULE,
+    }
+)
 
 DEFAULT_CONCURRENCY = 10
 
@@ -170,9 +191,20 @@ def _flatten_symbols(payload: Any) -> list[dict[str, Any]]:
     此函数将其展平为 [{"name": ..., "kind": ...}, ...] 的统一列表。
     """
     _KIND_KEYS = {
-        "class", "interface", "method", "function", "module",
-        "file", "variable", "import", "enum", "property",
-        "constructor", "field", "constant", "namespace",
+        "class",
+        "interface",
+        "method",
+        "function",
+        "module",
+        "file",
+        "variable",
+        "import",
+        "enum",
+        "property",
+        "constructor",
+        "field",
+        "constant",
+        "namespace",
     }
     result: list[dict[str, Any]] = []
 
@@ -335,12 +367,14 @@ def _build_structure_md(entries: list[IndexEntry]) -> str:
         file_count = len(top_dirs[directory])
         lines.append(f"- `{directory}` — {file_count} 个文件")
 
-    lines.extend([
-        "",
-        "## 顶层模块清单",
-        "| 模块 | 文件 | 符号数 |",
-        "|------|------|--------|",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 顶层模块清单",
+            "| 模块 | 文件 | 符号数 |",
+            "|------|------|--------|",
+        ]
+    )
     for entry in sorted(entries, key=lambda e: str(e.file_meta.path)):
         path = Path(entry.file_meta.path)
         module = path.stem or path.name
@@ -372,20 +406,22 @@ def _build_annotation_prompt(entries: list[IndexEntry], project_meta: ProjectMet
         for entry in entries[:50]  # 限制提示词长度
     ]
 
-    return "\n".join([
-        "你是软件架构助手,请基于以下项目索引摘要生成模块职责语义注解。",
-        "",
-        f"项目根路径: {project_meta.root_path}",
-        f"文件总数: {project_meta.file_count}, 代码行总数: {project_meta.loc_total}",
-        "",
-        "索引摘要:",
-        *summary_lines,
-        "",
-        "输出要求(Markdown 格式):",
-        "- 按模块/目录划分章节,使用 ## 标题",
-        "- 每章包含: 核心职责、关键流程、依赖关系、高风险点",
-        "- 语言简洁,每章不超过 200 字",
-    ])
+    return "\n".join(
+        [
+            "你是软件架构助手,请基于以下项目索引摘要生成模块职责语义注解。",
+            "",
+            f"项目根路径: {project_meta.root_path}",
+            f"文件总数: {project_meta.file_count}, 代码行总数: {project_meta.loc_total}",
+            "",
+            "索引摘要:",
+            *summary_lines,
+            "",
+            "输出要求(Markdown 格式):",
+            "- 按模块/目录划分章节,使用 ## 标题",
+            "- 每章包含: 核心职责、关键流程、依赖关系、高风险点",
+            "- 语言简洁,每章不超过 200 字",
+        ]
+    )
 
 
 async def _generate_annotations(
@@ -397,15 +433,14 @@ async def _generate_annotations(
     if not entries:
         return None
 
-    effective_model = (
-        model
-        or get_env_text("PCE_ANNOTATION_MODEL")
-        or get_env_text("PCE_MODEL")
-    )
-    effective_model = normalize_litellm_model(effective_model)
-    if not effective_model:
-        logger.warning("未配置 PCE_ANNOTATION_MODEL 或 PCE_MODEL，跳过语义注解生成")
-        return None
+    effective_model = model
+    if effective_model is None:
+        provider = get_env_text("PCE_PROVIDER")
+        model_name = get_env_text("PCE_MODEL")
+        if not provider or not model_name:
+            logger.warning("未配置 PCE_PROVIDER 或 PCE_MODEL，跳过语义注解生成")
+            return None
+        effective_model = build_litellm_model(provider, model_name)
 
     prompt = _build_annotation_prompt(entries, project_meta)
     messages = [
@@ -606,9 +641,7 @@ async def build_index(
             return await _index_file(file_path, serena_client)
 
     # return_exceptions=True 确保单文件异常不会中断整体构建
-    results = await asyncio.gather(
-        *[_run_with_semaphore(f) for f in files], return_exceptions=True
-    )
+    results = await asyncio.gather(*[_run_with_semaphore(f) for f in files], return_exceptions=True)
 
     entries: list[IndexEntry] = []
     failed_files: list[str] = []
@@ -722,8 +755,7 @@ async def build_index_incremental(
 
     # 过滤有效的代码文件
     effective_changes = [
-        f for f in changed_files
-        if _is_code_file(Path(f)) and not _should_skip(Path(f))
+        f for f in changed_files if _is_code_file(Path(f)) and not _should_skip(Path(f))
     ]
     deleted = set(deleted_files or [])
 
@@ -731,10 +763,7 @@ async def build_index_incremental(
         logger.info("无有效变更，跳过增量更新")
         return existing
 
-    logger.info(
-        f"开始增量索引: {len(effective_changes)} 个变更, "
-        f"{len(deleted)} 个删除"
-    )
+    logger.info(f"开始增量索引: {len(effective_changes)} 个变更, " f"{len(deleted)} 个删除")
 
     # 并发重建变更文件
     semaphore = asyncio.Semaphore(concurrency)
@@ -743,14 +772,10 @@ async def build_index_incremental(
         async with semaphore:
             return await _index_file(file_path, serena_client)
 
-    results = await asyncio.gather(
-        *[_run(f) for f in effective_changes], return_exceptions=True
-    )
+    results = await asyncio.gather(*[_run(f) for f in effective_changes], return_exceptions=True)
 
     # 以现有条目为基础，按文件路径建立映射
-    entries_map: dict[str, IndexEntry] = {
-        str(e.file_meta.path): e for e in existing.entries
-    }
+    entries_map: dict[str, IndexEntry] = {str(e.file_meta.path): e for e in existing.entries}
 
     failed_files: list[str] = []
     for file_path, result in zip(effective_changes, results):

@@ -22,7 +22,9 @@ if env_path.exists():
 
 import litellm
 
-MODEL = os.getenv("PCE_MODEL", "openrouter/stepfun/step-3.5-flash:free")
+PROVIDER = os.getenv("PCE_PROVIDER", "openrouter")
+MODEL_NAME = os.getenv("PCE_MODEL", "stepfun/step-3.5-flash:free")
+MODEL = f"{PROVIDER}/{MODEL_NAME}"
 
 # ── 工具定义 ──────────────────────────────────────────────────
 TOOLS = [
@@ -84,7 +86,14 @@ TOOLS = [
 # ── 模拟工具执行 ──────────────────────────────────────────────
 def mock_tool_call(name: str, args: dict) -> str:
     if name == "get_weather":
-        return json.dumps({"city": args["city"], "temp": 22, "condition": "晴", "unit": args.get("unit", "celsius")})
+        return json.dumps(
+            {
+                "city": args["city"],
+                "temp": 22,
+                "condition": "晴",
+                "unit": args.get("unit", "celsius"),
+            }
+        )
     if name == "get_time":
         return json.dumps({"timezone": args["timezone"], "time": "14:30:00", "date": "2026-02-19"})
     return json.dumps({"error": f"未知工具: {name}"})
@@ -142,14 +151,13 @@ def run_test(title: str, messages: list, max_steps: int = 5):
             print("\n[结果] 循环以无 tool_call 方式结束")
             return
 
-        p(f"LLM 调用了 {len(tool_calls)} 个工具", [
-            {"name": tc.function.name, "args": tc.function.arguments} for tc in tool_calls
-        ])
+        p(
+            f"LLM 调用了 {len(tool_calls)} 个工具",
+            [{"name": tc.function.name, "args": tc.function.arguments} for tc in tool_calls],
+        )
 
         # 检测 deliver 信号
-        deliver_call = next(
-            (tc for tc in tool_calls if tc.function.name == "deliver"), None
-        )
+        deliver_call = next((tc for tc in tool_calls if tc.function.name == "deliver"), None)
         if deliver_call:
             args = json.loads(deliver_call.function.arguments)
             p("检测到 deliver 终止信号", args)
@@ -161,12 +169,14 @@ def run_test(title: str, messages: list, max_steps: int = 5):
             args = json.loads(tc.function.arguments)
             result = mock_tool_call(tc.function.name, args)
             print(f"  → 执行 {tc.function.name}({args}) = {result}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                # StepFun 不识别 name 字段，仅保留 tool_call_id + content
-                "content": result,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    # StepFun 不识别 name 字段，仅保留 tool_call_id + content
+                    "content": result,
+                }
+            )
 
     print(f"\n[结果] 达到最大步数 {max_steps}，强制终止（兜底）")
 
