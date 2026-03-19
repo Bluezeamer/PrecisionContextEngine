@@ -273,23 +273,44 @@ class InsightCache:
         return new_stale_count
 
     async def cleanup_stale(self) -> int:
-        """删除所有 stale 条目及其 entry 文件，返回删除数量。"""
+        """删除所有 stale 条目及其 entry 文件，并清理孤儿 entry 文件。
+
+        返回总删除数量（stale 条目 + 孤儿文件）。
+        """
         await self.ensure_layout()
+        removed = 0
 
         async with self._lock:
             index = await self._load_index_unlocked()
-            stale_ids = [rid for rid, rec in index.records.items() if rec.stale]
-            if not stale_ids:
-                return 0
 
+            # 1. 删除 index 中标记为 stale 的条目
+            stale_ids = [rid for rid, rec in index.records.items() if rec.stale]
             for entry_id in stale_ids:
                 index.records.pop(entry_id)
                 await asyncio.to_thread(self._entry_path(entry_id).unlink, True)
+            removed += len(stale_ids)
 
-            await self._save_index_unlocked(index)
+            # 2. 扫描 entries 目录，删除不在 index 中的孤儿文件
+            known_ids = set(index.records.keys())
+            try:
+                entry_files = await asyncio.to_thread(
+                    lambda: list(self._entries_dir.glob("*.json"))
+                )
+            except Exception:
+                entry_files = []
+            for path in entry_files:
+                file_id = path.stem
+                if file_id not in known_ids:
+                    await asyncio.to_thread(path.unlink, True)
+                    removed += 1
 
-        logger.debug(f"cleanup_stale 删除 {len(stale_ids)} 条 stale 条目")
-        return len(stale_ids)
+            if stale_ids:
+                await self._save_index_unlocked(index)
+
+        if removed:
+            logger.debug("cleanup_stale 删除 %d 条（stale %d + 孤儿 %d）",
+                         removed, len(stale_ids), removed - len(stale_ids))
+        return removed
 
     async def stats(self) -> InsightStats:
         """返回 Insight Cache 统计信息。
