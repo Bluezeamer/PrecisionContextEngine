@@ -405,6 +405,20 @@ class PCEContext:
             self.insight_cache = InsightCache(project_path)
             self.agent = PCEAgent(insight_cache=self.insight_cache)
 
+            # 初始化时清理过时 insight，确保新会话起步认知干净
+            try:
+                stale_marked = await self.insight_cache.sweep_stale()
+                stale_removed = await self.insight_cache.cleanup_stale()
+                if stale_marked or stale_removed:
+                    logger.info(
+                        "Bootstrap Insight 清理: 标记过时 %d 条, 删除 %d 条",
+                        stale_marked, stale_removed,
+                    )
+            except Exception as e:
+                warning = f"Bootstrap Insight 清理失败（不影响初始化）: {e}"
+                warnings.append(warning)
+                logger.warning(warning)
+
             async with self._sync_lock:
                 async with SerenaClient.create(
                     project_path,
@@ -553,14 +567,31 @@ class PCEContext:
         response = await self._bootstrap(resolved, init_mode)
         return response.model_dump(mode="json")
 
-    @staticmethod
-    def _format_dirty_context(dirty: DirtyState) -> str:
-        """将暂存区脏文件信息格式化为上下文注入文本。"""
+    _DIRTY_INJECT_MAX_FILES: int = 50  # 注入脏文件列表的上限
+
+    @classmethod
+    def _format_dirty_context(cls, dirty: DirtyState) -> str:
+        """将暂存区脏文件信息格式化为上下文注入文本。
+
+        超出上限时截断并提示 Agent 先调 pce_sync。
+        """
+        all_paths = dirty.changed + dirty.deleted
+        total = len(all_paths)
+        cap = cls._DIRTY_INJECT_MAX_FILES
+
         lines = ["[系统提示] 以下文件在上次索引后发生了变更，Memory 中对应信息可能不准确:"]
-        for path in dirty.changed:
+        for path in dirty.changed[:cap]:
             lines.append(f"  - 变更: {path}")
-        for path in dirty.deleted:
+        remaining = max(0, cap - len(dirty.changed))
+        for path in dirty.deleted[:remaining]:
             lines.append(f"  - 删除: {path}")
+
+        if total > cap:
+            lines.append(
+                f"  ... 以及另外 {total - cap} 个变更文件未列出。"
+                "建议先调用 pce_sync 更新索引后再继续查询。"
+            )
+
         lines.append(
             "请使用 Serena 工具读取这些文件的最新内容进行验证，"
             "完成理解后调用 acknowledge_changes 确认认知。"
@@ -719,9 +750,13 @@ class PCEContext:
                 f"{snapshot.build_stats.total_symbols} 符号"
             )
 
-        # Insight Cache stale sweep 在锁外执行，避免遍历 I/O 延长临界区
+        # Insight Cache stale sweep + cleanup 在锁外执行，避免遍历 I/O 延长临界区
         stale_marked = await self.insight_cache.sweep_stale()
-        logger.info(f"pce_sync: Insight Cache stale sweep 完成，新标记 {stale_marked} 条")
+        stale_removed = await self.insight_cache.cleanup_stale()
+        logger.info(
+            "pce_sync: Insight Cache 清理完成，标记过时 %d 条，删除 %d 条",
+            stale_marked, stale_removed,
+        )
 
         return {
             "success": True,
