@@ -4,8 +4,8 @@
 - 自然语言代码库查询 (pce_query)
 - 变更影响边界分析 (pce_impact)
 
-会话管理:
-- in-memory 存储 `_sessions: dict[str, list[dict]]`
+运行特性:
+- 每次调用从 Memory 快照与 InsightCache 注入重新起步（无状态）
 - 循环以挂钟时间（而非步数）为终止条件
 - 上下文接近窗口上限时触发 compact：将已有认知蒸馏为摘要，重建对话窗口后继续
 """
@@ -19,6 +19,8 @@ import os
 import re
 import time
 import uuid
+from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -270,6 +272,108 @@ _INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
 _PATH_RE = re.compile(r"(?<![\w./-])(?:\./)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::\d+)?")
 
 
+# ---------------------------------------------------------------------------
+# 请求追踪（per-request，无状态）
+# ---------------------------------------------------------------------------
+
+# 每次 pce_query/pce_impact 在入口设置，通过 asyncio context 自动传播给 spawn 子 Agent
+_req_id_var: ContextVar[str] = ContextVar("pce_req_id", default="")
+
+# Serena 工具名 → 最能代表查询意图的主要参数名（用于 INFO 日志预览）
+_PRIMARY_ARG: dict[str, str] = {
+    "find_symbol": "name_path_pattern",
+    "find_referencing_symbols": "name_path",
+    "get_symbols_overview": "relative_path",
+    "search_for_pattern": "substring_pattern",
+    "list_dir": "relative_path",
+    "find_file": "file_mask",
+    "read_file": "relative_path",
+}
+
+
+def _key_arg_preview(tool_name: str, args: dict[str, Any] | None) -> str:
+    """提取工具主要参数预览，返回 'tool(key=val)' 格式，用于 INFO 日志。"""
+    if not args:
+        return tool_name
+
+    primary_key = _PRIMARY_ARG.get(tool_name)
+    display_key: str | None = None
+    value: str | None = None
+
+    # 优先取 _PRIMARY_ARG 对应的参数
+    if primary_key:
+        candidate = args.get(primary_key)
+        if isinstance(candidate, str) and candidate:
+            display_key = primary_key
+            value = candidate
+
+    # fallback：取第一个非空字符串值（不知道 key 名，只显示值）
+    if value is None:
+        for v in args.values():
+            if isinstance(v, str) and v:
+                value = v
+                break
+
+    if value is None:
+        return tool_name
+
+    truncated = value[:57].rstrip() + "..." if len(value) > 60 else value
+    return f"{tool_name}({display_key}={truncated!r})" if display_key else f"{tool_name}({truncated!r})"
+
+
+# ---------------------------------------------------------------------------
+# 可选 JSONL Trace 文件写入（PCE_TRACE_DIR 设置时生效）
+# ---------------------------------------------------------------------------
+
+
+class _TraceWriter:
+    """per-request JSONL 追踪写入器。
+
+    每条消息（system/user/assistant/tool/deliver）异步追加到独立文件。
+    所有 I/O 均 best-effort：失败不影响主流程。
+    """
+
+    _MAX_FILES: int = 50  # 保留最近 N 个 trace 文件
+
+    def __init__(self, req_id: str, trace_dir: Path) -> None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._path = trace_dir / f"{ts}_{req_id}.jsonl"
+
+    @classmethod
+    def from_env(cls, req_id: str) -> "_TraceWriter | None":
+        """若 PCE_TRACE_DIR 已配置则创建实例，否则返回 None。"""
+        raw = os.getenv("PCE_TRACE_DIR", "").strip()
+        if not raw:
+            return None
+        trace_dir = Path(raw).expanduser()
+        try:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+        return cls(req_id, trace_dir)
+
+    async def write(self, record: dict[str, Any]) -> None:
+        """将 record 追加为一行 JSON 到 trace 文件。"""
+        try:
+            line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+            async with aiofiles.open(self._path, "a", encoding="utf-8") as f:
+                await f.write(line)
+        except Exception:
+            pass
+
+    async def rotate(self) -> None:
+        """超出上限时删除最旧的 trace 文件（LRU）。"""
+        try:
+            files = sorted(
+                self._path.parent.glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            for old_file in files[: -self._MAX_FILES]:
+                old_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 # ============================================================================
 # 辅助函数
 # ============================================================================
@@ -380,7 +484,7 @@ def _parse_tool_call_args(raw_args: Any) -> dict[str, Any] | None:
 # ============================================================================
 
 
-def _parse_query_response(content: str, session_id: str) -> QueryResponse:
+def _parse_query_response(content: str) -> QueryResponse:
     """将 Agent 输出解析为 QueryResponse。"""
     _FALLBACK_ANSWERS = {
         "__REACT_MAX_STEPS_EXCEEDED__": "Agent 未能在限定步数内完成推理，请缩小问题范围后重试。",
@@ -397,7 +501,6 @@ def _parse_query_response(content: str, session_id: str) -> QueryResponse:
             evidence=[],
             related_symbols=[],
             related_files=[],
-            session_id=session_id,
         )
 
     payload = _try_parse_json(content)
@@ -423,7 +526,6 @@ def _parse_query_response(content: str, session_id: str) -> QueryResponse:
             evidence=evidence,
             related_symbols=related_symbols,
             related_files=related_files,
-            session_id=session_id,
         )
 
     return QueryResponse(
@@ -431,11 +533,10 @@ def _parse_query_response(content: str, session_id: str) -> QueryResponse:
         evidence=[],
         related_symbols=[],
         related_files=[],
-        session_id=session_id,
     )
 
 
-def _parse_impact_response(content: str, session_id: str) -> ImpactResponse:
+def _parse_impact_response(content: str) -> ImpactResponse:
     """将 Agent 输出解析为 ImpactResponse。"""
     _FALLBACK_RISKS = {
         "__REACT_MAX_STEPS_EXCEEDED__": "Agent 未能在限定步数内完成影响分析，请缩小分析范围后重试。",
@@ -452,7 +553,6 @@ def _parse_impact_response(content: str, session_id: str) -> ImpactResponse:
             boundary=[],
             risks=[_FALLBACK_RISKS[content]],
             unknowns=[],
-            session_id=session_id,
         )
 
     payload = _try_parse_json(content)
@@ -482,16 +582,14 @@ def _parse_impact_response(content: str, session_id: str) -> ImpactResponse:
             boundary=boundary,
             risks=risks,
             unknowns=unknowns,
-            session_id=session_id,
         )
 
-    # 无法解析为结构化格式,将原始内容作为风险描述
+    # 无法解析为结构化格式，将原始内容作为风险描述
     return ImpactResponse(
         impact_chain=[],
         boundary=[],
         risks=[str(content)] if content else ["分析结果无法解析"],
         unknowns=[],
-        session_id=session_id,
     )
 
 
@@ -503,7 +601,7 @@ def _parse_impact_response(content: str, session_id: str) -> ImpactResponse:
 class PCEAgent:
     """PCE ReAct Agent。
 
-    维护会话状态,驱动 Serena 工具调用,返回推理结论。
+    驱动 Serena 工具调用，返回推理结论。每次调用均从 Memory 快照重新起步（无状态）。
     """
 
     def __init__(
@@ -541,8 +639,6 @@ class PCEAgent:
         self._max_seconds = max_seconds
         self._deliver_tool = DELIVER_TOOL
         self._insight_cache = insight_cache
-        # in-memory 会话存储,进程重启后丢失(MVP 范围内可接受)
-        self._sessions: dict[str, list[dict[str, Any]]] = {}
 
     # =========================================================================
     # Insight 蒸馏辅助
@@ -801,7 +897,7 @@ class PCEAgent:
 
         下一轮 prompt = 本轮 prompt + 本轮 completion（本轮输出会追加到历史）
         因此用 total_tokens（= prompt + completion）作为下一轮窗口占用的预测值，
-        无需累加历史（累加会因每轮 prompt 已包含完整历史而产生 O(n²) 重复计数）。
+        无需累加历史（累加会因每轮 prompt 已包含完整历史而产生 O(n^2) 重复计数）。
         """
         usage = getattr(response, "usage", None)
         if usage is None and isinstance(response, dict):
@@ -907,6 +1003,7 @@ class PCEAgent:
         acknowledge_cb: AcknowledgeCallback | None = None,
         depth: int = 0,
         deadline: float | None = None,
+        trace: _TraceWriter | None = None,
     ) -> tuple[str, str | None]:
         """执行 ReAct 循环直到 agent 调用 deliver 或超出时长预算。
 
@@ -936,9 +1033,11 @@ class PCEAgent:
         if acknowledge_cb is not None:
             tools_schema = tools_schema + [ACKNOWLEDGE_TOOL]
 
+        req_id = _req_id_var.get()
+        round_num = 0
         no_tool_retries = 0
         length_continuations = 0
-        spawn_count = 0  # 本循环内 spawn 次数，不超过 MAX_SPAWNS_PER_SESSION
+        spawn_count = 0  # 本循环内 spawn 次数，不超过 MAX_SPAWNS_PER_LOOP
         token_used = 0
         compact_failed = False
         start = time.monotonic()
@@ -952,11 +1051,18 @@ class PCEAgent:
                 logger.warning(f"ReAct 循环超出截止时间（depth={depth}），强制终止")
                 return "__REACT_TIMEOUT_BUDGET__", None
 
+            round_num += 1
+
             # ── 上下文 compact 检查 ───────────────────────────────────────────
             try:
+                old_len = len(messages)
                 messages, token_used, compact_failed = await self._maybe_compact(
                     messages, token_used, compact_failed
                 )
+                # compact 重建了消息列表时，将新消息写入 trace
+                if trace and len(messages) != old_len:
+                    for m in messages:
+                        await trace.write({"event": "compact_rebuild", **m})
             except LLMCompletionError as e:
                 logger.warning("compact 阶段模型降级链耗尽，终止 ReAct 循环: %s", e)
                 return "__REACT_LLM_EXHAUSTED__", None
@@ -996,18 +1102,27 @@ class PCEAgent:
                 if message.get("content"):
                     # 推理文字被截断：保留已有内容，追加"请继续"
                     messages.append(message)
-                    messages.append({"role": "user", "content": "请继续"})
+                    if trace:
+                        await trace.write(message)
+                    continue_msg = {"role": "user", "content": "请继续"}
+                    messages.append(continue_msg)
+                    if trace:
+                        await trace.write(continue_msg)
                     logger.warning(f"输出被截断(content,第 {length_continuations} 次),追加续写指令")
                 else:
                     # tool_call JSON 被截断：追加空占位 assistant 保持对话结构连续，
                     # 再追加 user 纠正，避免产生"孤立 user 消息"的非法序列
-                    messages.append({"role": "assistant", "content": ""})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": "刚才的工具调用格式不完整，请重新完整地调用工具。",
-                        }
-                    )
+                    empty_assistant = {"role": "assistant", "content": ""}
+                    messages.append(empty_assistant)
+                    if trace:
+                        await trace.write(empty_assistant)
+                    user_correction = {
+                        "role": "user",
+                        "content": "刚才的工具调用格式不完整，请重新完整地调用工具。",
+                    }
+                    messages.append(user_correction)
+                    if trace:
+                        await trace.write(user_correction)
                     logger.warning(
                         f"输出被截断(tool_call,第 {length_continuations} 次),要求重新调用"
                     )
@@ -1015,6 +1130,8 @@ class PCEAgent:
 
             # 正常路径：将 assistant 消息追加到历史
             messages.append(message)
+            if trace:
+                await trace.write(message)
 
             # ── 无 tool_calls：LLM 违反约束（无论 finish_reason）────────────
             # 统一处理，避免 finish_reason=tool_calls 但实际 tool_calls 为空的漏网情况
@@ -1025,16 +1142,17 @@ class PCEAgent:
                         f"无 tool_calls 输出(第 {no_tool_retries} 次),"
                         f"finish_reason={finish_reason},追加强化纠正指令"
                     )
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "你刚才直接用文字回答，这违反了强制流程。"
-                                "必须先通过 tool_calls 调用工具获取证据，"
-                                "完成推理后再用 deliver 提交最终结论，禁止直接回答。"
-                            ),
-                        }
-                    )
+                    user_correction = {
+                        "role": "user",
+                        "content": (
+                            "你刚才直接用文字回答，这违反了强制流程。"
+                            "必须先通过 tool_calls 调用工具获取证据，"
+                            "完成推理后再用 deliver 提交最终结论，禁止直接回答。"
+                        ),
+                    }
+                    messages.append(user_correction)
+                    if trace:
+                        await trace.write(user_correction)
                 else:
                     logger.warning("无 tool_calls 纠正次数耗尽，强制终止循环")
                     return "__REACT_NO_TOOL_EXHAUSTED__", None
@@ -1067,7 +1185,18 @@ class PCEAgent:
                     *[self._invoke_tool(tc, serena_client) for tc in serena_calls]
                 )
                 for result_msg in tool_results:
-                    messages.append({"role": "tool", **result_msg})
+                    # 提取内部计时/预览字段（不写入 messages）
+                    elapsed_s = float(result_msg.pop("_elapsed_seconds", 0.0))
+                    preview = result_msg.pop("_preview", result_msg.get("name", "?"))
+                    content_len = len(result_msg.get("content", ""))
+                    logger.info(
+                        "[req=%s] round=%d -> %s %.2fs %dchars",
+                        req_id, round_num, preview, elapsed_s, content_len,
+                    )
+                    tool_msg = {"role": "tool", **result_msg}
+                    messages.append(tool_msg)
+                    if trace:
+                        await trace.write(tool_msg)
 
             # ── 处理 spawn_agent 调用（串行，避免子任务并发挤占预算）────────────
             for tc in spawn_calls:
@@ -1147,14 +1276,19 @@ class PCEAgent:
                                 confidence=spawn_result.confidence,
                             )
 
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "name": "spawn_agent",
-                        "content": _safe_json_dumps(spawn_result.to_tool_content()),
-                    }
+                spawn_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": "spawn_agent",
+                    "content": _safe_json_dumps(spawn_result.to_tool_content()),
+                }
+                messages.append(spawn_msg)
+                logger.info(
+                    "[req=%s] round=%d -> spawn_agent ok=%s %.1fs",
+                    req_id, round_num, spawn_result.ok, spawn_result.elapsed_seconds,
                 )
+                if trace:
+                    await trace.write(spawn_msg)
 
             # 处理认知确认调用
             for tc in acknowledge_calls:
@@ -1176,14 +1310,19 @@ class PCEAgent:
                         ack_result = f"认知确认失败: {e}"
                 else:
                     ack_result = "无需确认（无变更文件或回调未配置）"
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "name": "acknowledge_changes",
-                        "content": ack_result,
-                    }
+                ack_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": "acknowledge_changes",
+                    "content": ack_result,
+                }
+                messages.append(ack_msg)
+                logger.info(
+                    "[req=%s] round=%d -> acknowledge_changes paths=%d",
+                    req_id, round_num, len(paths),
                 )
+                if trace:
+                    await trace.write(ack_msg)
 
             # deliver 到来，提取结论并正常终止
             if deliver_call is not None:
@@ -1203,7 +1342,18 @@ class PCEAgent:
                     return "__REACT_DELIVER_EMPTY__", None
                 confidence = args.get("confidence")
                 elapsed = time.monotonic() - start
-                logger.debug(f"ReAct 循环收到 deliver，正常终止（耗时 {elapsed:.1f}s）")
+                logger.info(
+                    "[req=%s] DELIVER confidence=%s elapsed=%.1fs rounds=%d",
+                    req_id, confidence, elapsed, round_num,
+                )
+                if trace:
+                    await trace.write({
+                        "event": "deliver",
+                        "confidence": confidence,
+                        "elapsed_seconds": elapsed,
+                        "rounds": round_num,
+                        "answer": str(answer),
+                    })
                 return str(answer), str(confidence) if confidence else None
 
             # 本轮仅有 Serena 工具调用，重置无工具计数，继续下一轮
@@ -1212,7 +1362,7 @@ class PCEAgent:
     async def _invoke_tool(
         self, tool_call: dict[str, Any], serena_client: SerenaClient
     ) -> dict[str, Any]:
-        """执行单个工具调用,返回格式化的 tool 消息。"""
+        """执行单个工具调用,返回格式化的 tool 消息（含内部计时字段）。"""
         # 提取 tool_call 字段(兼容 dict 和 object 两种格式)
         if isinstance(tool_call, dict):
             tool_call_id = tool_call.get("id") or str(uuid.uuid4())
@@ -1230,6 +1380,8 @@ class PCEAgent:
                 "tool_call_id": tool_call_id,
                 "name": "unknown",
                 "content": "工具调用缺少 name 字段",
+                "_elapsed_seconds": 0.0,
+                "_preview": "unknown",
             }
 
         args = _parse_tool_call_args(raw_args)
@@ -1242,14 +1394,20 @@ class PCEAgent:
                 "tool_call_id": tool_call_id,
                 "name": tool_name,
                 "content": f"工具参数解析失败: 无效的 JSON。请重新调用 {tool_name} 并确保参数格式正确。",
+                "_elapsed_seconds": 0.0,
+                "_preview": _key_arg_preview(tool_name, None),
             }
 
+        preview = _key_arg_preview(tool_name, args)
+        t0 = time.monotonic()
         try:
             result = await serena_client.call(tool_name, args)
             return {
                 "tool_call_id": tool_call_id,
                 "name": tool_name,
                 "content": _safe_json_dumps(result),
+                "_elapsed_seconds": time.monotonic() - t0,
+                "_preview": preview,
             }
         except SerenaClientError as e:
             logger.warning(f"工具调用失败: {tool_name}: {e}")
@@ -1257,6 +1415,8 @@ class PCEAgent:
                 "tool_call_id": tool_call_id,
                 "name": tool_name,
                 "content": f"工具调用失败: {e}",
+                "_elapsed_seconds": time.monotonic() - t0,
+                "_preview": preview,
             }
 
     # ============================================================================
@@ -1266,7 +1426,6 @@ class PCEAgent:
     async def query(
         self,
         question: str,
-        session_id: str | None = None,
         memory_root: str | Path | None = None,
         serena_client: SerenaClient | None = None,
         acknowledge_cb: AcknowledgeCallback | None = None,
@@ -1275,7 +1434,6 @@ class PCEAgent:
 
         Args:
             question: 用户问题
-            session_id: 会话 ID,不传时自动创建新会话
             memory_root: Memory 文件根路径
             serena_client: 已连接的 SerenaClient
             acknowledge_cb: 认知确认回调,Agent 探索变更文件后触发
@@ -1289,27 +1447,35 @@ class PCEAgent:
         if serena_client is None:
             raise SerenaClientError("serena_client 未提供")
 
-        sid = session_id or str(uuid.uuid4())
-        messages = list(self._sessions.get(sid, []))
-
-        # 新会话时注入 system prompt
-        if not messages:
+        req_id = uuid.uuid4().hex[:8]
+        token = _req_id_var.set(req_id)
+        trace = _TraceWriter.from_env(req_id)
+        try:
+            logger.info('[req=%s] QUERY "%s"', req_id, question[:80])
             memory_path = Path(memory_root) if memory_root else None
             system_content = await self._build_system_prompt(memory_path)
-            messages = [{"role": "system", "content": system_content}]
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": question},
+            ]
+            if trace:
+                await trace.write({"role": "system", "content": system_content})
+                await trace.write({"role": "user", "content": question})
 
-        messages.append({"role": "user", "content": question})
-        answer, confidence = await self._run_react_loop(messages, serena_client, acknowledge_cb)
-        self._sessions[sid] = messages
-        await self._persist_insights(question=question, answer=answer, confidence=confidence)
-
-        return _parse_query_response(answer, sid)
+            answer, confidence = await self._run_react_loop(
+                messages, serena_client, acknowledge_cb, trace=trace,
+            )
+            await self._persist_insights(question=question, answer=answer, confidence=confidence)
+            return _parse_query_response(answer)
+        finally:
+            if trace:
+                await trace.rotate()
+            _req_id_var.reset(token)
 
     async def impact(
         self,
         target: str,
         change_type: str,
-        session_id: str | None = None,
         memory_root: str | Path | None = None,
         serena_client: SerenaClient | None = None,
         acknowledge_cb: AcknowledgeCallback | None = None,
@@ -1319,7 +1485,6 @@ class PCEAgent:
         Args:
             target: 分析目标(符号名或文件路径)
             change_type: 变更类型(modify/rename/delete/add_field/change_signature)
-            session_id: 会话 ID,不传时自动创建新会话
             memory_root: Memory 文件根路径
             serena_client: 已连接的 SerenaClient
             acknowledge_cb: 认知确认回调,Agent 探索变更文件后触发
@@ -1333,32 +1498,43 @@ class PCEAgent:
         if serena_client is None:
             raise SerenaClientError("serena_client 未提供")
 
-        sid = session_id or str(uuid.uuid4())
-        messages = list(self._sessions.get(sid, []))
-
-        if not messages:
+        req_id = uuid.uuid4().hex[:8]
+        token = _req_id_var.set(req_id)
+        trace = _TraceWriter.from_env(req_id)
+        try:
+            logger.info('[req=%s] IMPACT target="%s" change_type=%s', req_id, target[:80], change_type)
             memory_path = Path(memory_root) if memory_root else None
             system_content = await self._build_system_prompt(memory_path)
-            messages = [{"role": "system", "content": system_content}]
-
-        # 构造影响分析专用提示词
-        prompt = "\n".join(
-            [
-                f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
-                "",
-                "请使用 Serena 工具查找所有引用,然后以 JSON 格式输出:",
-                "{",
-                '  "impact_chain": [...],  // 影响链路中的 ReferenceEdge 列表',
-                '  "boundary": [...],      // 影响边界的 SymbolRef 列表',
-                '  "risks": [...],         // 风险提示字符串列表',
-                '  "unknowns": [...]       // 不确定项字符串列表',
-                "}",
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_content},
             ]
-        )
 
-        messages.append({"role": "user", "content": prompt})
-        answer, confidence = await self._run_react_loop(messages, serena_client, acknowledge_cb)
-        self._sessions[sid] = messages
-        await self._persist_insights(question=prompt, answer=answer, confidence=confidence)
+            # 构造影响分析专用提示词
+            prompt = "\n".join(
+                [
+                    f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
+                    "",
+                    "请使用 Serena 工具查找所有引用,然后以 JSON 格式输出:",
+                    "{",
+                    '  "impact_chain": [...],  // 影响链路中的 ReferenceEdge 列表',
+                    '  "boundary": [...],      // 影响边界的 SymbolRef 列表',
+                    '  "risks": [...],         // 风险提示字符串列表',
+                    '  "unknowns": [...]       // 不确定项字符串列表',
+                    "}",
+                ]
+            )
+            messages.append({"role": "user", "content": prompt})
 
-        return _parse_impact_response(answer, sid)
+            if trace:
+                await trace.write({"role": "system", "content": system_content})
+                await trace.write({"role": "user", "content": prompt})
+
+            answer, confidence = await self._run_react_loop(
+                messages, serena_client, acknowledge_cb, trace=trace,
+            )
+            await self._persist_insights(question=prompt, answer=answer, confidence=confidence)
+            return _parse_impact_response(answer)
+        finally:
+            if trace:
+                await trace.rotate()
+            _req_id_var.reset(token)

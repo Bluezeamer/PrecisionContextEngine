@@ -200,10 +200,6 @@ def _build_tools(
                         "type": "string",
                         "description": "自然语言问题,例如: '认证逻辑的入口在哪里?'",
                     },
-                    "session_id": {
-                        "type": "string",
-                        "description": "会话 ID(可选,用于多轮对话;不传时自动创建新会话)",
-                    },
                 },
                 "required": ["query"],
             },
@@ -233,10 +229,6 @@ def _build_tools(
                         "type": "string",
                         "description": "变更类型: modify | rename | delete | add_field | change_signature",
                         "enum": ["modify", "rename", "delete", "add_field", "change_signature"],
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "会话 ID(可选)",
                     },
                     "file": {
                         "type": "string",
@@ -562,9 +554,7 @@ class PCEContext:
         )
         return "\n".join(lines)
 
-    async def handle_query(
-        self, query: str, session_id: str | None
-    ) -> dict[str, Any]:
+    async def handle_query(self, query: str) -> dict[str, Any]:
         """处理 pce_query 请求。"""
         self._require_initialized()
         assert self.staging is not None
@@ -580,7 +570,6 @@ class PCEContext:
         async with self.serena_session() as serena_client:
             response = await self.agent.query(
                 question=enriched_query,
-                session_id=session_id,
                 memory_root=self.project_path,
                 serena_client=serena_client,
                 acknowledge_cb=self.staging.acknowledge,
@@ -591,7 +580,6 @@ class PCEContext:
         self,
         target: str,
         change_type: str,
-        session_id: str | None,
         file: str | None,
     ) -> dict[str, Any]:
         """处理 pce_impact 请求。"""
@@ -604,7 +592,6 @@ class PCEContext:
             response = await self.agent.impact(
                 target=effective_target,
                 change_type=change_type,
-                session_id=session_id,
                 memory_root=self.project_path,
                 serena_client=serena_client,
                 acknowledge_cb=self.staging.acknowledge,
@@ -798,10 +785,7 @@ async def serve() -> None:
                 query = arguments.get("query", "")
                 if not query:
                     return _error_response("INVALID_INPUT", "query 参数不能为空")
-                result = await ctx.handle_query(
-                    query=query,
-                    session_id=arguments.get("session_id"),
-                )
+                result = await ctx.handle_query(query=query)
                 return _text_response(result)
 
             if name == "pce_impact":
@@ -812,7 +796,6 @@ async def serve() -> None:
                 result = await ctx.handle_impact(
                     target=target,
                     change_type=change_type,
-                    session_id=arguments.get("session_id"),
                     file=arguments.get("file"),
                 )
                 return _text_response(result)

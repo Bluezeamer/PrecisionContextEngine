@@ -258,7 +258,6 @@ class QueryRequest(BaseSchema):
 
     query: NonEmptyStr = Field(..., description="自然语言查询")
     top_k: int = Field(default=5, ge=1, le=50, description="返回结果数量上限")
-    session_id: Optional[UUIDStr] = Field(default=None, description="会话 ID（可选,用于多轮对话）")
 
 
 class QueryResponse(BaseSchema):
@@ -268,7 +267,6 @@ class QueryResponse(BaseSchema):
     evidence: list[NonEmptyStr] = Field(default_factory=list, description="证据摘要列表")
     related_symbols: list[SymbolRef] = Field(default_factory=list, description="相关符号列表")
     related_files: list[Path] = Field(default_factory=list, description="相关文件路径列表")
-    session_id: UUIDStr = Field(..., description="会话 ID（用于后续对话,新会话时自动生成）")
 
 
 class ImpactRequest(BaseSchema):
@@ -277,7 +275,6 @@ class ImpactRequest(BaseSchema):
     target: NonEmptyStr = Field(..., description="影响分析目标（符号名或文件路径）")
     depth: int = Field(default=3, ge=1, le=10, description="引用链追踪深度")
     max_nodes: int = Field(default=200, ge=1, le=2000, description="最大分析节点数")
-    session_id: Optional[UUIDStr] = Field(default=None, description="会话 ID（可选）")
 
 
 class ImpactResponse(BaseSchema):
@@ -287,7 +284,6 @@ class ImpactResponse(BaseSchema):
     boundary: list[SymbolRef] = Field(default_factory=list, description="影响边界符号列表")
     risks: list[NonEmptyStr] = Field(default_factory=list, description="风险提示列表")
     unknowns: list[NonEmptyStr] = Field(default_factory=list, description="不确定项列表")
-    session_id: UUIDStr = Field(..., description="会话 ID（用于后续对话,新会话时自动生成）")
 
 
 class StatusResponse(BaseSchema):
