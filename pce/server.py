@@ -30,6 +30,7 @@ from mcp.server import Server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from .agent import PCEAgent
+from .digest_agent import run_digest
 from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
 from .models import InitResponse
@@ -324,14 +325,15 @@ class PCEContext:
             except Exception:
                 logger.exception("Serena 会话关闭异常")
 
-    async def _run_index_refresh(self, serena_client: SerenaClient) -> None:
-        """执行索引刷新逻辑（全量或增量）。
+    async def _run_index_refresh(self, serena_client: SerenaClient) -> DirtyState:
+        """执行索引刷新逻辑（全量或增量），返回本次刷新前的 DirtyState 供 Digest 消费。
 
         调用方负责加锁（_sync_lock）与状态位更新。
         1. 索引不存在 → 全量构建 + 清空暂存区
         2. 索引存在但暂存区有累积变更 → 增量更新 + 清空暂存区
-        3. 索引存在且无变更 → 直接跳过
+        3. 索引存在且无变更 → 直接跳过，返回当前（空）DirtyState
         """
+        assert self.staging is not None
         if not await index_exists(root_path=self.project_path):
             logger.info("PCE 索引不存在，开始全量构建...")
             dirty = await self.staging.list_pending_reindex()
@@ -351,7 +353,7 @@ class PCEContext:
                     all_paths, expected_hashes=hash_snapshot,
                 )
             logger.info("PCE 索引全量构建完成")
-            return
+            return dirty
 
         dirty = await self.staging.list_pending_reindex()
         if not dirty.empty:
@@ -372,6 +374,8 @@ class PCEContext:
                 all_paths, expected_hashes=hash_snapshot
             )
             logger.info("增量索引更新完成")
+
+        return dirty
 
     async def _bootstrap(
         self,
@@ -405,20 +409,6 @@ class PCEContext:
             self.insight_cache = InsightCache(project_path)
             self.agent = PCEAgent(insight_cache=self.insight_cache)
 
-            # 初始化时清理过时 insight，确保新会话起步认知干净
-            try:
-                stale_marked = await self.insight_cache.sweep_stale()
-                stale_removed = await self.insight_cache.cleanup_stale()
-                if stale_marked or stale_removed:
-                    logger.info(
-                        "Bootstrap Insight 清理: 标记过时 %d 条, 删除 %d 条",
-                        stale_marked, stale_removed,
-                    )
-            except Exception as e:
-                warning = f"Bootstrap Insight 清理失败（不影响初始化）: {e}"
-                warnings.append(warning)
-                logger.warning(warning)
-
             async with self._sync_lock:
                 async with SerenaClient.create(
                     project_path,
@@ -442,7 +432,28 @@ class PCEContext:
                         warnings.append(warning)
                         logger.warning(warning)
 
-                    await self._run_index_refresh(serena_client)
+                    digest_dirty = await self._run_index_refresh(serena_client)
+
+                    # 认知整合：将积累的 insight 和 dirty_files 内化到 annotation
+                    try:
+                        digest_result = await run_digest(
+                            project_root=project_path,
+                            serena_client=serena_client,
+                            insight_cache=self.insight_cache,
+                            dirty_state=digest_dirty,
+                        )
+                        for w in digest_result.get("warnings", []):
+                            warnings.append(f"Digest: {w}")
+                        logger.info(
+                            "Bootstrap Digest 完成: resolved=%d pending=%d deleted_insights=%d",
+                            digest_result.get("resolved_tasks", 0),
+                            digest_result.get("pending_tasks", 0),
+                            digest_result.get("deleted_insights", 0),
+                        )
+                    except Exception as e:
+                        warning = f"Bootstrap Digest 失败（不影响初始化）: {e}"
+                        warnings.append(warning)
+                        logger.warning(warning)
 
             self._init_state = "initialized"
             self._bootstrap_warnings = list(warnings)
@@ -712,6 +723,8 @@ class PCEContext:
         assert self.staging is not None
         assert self.insight_cache is not None
 
+        digest_warnings: list[str] = []
+
         async with self._sync_lock:
             async with self.serena_session() as serena_client:
                 dirty = await self.staging.list_pending_reindex()
@@ -743,6 +756,28 @@ class PCEContext:
                     )
                     message = "Serena 已重连，PCE 索引全量重建完成"
 
+                # 认知整合：在 Serena 连接仍活跃时执行，复用当前连接
+                try:
+                    digest_result = await run_digest(
+                        project_root=self.project_path,
+                        serena_client=serena_client,
+                        insight_cache=self.insight_cache,
+                        dirty_state=dirty,
+                    )
+                    digest_warnings = [
+                        f"Digest: {w}" for w in digest_result.get("warnings", [])
+                    ]
+                    logger.info(
+                        "pce_sync Digest 完成: resolved=%d pending=%d deleted_insights=%d",
+                        digest_result.get("resolved_tasks", 0),
+                        digest_result.get("pending_tasks", 0),
+                        digest_result.get("deleted_insights", 0),
+                    )
+                except Exception as e:
+                    w = f"pce_sync Digest 失败（不影响同步）: {e}"
+                    digest_warnings = [w]
+                    logger.warning(w)
+
             self._init_state = "initialized"
             logger.info(
                 f"pce_sync: 完成 — "
@@ -750,18 +785,11 @@ class PCEContext:
                 f"{snapshot.build_stats.total_symbols} 符号"
             )
 
-        # Insight Cache stale sweep + cleanup 在锁外执行，避免遍历 I/O 延长临界区
-        stale_marked = await self.insight_cache.sweep_stale()
-        stale_removed = await self.insight_cache.cleanup_stale()
-        logger.info(
-            "pce_sync: Insight Cache 清理完成，标记过时 %d 条，删除 %d 条",
-            stale_marked, stale_removed,
-        )
-
         return {
             "success": True,
             "message": message,
             "stats": snapshot.build_stats.model_dump(mode="json"),
+            "warnings": digest_warnings,
         }
 
 

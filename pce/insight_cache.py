@@ -328,6 +328,41 @@ class InsightCache:
             last_updated=index.updated_at if total > 0 else None,
         )
 
+    async def get_all_records(
+        self, *, include_stale: bool = True
+    ) -> list[InsightIndexRecord]:
+        """返回全部索引记录，默认包含 stale 条目。DigestAgent 用于构建任务清单。"""
+        index = await self._load_index_safe()
+        records = list(index.records.values())
+        if not include_stale:
+            records = [r for r in records if not r.stale]
+        return sorted(records, key=lambda r: r.last_referenced_at, reverse=True)
+
+    async def get_entry_content(self, entry_id: str) -> str | None:
+        """返回指定条目的正文内容，条目不存在时返回 None。"""
+        entry = await self._read_entry(entry_id)
+        return entry.content if entry is not None else None
+
+    async def delete_by_ids(self, ids: list[str]) -> int:
+        """按 ID 批量删除条目及其 entry 文件，返回实际从索引中删除的数量。"""
+        normalized = [eid.strip() for eid in ids if eid and eid.strip()]
+        if not normalized:
+            return 0
+
+        await self.ensure_layout()
+        removed = 0
+        async with self._lock:
+            index = await self._load_index_unlocked()
+            changed = False
+            for entry_id in dict.fromkeys(normalized):  # 去重保序
+                if index.records.pop(entry_id, None) is not None:
+                    removed += 1
+                    changed = True
+                await asyncio.to_thread(self._entry_path(entry_id).unlink, True)
+            if changed:
+                await self._save_index_unlocked(index)
+        return removed
+
     # =========================================================================
     # 私有辅助
     # =========================================================================
