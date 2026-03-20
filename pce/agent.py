@@ -44,7 +44,7 @@ from .agent_runtime.spawner import invoke_spawn
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse, ReferenceEdge, SymbolRef
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import build_litellm_model, get_completion_overrides, get_env_text
+from ._env import build_litellm_model, get_completion_overrides, get_env_text, get_system_prompt_soft_limit
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +309,13 @@ _MAX_TIMEOUT_RETRIES = 1
 _INSIGHT_TOP_K = 5
 _INSIGHT_TOKEN_BUDGET = 4000  # 字符数上限（粗略估算 token）
 _INSIGHT_MAX_SCOPES = 3  # 每次 deliver 最多写入的 scope 数量
+# system prompt 动态注入块软上限（token 数），运行时从 env 读取。
+# 仅针对可压缩块（structure.md + annotations/index.md + InsightCache），
+# 不含 SYSTEM_PROMPT_HEADER 和工具 schema。
+# 计算方式：PCE_CONTEXT_WINDOW / 10，默认 200k / 10 = 20000。
+_SYSTEM_PROMPT_SOFT_LIMIT: int = get_system_prompt_soft_limit()
+_SYSTEM_PROMPT_TRUNCATED_NOTICE = "\n\n(以上内容因 system prompt token 预算限制已被截断，如需完整信息请通过工具按需读取)"
+_SYSTEM_PROMPT_PLACEHOLDER = "(内容因 system prompt token 超限未注入，请通过工具按需读取)"
 _INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
 # 从文本中提取形如 pce/agent.py 或 ./src/foo.py:123 的路径
 _PATH_RE = re.compile(r"(?<![\w./-])(?:\./)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::\d+)?")
@@ -902,20 +909,9 @@ class PCEAgent:
             logger.warning(f"读取文件失败: {path}: {e}")
             return f"(读取 {path.name} 失败)"
 
-    async def _build_system_prompt(self, memory_root: Path | None) -> str:
-        """构建 system prompt,注入 structure.md 和 annotations/index.md 内容。
-
-        annotations/index.md 是轻量的模块导航入口；各模块深度认知文档（modules/*.md）
-        由 PCE Agent 在 ReAct 循环中按需通过 read_file 工具自主加载。
-
-        若 insight_cache 已配置，在末尾追加动态认知块（top-k 条目）。
-        """
-        root = memory_root or Path.cwd()
-        pce_dir = root / ".pce"
-
-        structure_md = await self._read_pce_file(pce_dir / "structure.md")
-        annotations_index_md = await self._read_pce_file(pce_dir / "annotations" / "index.md")
-
+    @staticmethod
+    def _compose_system_prompt(structure_md: str, annotations_index_md: str, injected: str) -> str:
+        """将各注入块拼装为完整 system prompt 文本。"""
         sections = [
             SYSTEM_PROMPT_HEADER,
             "",
@@ -925,25 +921,114 @@ class PCEAgent:
             "## 项目认知导航 (annotations/index.md)",
             annotations_index_md.strip(),
         ]
+        if injected.strip():
+            sections += [
+                "",
+                "## 动态认知提示",
+                "以下内容来自历史会话蒸馏，可能过时；必须通过工具验证后再使用。",
+                "",
+                injected.strip(),
+            ]
+        return "\n".join(sections)
 
+    async def _build_system_prompt(self, memory_root: Path | None) -> str:
+        """构建 system prompt,注入 structure.md 和 annotations/index.md 内容。
+
+        annotations/index.md 是轻量的模块导航入口；各模块深度认知文档（modules/*.md）
+        由 PCE Agent 在 ReAct 循环中按需通过 read_file 工具自主加载。
+
+        若 insight_cache 已配置，在末尾追加动态认知块（top-k 条目）。
+
+        超出 _SYSTEM_PROMPT_SOFT_LIMIT 时按以下顺序降级：
+          降级1 — 截断 structure.md（保留比例行数 + 截断提示）
+          降级2 — 截断 annotations/index.md
+          降级3 — 两者均替换为占位文本
+        每级降级均打 WARNING 日志标明触发块与 token 估算值。
+        """
+        root = memory_root or Path.cwd()
+        pce_dir = root / ".pce"
+
+        structure_md = await self._read_pce_file(pce_dir / "structure.md")
+        annotations_index_md = await self._read_pce_file(pce_dir / "annotations" / "index.md")
+
+        injected = ""
         if self._insight_cache is not None:
             try:
                 injected, _ = await self._insight_cache.get_top_k(
                     k=_INSIGHT_TOP_K,
                     token_budget=_INSIGHT_TOKEN_BUDGET,
                 )
-                if injected.strip():
-                    sections += [
-                        "",
-                        "## 动态认知提示",
-                        "以下内容来自历史会话蒸馏，可能过时；必须通过工具验证后再使用。",
-                        "",
-                        injected.strip(),
-                    ]
             except Exception as e:
                 logger.warning(f"读取 Insight Cache 失败，忽略本轮注入: {e}")
 
-        return "\n".join(sections)
+        prompt = self._compose_system_prompt(structure_md, annotations_index_md, injected)
+
+        # 正常路径：只对可压缩的动态注入块做 token 估算（不含 HEADER 和工具 schema）
+        # HEADER 和工具 schema 不可压缩、不应参与上限判断
+        dynamic_content = "\n\n".join(filter(None, [
+            structure_md.strip(),
+            annotations_index_md.strip(),
+            injected.strip(),
+        ]))
+        token_count = litellm.token_counter(
+            model=self._model,
+            messages=[{"role": "system", "content": dynamic_content}],
+        )
+        if token_count <= _SYSTEM_PROMPT_SOFT_LIMIT:
+            return prompt
+
+        def _truncate_by_ratio(content: str, budget_ratio: float) -> str:
+            """按比例保留前 N 行；实际截断时末尾追加截断提示。"""
+            lines = content.strip().splitlines()
+            if not lines or budget_ratio >= 1.0:
+                return content.strip()
+            keep = max(1, int(len(lines) * budget_ratio))
+            if keep >= len(lines):
+                return content.strip()
+            return "\n".join(lines[:keep]) + _SYSTEM_PROMPT_TRUNCATED_NOTICE
+
+        # 目标：将每个动态块各自压缩到 ratio 比例，使总 token 回到软上限以内
+        # ratio 直接作用于每个块自身，不做跨块分配（降级1只压 structure，降级2再压 annotations）
+        ratio = (_SYSTEM_PROMPT_SOFT_LIMIT / token_count) * 0.85  # 留 15% 余量
+
+        def _count_dynamic(s: str, a: str, i: str) -> int:
+            """只统计动态注入块的 token 数（不含 HEADER 和工具 schema）。"""
+            content = "\n\n".join(filter(None, [s.strip(), a.strip(), i.strip()]))
+            return litellm.token_counter(
+                model=self._model,
+                messages=[{"role": "system", "content": content}],
+            )
+
+        # 降级1：截断 structure.md
+        structure_truncated = _truncate_by_ratio(structure_md, ratio)
+        token_count = _count_dynamic(structure_truncated, annotations_index_md, injected)
+        logger.warning(
+            "system prompt 超出软上限，触发降级1: block=structure.md, tokens=%d",
+            token_count,
+        )
+        if token_count <= _SYSTEM_PROMPT_SOFT_LIMIT:
+            return self._compose_system_prompt(structure_truncated, annotations_index_md, injected)
+
+        # 降级2：同时截断 annotations/index.md
+        annotations_truncated = _truncate_by_ratio(annotations_index_md, ratio)
+        token_count = _count_dynamic(structure_truncated, annotations_truncated, injected)
+        logger.warning(
+            "system prompt 超出软上限，触发降级2: block=annotations/index.md, tokens=%d",
+            token_count,
+        )
+        if token_count <= _SYSTEM_PROMPT_SOFT_LIMIT:
+            return self._compose_system_prompt(structure_truncated, annotations_truncated, injected)
+
+        # 降级3：两者均替换为占位文本
+        logger.warning(
+            "system prompt 超出软上限，触发降级3: 全部动态块替换为占位文本, tokens=%d",
+            token_count,
+        )
+        return self._compose_system_prompt(
+            _SYSTEM_PROMPT_PLACEHOLDER,
+            _SYSTEM_PROMPT_PLACEHOLDER,
+            injected,
+        )
 
     async def _completion(
         self,

@@ -40,6 +40,26 @@ def get_completion_overrides() -> dict[str, Any]:
     return overrides
 
 
+def get_system_prompt_soft_limit() -> int:
+    """根据 PCE_CONTEXT_WINDOW 计算动态注入块的 token 软上限。
+
+    软上限 = context_window / 10，仅针对可压缩的动态注入块
+    （structure.md + annotations/index.md + InsightCache），
+    不含 SYSTEM_PROMPT_HEADER 和工具 schema。
+
+    未配置时默认 context_window=200000，对应软上限 20000 token。
+    """
+    raw = get_env_text("PCE_CONTEXT_WINDOW")
+    if raw is not None:
+        try:
+            context_window = int(raw)
+            if context_window > 0:
+                return max(1000, context_window // 10)
+        except ValueError:
+            pass
+    return 20000  # 默认：200k context window / 10
+
+
 def build_litellm_model(provider: str | None, model: str) -> str:
     """将 provider + model 机械拼装为 LiteLLM model 字符串。
 
