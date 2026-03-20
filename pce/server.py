@@ -648,7 +648,7 @@ class PCEContext:
         status = (
             await get_status(root_path=root)
             if root is not None
-            else {"last_index_time": None, "index_version": None, "memory_items_count": 0}
+            else {"last_index_time": None, "index_version": None, "annotation_modules_count": 0}
         )
         staging_summary = (
             await self.staging.summary()

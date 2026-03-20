@@ -24,7 +24,6 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
-    field_validator,
     model_validator,
 )
 
@@ -176,57 +175,6 @@ class IndexSnapshot(BaseSchema):
 
 
 # ============================================================================
-# Memory 与会话
-# ============================================================================
-
-
-class MemoryItemType(str, Enum):
-    """记忆条目类型枚举。"""
-
-    SUMMARY = "summary"  # 摘要
-    DECISION = "decision"  # 决策记录
-    QUERY = "query"  # 查询记录
-    IMPACT = "impact"  # 影响分析记录
-    NOTE = "note"  # 备注
-
-
-class MemoryItem(BaseSchema):
-    """记忆条目,存储 Agent 的推理过程和结论。"""
-
-    item_id: UUIDStr = Field(..., description="记忆条目唯一 ID（UUID）")
-    item_type: MemoryItemType = Field(..., description="记忆类型")
-    content: NonEmptyStr = Field(..., description="记忆内容")
-    tags: list[NonEmptyStr] = Field(default_factory=list, description="标签列表")
-    related_files: list[Path] = Field(default_factory=list, description="关联文件路径列表")
-    created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
-
-    @field_validator("tags")
-    @classmethod
-    def _dedupe_tags(cls, value: list[str]) -> list[str]:
-        """去除标签列表中的重复项,保持顺序。"""
-        seen: set[str] = set()
-        result: list[str] = []
-        for item in value:
-            if item not in seen:
-                seen.add(item)
-                result.append(item)
-        return result
-
-
-class SessionState(BaseSchema):
-    """会话状态,记录单个对话会话的上下文。"""
-
-    session_id: UUIDStr = Field(..., description="会话唯一 ID（UUID）")
-    started_at: UTCDateTime = Field(..., description="会话开始时间（UTC）")
-    last_step: Optional[NonEmptyStr] = Field(
-        default=None, description="最后执行的步骤描述"
-    )
-    last_error: Optional[NonEmptyStr] = Field(
-        default=None, description="最后发生的错误信息"
-    )
-
-
-# ============================================================================
 # MCP 工具协议
 # ============================================================================
 
@@ -284,20 +232,6 @@ class ImpactResponse(BaseSchema):
     boundary: list[dict[str, Any]] = Field(default_factory=list, description="影响边界符号列表（轻量 dict）")
     risks: list[NonEmptyStr] = Field(default_factory=list, description="风险提示列表")
     unknowns: list[NonEmptyStr] = Field(default_factory=list, description="不确定项列表")
-
-
-class StatusResponse(BaseSchema):
-    """pce_status 工具的响应结果。"""
-
-    last_index_time: Optional[UTCDateTime] = Field(
-        default=None, description="最后索引时间（UTC）"
-    )
-    index_version: Optional[NonEmptyStr] = Field(default=None, description="索引版本号")
-    memory_items_count: int = Field(..., ge=0, description="记忆条目数量")
-    status_message: NonEmptyStr = Field(..., description="状态描述信息")
-    insight_stats: Optional[InsightStats] = Field(
-        default=None, description="Insight Cache 统计信息（可选）"
-    )
 
 
 # ============================================================================

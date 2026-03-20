@@ -1,6 +1,6 @@
 # PCE 开发进度
 
-> 最后更新：2026-03-19
+> 最后更新：2026-03-20
 > 设计文档：[PCE_design.md](PCE_design.md) · [design_subagent_architecture.md](design_subagent_architecture.md) · [implementation_plan.md](implementation_plan.md)
 
 ---
@@ -49,6 +49,13 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
   - Insight 模型：InsightConfidence, InsightEntry, InsightIndexRecord, InsightIndex, InsightStats
   - **新增**：`InitResponse`（pce_init 响应，含 status/init_mode/file_count/warnings/error）
 - `pce/indexer.py` — 代码索引构建
+  - **改造**：移除单体 `annotations.md` 语义注解写入链路，改为生成 `.pce/annotations/index.md` + `.pce/annotations/modules/*.md`
+  - **新增**：`_build_index_md_prompt()` — 生成轻量认知导航首页（index.md）的 in-context learning prompt
+  - **新增**：`_build_module_annotation_prompt()` — 生成单模块深度认知文档的 prompt
+  - **新增**：`_parse_index_md()` / `_split_index_md()` / `_render_index_md()` — index.md 结构化解析与回写
+  - **新增**：`_write_annotations()` / `_update_annotations_incremental()` — 全量/增量认知导航写入与局部更新
+  - **新增**：新增文件模块归属判断与临时章节降级逻辑；LLM 不可用时回退到结构化 index/module 模板
+  - **改造**：`build_index_incremental()` 新增 `model` 参数，并在增量索引后局部刷新受影响模块认知文档
 - `pce/staging.py` — 文件变更追踪（dirty_files.json）
 - `pce/memory.py` — 会话记忆管理
 - `pce/serena_client.py` — Serena MCP 客户端封装
@@ -59,6 +66,7 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 ### Agent 层
 
 - `pce/agent.py` — PCEAgent 核心（**无状态**，时间驱动 ReAct 循环）
+  - **改造**：`_build_system_prompt()` 改为注入 `annotations/index.md` 轻量认知导航；模块深度认知文档由 Agent 在 ReAct 循环中按需 `read_file`
   - **改造**：完全无状态化 — 移除 `self._sessions`，每次 `query()`/`impact()` 从 Memory 快照重新起步
   - **改造**：per-request 日志追踪 — 8 字符 hex `req_id`（ContextVar 传播），所有工具调用（Serena/spawn/acknowledge）带 `[req=xxx] round=N` INFO 日志
   - **新增**：`_TraceWriter` — 可选 JSONL trace 文件（`PCE_TRACE_DIR` 环境变量控制），LRU 保留 50 个文件
@@ -133,6 +141,7 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 
 - `scripts/agent_playground.py` — 离线测试 CLI（mock/repl 双模式，支持 InsightCache）
 - `scripts/test_react_robustness.py` — ReAct 循环健壮性测试（**43/43 通过**）
+  - **修复**：`test_fallback_markers()` 去掉已废弃的 `_parse_query_response(..., session_id)` 调用参数，适配当前无状态接口
   - T01~T15：基础路径（deliver/工具调用/纠正/截断/超时/步数）
   - T16~T20：spawn 路径（成功回注 / DEPTH_EXCEEDED / BUDGET_REJECTED / 次数上限 / 非法 JSON）
   - fallback marker 测试：含 `__REACT_LLM_EXHAUSTED__`
@@ -146,8 +155,10 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 ## 待完成
 
 ### 清理项
-- [ ] 删除死代码：`SessionState`（`pce/models.py:216`）+ `memory.py` 的 `load_session`/`save_session`/`clear_session`
-- [ ] 删除死代码：`memory.py` 中 sessions 目录相关函数（`_session_path`/`_sessions_dir`）
+- [x] ~~删除死代码：`SessionState`/`MemoryItem`/`MemoryItemType`/`StatusResponse`（`pce/models.py`）~~：已删除
+- [x] ~~删除死代码：`memory.py` 的 `load_session`/`save_session`/`clear_session`/`_session_path`/`_sessions_dir`/Memory 管理块/JSONL helper~~：已删除
+- [x] ~~`_ensure_layout` 不再生成 `.pce/annotations.md` 和 `.pce/sessions/`~~：已修复
+- [x] ~~`pce_status` 旧 `memory_items_count` 语义残留~~：已替换为 `annotation_modules_count`（统计 `.pce/annotations/modules/*.md` 文件数）
 
 ### 质量项
 - [x] ~~pce_impact 分析质量~~：已修复（轻量 dict 解析 + prompt schema + in-context learning）
@@ -157,8 +168,8 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 - [x] ~~`cleanup_stale` 孤儿清理~~：已增加 entries 目录扫描
 
 ### 架构演进（高优先级）
-- [ ] annotations 按模块拆分存储（当前是单体 `annotations.md`，大项目会膨胀）
-- [ ] `_build_system_prompt` 相关性过滤（根据 query 匹配 scope，按需加载模块 annotation）
+- [x] ~~annotations 按模块拆分存储~~：已实现 `.pce/annotations/index.md` + `.pce/annotations/modules/*.md`
+- [x] ~~`_build_system_prompt` 相关性过滤（根据 query 匹配 scope，按需加载模块 annotation）~~：改为 skill 式渐进披露；始终注入轻量导航，由 PCE Agent 自主 `read_file` 深度认知文档
 - [ ] system prompt 总量上限检查 + 降级策略（超限时只注入 structure.md + 直接相关 annotation）
 - [ ] insight 蒸馏去重（避免与 annotations 内容重复挤占 token 配额）
 - [ ] dirty file 注入时引导 agent 用 `get_symbols_overview` 做轻量验证（而非全文读取）
@@ -187,9 +198,10 @@ pce_query 请求
   │
   ├─ PCEAgent.query()  — 无状态，每次重建 messages
   │    ├─ req_id 生成 + ContextVar 设置 + TraceWriter 创建
-  │    ├─ _build_system_prompt()（含 InsightCache top-k 注入）
+  │    ├─ _build_system_prompt()（注入 structure.md + annotations/index.md + InsightCache top-k）
   │    └─ _run_react_loop(depth=0, deadline=now+max_seconds, trace=...)
   │         ├─ Serena 工具调用（asyncio.gather 并发）
+  │         ├─ 按需 read_file `.pce/annotations/modules/*.md` 获取模块深度认知
   │         ├─ spawn_agent → invoke_spawn()
   │         │    └─ _run_react_loop(depth=1, deadline=child_deadline)
   │         │         ├─ Serena 工具调用
@@ -215,7 +227,9 @@ PCEContext 状态机
 .pce/
 ├── meta.json
 ├── structure.md
-├── annotations.md
+├── annotations/
+│   ├── index.md
+│   └── modules/*.md
 ├── references.json
 ├── dirty_files.json
 └── insights/
@@ -271,10 +285,26 @@ pce/
 | Insight 生命周期闭环 | init 时 sweep+cleanup，sync 时 sweep+cleanup | 避免 insight 只增不减导致上下文膨胀 |
 | dirty file 注入截断 | 50 文件上限 + 超限提示调 pce_sync | 防御性策略，避免极端情况撑爆 token |
 | 认知架构演进方向 | annotations 按模块拆分 + 渐进式披露 | 治本：起始上下文默认轻量，按需加载局部认知 |
+| 渐进式认知实现方式 | skill 式导航页 + 模块文档 | 不在 system prompt 中硬编码相关性过滤规则，而是给 PCE Agent 一个结构良好的入口点，自主决定何时 `read_file` 某个模块认知文档 |
 
 ---
 
 ## Changelog
+
+### 2026-03-20 02:47
+本轮完成：新版 PCE 重初始化验证 + 旧产物残留链路清理
+- 验证：pce_init 全量重建通过，pce_query/pce_impact/pce_sync 真实链路均正常；幂等性验证通过（二次 init 返回 already_initialized/reused）
+- 根因定位：`.pce/annotations.md` 和 `.pce/sessions/` 由 `memory.py._ensure_layout()` 在 `save_index()` 前置调用时产生
+- 修复 `pce/memory.py`：删除 JSONL helper、Memory 管理块（`list_memory_items/append_memory/clear_memory`）、Session 管理块（`load_session/save_session/clear_session`）、旧路径函数（`_annotations_path/_sessions_dir/_session_path`）；`_ensure_layout` 不再创建 `sessions/` 和 `annotations.md`；新增 `_annotations_dir/_annotation_modules_dir`；`get_status` 改为统计 `annotation_modules_count`
+- 修复 `pce/models.py`：删除 `MemoryItemType/MemoryItem/SessionState/StatusResponse`；删除 `field_validator` import
+- 修复 `pce/server.py`：fallback dict 字段名 `memory_items_count` → `annotation_modules_count`
+- 回归：import OK，1/1 单元测试通过，直接验证 `save_index` 后旧产物不再出现
+下一步：system prompt 总量上限检查 + 降级策略 或 insight 蒸馏去重
+
+### 2026-03-20 01:43
+本轮完成：实现 skill 式渐进认知导航（`annotations/index.md` + `modules/*.md`）并接入增量索引
+主体更新："已完成"（基础层/Agent 层/测试工具）、"待完成"（架构演进状态）、"架构速查"（.pce 布局与 query 流程）、"关键决策"（新增渐进式认知实现方式）
+下一步：验证真实 pce_init/pce_query/pce_sync 链路下模块认知导航的生成与按需读取效果
 
 ### 2026-03-19 14:08
 本轮完成：pce_impact 结构化输出修复 + Insight 生命周期闭环 + 认知架构探索
