@@ -3,14 +3,14 @@
 负责构建三层索引:
 1. structure.md — 目录职责与模块清单
 2. references.json — 符号引用索引 (通过 save_index)
-3. annotations.md — 语义注解 (通过 append_memory)
+3. annotations/index.md + annotations/modules/*.md — 渐进式项目认知导航
 
 构建流程:
   list_dir 扫描目录
     → 并发 get_symbols_overview 建立符号清单
     → find_referencing_symbols 建立引用图
-    → LLM 生成语义注解(可降级)
-    → 写入 Memory
+    → LLM 生成认知导航与模块认知文档(可降级)
+    → 写入 .pce/annotations/
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -28,14 +29,12 @@ from typing import Any
 import aiofiles
 import litellm
 
-from .memory import append_memory, load_index, save_index
+from .memory import load_index, save_index
 from .models import (
     BuildStats,
     FileMeta,
     IndexEntry,
     IndexSnapshot,
-    MemoryItem,
-    MemoryItemType,
     ProjectMeta,
     ReferenceEdge,
     ReferenceRelation,
@@ -105,6 +104,10 @@ HIGH_LEVEL_KINDS = frozenset(
 )
 
 DEFAULT_CONCURRENCY = 10
+
+ANNOTATIONS_DIR = "annotations"
+ANNOTATIONS_INDEX_FILE = "index.md"
+ANNOTATIONS_MODULES_DIR = "modules"
 
 
 # ============================================================================
@@ -393,22 +396,135 @@ async def _write_structure_md(entries: list[IndexEntry], root_path: Path) -> Non
 
 
 # ============================================================================
-# LLM 语义注解生成
+# 渐进式认知导航生成
 # ============================================================================
 
 
-def _build_annotation_prompt(entries: list[IndexEntry], project_meta: ProjectMeta) -> str:
-    """构建语义注解的 LLM 提示词。"""
-    summary_lines = [
-        f"- {entry.file_meta.path} "
-        f"[{entry.file_meta.language}, {entry.file_meta.loc} 行, "
-        f"{len(entry.symbols)} 个符号]"
-        for entry in entries[:50]  # 限制提示词长度
-    ]
+def _annotation_index_path(root_path: Path) -> Path:
+    """返回 .pce/annotations/index.md 路径。"""
+    return root_path / ".pce" / ANNOTATIONS_DIR / ANNOTATIONS_INDEX_FILE
 
+
+def _annotation_modules_dir(root_path: Path) -> Path:
+    """返回 .pce/annotations/modules/ 目录路径。"""
+    return root_path / ".pce" / ANNOTATIONS_DIR / ANNOTATIONS_MODULES_DIR
+
+
+def _module_slug(module_name: str) -> str:
+    """将模块名规范化为文件名 slug。"""
+    normalized = " ".join(module_name.strip().split()) or "unnamed-module"
+    return normalized.lower().replace(" ", "-")
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    """按出现顺序去重。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _strip_markdown_fence(content: str) -> str:
+    """去掉模型偶发输出的 Markdown 代码块包裹。"""
+    raw = content.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            raw = "\n".join(lines[1:-1]).strip()
+    return raw
+
+
+def _extract_llm_text(response: Any) -> str:
+    """从 litellm 响应中提取文本内容。"""
+    if hasattr(response, "choices") and response.choices:
+        msg = response.choices[0].message
+        return getattr(msg, "content", "") or ""
+    if isinstance(response, dict):
+        return response.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+    return ""
+
+
+def _resolve_annotation_model(model: str | None) -> str | None:
+    """解析注解生成所用的模型配置，失败时返回 None（触发降级）。"""
+    if model is not None:
+        return model
+    provider = get_env_text("PCE_PROVIDER")
+    model_name = get_env_text("PCE_MODEL")
+    if not provider or not model_name:
+        logger.warning("未配置 PCE_PROVIDER 或 PCE_MODEL，跳过 LLM 认知文档生成")
+        return None
+    return build_litellm_model(provider, model_name)
+
+
+async def _llm_complete_text(
+    prompt: str,
+    *,
+    system_prompt: str,
+    model: str | None,
+    failure_log: str,
+) -> str | None:
+    """执行单次文本补全，返回去除代码块包裹后的纯文本，失败时返回 None。"""
+    effective_model = _resolve_annotation_model(model)
+    if effective_model is None:
+        return None
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        response = await asyncio.to_thread(
+            litellm.completion,
+            model=effective_model,
+            messages=messages,
+            temperature=0.1,
+            **get_completion_overrides(),
+        )
+    except Exception as e:
+        logger.warning(f"{failure_log}(已降级): {e}")
+        return None
+
+    content = _strip_markdown_fence(_extract_llm_text(response))
+    return content.strip() or None
+
+
+def _format_entry_outline(entry: IndexEntry) -> str:
+    """将单个 IndexEntry 格式化为提示词摘要行（含主要符号名）。"""
+    symbol_summary = ", ".join(
+        f"{sym.name}({sym.kind.value})" for sym in entry.symbols[:8]
+    ) or "无显式符号"
+    if len(entry.symbols) > 8:
+        symbol_summary += ", ..."
+    return (
+        f"- {entry.file_meta.path} "
+        f"[{entry.file_meta.language}, {entry.file_meta.loc} 行, {len(entry.symbols)} 个符号] "
+        f"符号: {symbol_summary}"
+    )
+
+
+def _build_index_md_prompt(entries: list[IndexEntry], project_meta: ProjectMeta) -> str:
+    """构建生成 annotations/index.md 的 LLM 提示词（含 in-context learning 示例）。"""
+    summary_lines = [_format_entry_outline(entry) for entry in entries[:80]]
     return "\n".join(
         [
-            "你是软件架构助手,请基于以下项目索引摘要生成模块职责语义注解。",
+            "你要为代码库生成一个可渐进加载的项目认知导航首页 index.md。",
+            "请严格模仿示例的结构输出，不要输出任何额外解释，不要使用代码块。",
+            "",
+            "示例输出:",
+            "# 项目认知导航",
+            "",
+            "## Agent Core",
+            "文件：pce/agent.py, pce/agent_runtime/contracts.py, pce/agent_runtime/spawner.py",
+            "职责：负责 PCE 主循环、任务编排与子 Agent 协议。对外接收查询目标，对内协调工具调用、compact 与交付流程。高风险点：ReAct 循环无 tool_calls 时的纠错逻辑、spawn 预算与深度限制。",
+            "详细认知：.pce/annotations/modules/agent-core.md",
+            "",
+            "## Index Pipeline",
+            "文件：pce/indexer.py, pce/memory.py",
+            "职责：负责代码索引构建与持久化。维护结构索引、引用索引和渐进式认知文档；提供增量更新路径避免全量重建。高风险点：LLM 注解降级时需保证回退内容可机器解析。",
+            "详细认知：.pce/annotations/modules/index-pipeline.md",
             "",
             f"项目根路径: {project_meta.root_path}",
             f"文件总数: {project_meta.file_count}, 代码行总数: {project_meta.loc_total}",
@@ -416,57 +532,495 @@ def _build_annotation_prompt(entries: list[IndexEntry], project_meta: ProjectMet
             "索引摘要:",
             *summary_lines,
             "",
-            "输出要求(Markdown 格式):",
-            "- 按模块/目录划分章节,使用 ## 标题",
-            "- 每章包含: 核心职责、关键流程、依赖关系、高风险点",
-            "- 语言简洁,每章不超过 200 字",
+            "输出约束:",
+            "- 第一行必须是 `# 项目认知导航`",
+            "- 每个模块使用 `## 模块名` 开头",
+            "- `文件：` 行使用逗号分隔的相对路径，路径必须来自索引摘要",
+            "- `职责：` 2-3 句话，描述模块边界、关键职责、主要协作对象和高风险点",
+            "- `详细认知：` 写成 `.pce/annotations/modules/{slug}.md`，slug = 模块名小写后空格替换为连字符",
+            "- 不要输出 JSON、代码块、前言、结语或任何未在示例中出现的附加文本",
         ]
     )
 
 
-async def _generate_annotations(
+def _build_module_annotation_prompt(
+    module_name: str,
+    module_entries: list[IndexEntry],
+) -> str:
+    """构建单模块深度认知文档的 LLM 提示词。"""
+    file_lines: list[str] = []
+    for entry in module_entries:
+        symbol_lines = ", ".join(
+            f"{sym.name}({sym.kind.value})[{sym.line_start}-{sym.line_end}]"
+            for sym in entry.symbols[:12]
+        ) or "无显式符号"
+        if len(entry.symbols) > 12:
+            symbol_lines += ", ..."
+        file_lines.append(
+            f"- {entry.file_meta.path} [{entry.file_meta.language}, {entry.file_meta.loc} 行] "
+            f"符号: {symbol_lines}"
+        )
+
+    return "\n".join(
+        [
+            "你要为单个代码模块生成可按需加载的深度认知文档。",
+            "请输出 Markdown，不要代码块，不要额外解释。",
+            "",
+            f"模块名: {module_name}",
+            f"覆盖文件数: {len(module_entries)}",
+            "",
+            "文件与符号摘要:",
+            *file_lines,
+            "",
+            "输出要求:",
+            f"- 标题必须是 `# {module_name}`",
+            "- 必须包含 `## 覆盖文件`、`## 核心职责`、`## 关键符号`、`## 关键流程`、`## 外部协作`、`## 风险与约束` 这些二级标题",
+            "- `## 覆盖文件` 需列出所有文件路径",
+            "- `## 关键符号` 需优先引用给定摘要里的符号名和文件路径",
+            "- `## 关键流程` 关注控制流、数据流或调用链，不要泛泛而谈",
+            "- 结论必须基于输入，不得编造不存在的文件、符号或依赖",
+        ]
+    )
+
+
+def _build_module_assignment_prompt(entry: IndexEntry, index_content: str) -> str:
+    """构建新增文件模块归属判断的 LLM 提示词。"""
+    return "\n".join(
+        [
+            "请根据现有项目认知导航，为一个新增文件判断最合适的模块归属。",
+            "只能从已有模块 slug 中选择；如果无法可靠判断，则返回空字符串。",
+            "",
+            "现有导航:",
+            index_content.strip(),
+            "",
+            "新增文件摘要:",
+            _format_entry_outline(entry),
+            "",
+            "输出要求:",
+            '- 只输出 JSON，例如 {"module_slug":"agent-core"}',
+            '- 如果无法判断，输出 {"module_slug":""}',
+            "- 不要输出 Markdown、代码块或解释",
+        ]
+    )
+
+
+def _build_fallback_index_md(entries: list[IndexEntry]) -> str:
+    """在 LLM 不可用时构建可机器解析的回退版 index.md（按顶层目录分组）。"""
+    grouped: dict[str, list[IndexEntry]] = {}
+    for entry in entries:
+        path = Path(entry.file_meta.path)
+        key = path.parts[0] if len(path.parts) > 1 else "__root__"
+        grouped.setdefault(key, []).append(entry)
+
+    lines = ["# 项目认知导航"]
+    for key in sorted(grouped.keys()):
+        module_entries = sorted(grouped[key], key=lambda e: str(e.file_meta.path))
+        # 直接用 key 做 slug，避免来回转换引入噪声
+        slug = key.lower().replace("_", "-").replace(" ", "-")
+        module_name = key.replace("_", " ").replace("-", " ").title() if key != "__root__" else "Root Files"
+        files = ", ".join(str(e.file_meta.path) for e in module_entries)
+        lines.extend(
+            [
+                "",
+                f"## {module_name}",
+                f"文件：{files}",
+                "职责：当前为基于目录结构的回退导航，建议模型可用时重新生成精细化认知边界。",
+                f"详细认知：.pce/annotations/modules/{slug}.md",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _build_fallback_module_md(module_name: str, module_entries: list[IndexEntry]) -> str:
+    """在 LLM 不可用时构建模块文档回退内容（基于符号索引）。"""
+    lines = [
+        f"# {module_name}",
+        "",
+        "## 覆盖文件",
+    ]
+    for entry in module_entries:
+        lines.append(f"- {entry.file_meta.path}")
+
+    lines.extend(["", "## 核心职责", "当前为基于索引条目的回退摘要，提供基本文件边界与符号概览。", "", "## 关键符号"])
+    has_symbols = False
+    for entry in module_entries:
+        for sym in entry.symbols[:12]:
+            lines.append(f"- {sym.name} ({sym.kind.value}) — {sym.file_path}:{sym.line_start}")
+            has_symbols = True
+    if not has_symbols:
+        lines.append("- 无显式符号")
+
+    lines.extend(
+        [
+            "",
+            "## 关键流程",
+            "需结合具体文件内容进一步检索，当前回退摘要不直接推断控制流。",
+            "",
+            "## 外部协作",
+            "可结合 structure.md、references.json 及 Serena 工具继续定位模块交互关系。",
+            "",
+            "## 风险与约束",
+            "本文件由索引级回退逻辑生成，细粒度职责与边界仍应以 LLM 生成版本为准。",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# ============================================================================
+# index.md 解析与增量更新辅助
+# ============================================================================
+
+
+def _parse_index_section(module_name: str, body_lines: list[str]) -> dict[str, Any]:
+    """将 index.md 单个模块章节解析为结构化记录。"""
+    file_paths: list[str] = []
+    for line in body_lines:
+        m = re.match(r"^文件[:：]\s*(.+)$", line.strip())
+        if m:
+            file_paths = [p.strip() for p in m.group(1).split(",") if p.strip()]
+            break
+    return {
+        "name": module_name,
+        "slug": _module_slug(module_name),
+        "body_lines": body_lines[:],
+        "file_paths": file_paths,
+    }
+
+
+def _split_index_md(index_content: str) -> tuple[str, list[dict[str, Any]]]:
+    """拆分 index.md 为头部文本和模块章节列表。"""
+    header_lines: list[str] = []
+    sections: list[dict[str, Any]] = []
+    current_name: str | None = None
+    current_body: list[str] = []
+    seen_section = False
+
+    for raw_line in index_content.splitlines():
+        if raw_line.startswith("## "):
+            seen_section = True
+            if current_name is not None:
+                sections.append(_parse_index_section(current_name, current_body))
+            current_name = raw_line[3:].strip()
+            current_body = []
+            continue
+        if not seen_section:
+            header_lines.append(raw_line)
+        elif current_name is not None:
+            current_body.append(raw_line)
+
+    if current_name is not None:
+        sections.append(_parse_index_section(current_name, current_body))
+
+    header = "\n".join(header_lines).strip() or "# 项目认知导航"
+    return header, sections
+
+
+def _render_index_md(header: str, sections: list[dict[str, Any]]) -> str:
+    """将结构化章节列表渲染回 index.md 字符串。"""
+    lines = [header.strip() or "# 项目认知导航"]
+    for section in sections:
+        lines.extend(["", f"## {section['name']}"])
+        lines.extend(section["body_lines"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _parse_index_md(index_content: str) -> dict[str, list[str]]:
+    """返回模块 slug -> 文件路径列表的映射（供增量更新反查）。"""
+    _, sections = _split_index_md(index_content)
+    return {
+        section["slug"]: _dedupe_keep_order(section["file_paths"])
+        for section in sections
+        if section["file_paths"]
+    }
+
+
+def _update_section_file_list(section: dict[str, Any], file_paths: list[str]) -> None:
+    """就地替换章节中的 `文件：` 行，并更新 file_paths 字段。"""
+    normalized = _dedupe_keep_order(file_paths)
+    file_line = f"文件：{', '.join(normalized)}"
+    new_body: list[str] = []
+    replaced = False
+    for line in section["body_lines"]:
+        if not replaced and re.match(r"^文件[:：]\s*", line.strip()):
+            new_body.append(file_line)
+            replaced = True
+        else:
+            new_body.append(line)
+    if not replaced:
+        new_body.insert(0, file_line)
+    section["body_lines"] = new_body
+    section["file_paths"] = normalized
+
+
+def _build_temporary_section(file_path: str) -> dict[str, Any]:
+    """为无法自动归属的新增文件创建临时模块章节。"""
+    stem = Path(file_path).stem.replace(".", "-")
+    module_name = f"临时归类 {stem}"
+    slug = _module_slug(module_name)
+    return {
+        "name": module_name,
+        "slug": slug,
+        "file_paths": [file_path],
+        "body_lines": [
+            f"文件：{file_path}",
+            "职责：该章节由增量索引降级逻辑创建，用于暂存未完成归类的新文件。建议后续执行全量索引校正模块边界。",
+            f"详细认知：.pce/annotations/modules/{slug}.md",
+        ],
+    }
+
+
+def _prepare_module_specs(
+    sections: list[dict[str, Any]],
+    entries_map: dict[str, "IndexEntry"],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, list["IndexEntry"]]]]:
+    """过滤章节中实际存在的文件，返回有效章节列表和模块生成规格。"""
+    valid_sections: list[dict[str, Any]] = []
+    module_specs: list[tuple[str, str, list[IndexEntry]]] = []
+    for section in sections:
+        file_paths = [p for p in _dedupe_keep_order(section["file_paths"]) if p in entries_map]
+        if not file_paths:
+            logger.warning(f"认知导航章节未命中实际文件，跳过: {section['name']}")
+            continue
+        _update_section_file_list(section, file_paths)
+        valid_sections.append(section)
+        module_specs.append(
+            (section["name"], section["slug"], [entries_map[p] for p in file_paths])
+        )
+    return valid_sections, module_specs
+
+
+async def _generate_index_md(
     entries: list[IndexEntry],
     project_meta: ProjectMeta,
     model: str | None = None,
 ) -> str | None:
-    """调用 LLM 生成语义注解。失败时降级返回 None。"""
+    """调用 LLM 生成 annotations/index.md。"""
     if not entries:
         return None
+    return await _llm_complete_text(
+        _build_index_md_prompt(entries, project_meta),
+        system_prompt="你是资深软件架构分析助手，擅长把大型代码库整理成可渐进加载的认知导航。",
+        model=model,
+        failure_log="认知导航 index.md 生成失败",
+    )
 
-    effective_model = model
-    if effective_model is None:
-        provider = get_env_text("PCE_PROVIDER")
-        model_name = get_env_text("PCE_MODEL")
-        if not provider or not model_name:
-            logger.warning("未配置 PCE_PROVIDER 或 PCE_MODEL，跳过语义注解生成")
-            return None
-        effective_model = build_litellm_model(provider, model_name)
 
-    prompt = _build_annotation_prompt(entries, project_meta)
-    messages = [
-        {"role": "system", "content": "你是软件架构助手,擅长总结模块职责与依赖关系。"},
-        {"role": "user", "content": prompt},
-    ]
+async def _generate_module_annotation(
+    module_name: str,
+    module_entries: list[IndexEntry],
+    model: str | None = None,
+) -> str | None:
+    """调用 LLM 生成单模块深度认知文档。"""
+    if not module_entries:
+        return None
+    return await _llm_complete_text(
+        _build_module_annotation_prompt(module_name, module_entries),
+        system_prompt="你是资深软件架构分析助手，擅长生成可按需加载的模块深度认知文档。",
+        model=model,
+        failure_log=f"模块认知文档生成失败: {module_name}",
+    )
+
+
+async def _classify_new_entry_module(
+    entry: IndexEntry,
+    index_content: str,
+    known_slugs: set[str],
+    model: str | None = None,
+) -> str | None:
+    """用 LLM 判断新增文件应归属的模块 slug，不在 known_slugs 中时返回 None。"""
+    if not known_slugs:
+        return None
+    content = await _llm_complete_text(
+        _build_module_assignment_prompt(entry, index_content),
+        system_prompt="你是代码库模块归类助手，只能从现有模块中选择最匹配的归属。",
+        model=model,
+        failure_log=f"新增文件模块归属判断失败: {entry.file_meta.path}",
+    )
+    if not content:
+        return None
+    slug = ""
+    try:
+        payload = json.loads(content)
+        if isinstance(payload, dict):
+            slug = str(payload.get("module_slug") or "").strip()
+    except json.JSONDecodeError:
+        slug = content.strip()
+    return slug if slug in known_slugs else None
+
+
+async def _write_module_files(
+    module_specs: list[tuple[str, str, list[IndexEntry]]],
+    modules_dir: Path,
+    model: str | None,
+) -> None:
+    """并发生成并写入 modules/*.md，失败时使用回退内容。"""
+    results = await asyncio.gather(
+        *[_generate_module_annotation(name, entries, model=model) for name, _, entries in module_specs],
+        return_exceptions=True,
+    )
+    for (module_name, slug, module_entries), result in zip(module_specs, results):
+        if isinstance(result, BaseException):
+            logger.warning(f"模块认知文档生成异常，使用回退内容: {module_name}: {result}")
+            content = None
+        else:
+            content = result
+        if not content:
+            content = _build_fallback_module_md(module_name, module_entries)
+        await _atomic_write_text(modules_dir / f"{slug}.md", content.rstrip() + "\n")
+
+
+async def _write_annotations(
+    entries: list[IndexEntry],
+    project_meta: ProjectMeta,
+    root_path: Path,
+    model: str | None = None,
+) -> None:
+    """全量生成并写入 annotations/index.md 与 modules/*.md。"""
+    index_path = _annotation_index_path(root_path)
+    modules_dir = _annotation_modules_dir(root_path)
+
+    if not entries:
+        await _atomic_write_text(index_path, "# 项目认知导航\n")
+        if modules_dir.exists():
+            for stale in modules_dir.glob("*.md"):
+                await asyncio.to_thread(stale.unlink, missing_ok=True)
+        return
+
+    index_content = await _generate_index_md(entries, project_meta, model=model)
+    if not index_content:
+        logger.warning("认知导航 index.md 不可用，使用索引级回退模板")
+        index_content = _build_fallback_index_md(entries)
+
+    entries_map = {str(e.file_meta.path): e for e in entries}
+    header, sections = _split_index_md(index_content)
+    valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
+
+    if not valid_sections:
+        logger.warning("认知导航解析为空，回退到结构化模板")
+        index_content = _build_fallback_index_md(entries)
+        header, sections = _split_index_md(index_content)
+        valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
+
+    await _write_module_files(module_specs, modules_dir, model)
+
+    # 删除本次不再使用的旧 module 文件
+    expected = {f"{slug}.md" for _, slug, _ in module_specs}
+    if modules_dir.exists():
+        for stale in modules_dir.glob("*.md"):
+            if stale.name not in expected:
+                await asyncio.to_thread(stale.unlink, missing_ok=True)
+
+    await _atomic_write_text(index_path, _render_index_md(header, valid_sections))
+    logger.info(
+        f"认知导航写入完成: {len(valid_sections)} 个模块章节, {len(module_specs)} 个模块文档"
+    )
+
+
+async def _update_annotations_incremental(
+    entries: list[IndexEntry],
+    project_meta: ProjectMeta,
+    root_path: Path,
+    *,
+    changed_files: list[str],
+    deleted_files: list[str],
+    model: str | None = None,
+) -> None:
+    """增量更新受影响模块的认知文档与 index.md。"""
+    index_path = _annotation_index_path(root_path)
+    modules_dir = _annotation_modules_dir(root_path)
 
     try:
-        response = await asyncio.to_thread(
-            litellm.completion,
-            model=effective_model,
-            messages=messages,
-            temperature=0.2,
-            **get_completion_overrides(),
-        )
-        # 提取响应文本
-        content = ""
-        if hasattr(response, "choices") and response.choices:
-            msg = response.choices[0].message
-            content = getattr(msg, "content", "") or ""
-        elif isinstance(response, dict):
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return content.strip() or None
+        async with aiofiles.open(index_path, "r", encoding="utf-8") as f:
+            index_content = await f.read()
+    except FileNotFoundError:
+        logger.info("未找到认知导航 index.md，降级为全量认知文档重建")
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
     except Exception as e:
-        logger.warning(f"语义注解生成失败(已降级): {e}")
-        return None
+        logger.warning(f"读取认知导航失败，降级为全量认知文档重建: {e}")
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
+
+    header, sections = _split_index_md(index_content)
+    if not sections:
+        logger.warning("认知导航解析结果为空，降级为全量认知文档重建")
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
+
+    entries_map = {str(e.file_meta.path): e for e in entries}
+    ownership = _parse_index_md(index_content)
+    reverse_map: dict[str, str] = {
+        file_path: slug
+        for slug, file_paths in ownership.items()
+        for file_path in file_paths
+    }
+    sections_by_slug = {section["slug"]: section for section in sections}
+    affected_slugs: set[str] = set()
+
+    # 已知文件的变更/删除 → 标记所属模块为受影响
+    for file_path in (*changed_files, *deleted_files):
+        slug = reverse_map.get(file_path)
+        if slug:
+            affected_slugs.add(slug)
+
+    # 新增文件（不在任何已知模块中）→ 尝试归属或创建临时章节
+    for file_path in changed_files:
+        if file_path in reverse_map:
+            continue
+        entry = entries_map.get(file_path)
+        if entry is None:
+            continue
+
+        current_index_content = _render_index_md(header, sections)
+        assigned_slug = await _classify_new_entry_module(
+            entry, current_index_content, set(sections_by_slug.keys()), model=model
+        )
+        if assigned_slug and assigned_slug in sections_by_slug:
+            section = sections_by_slug[assigned_slug]
+            _update_section_file_list(section, section["file_paths"] + [file_path])
+            affected_slugs.add(assigned_slug)
+            logger.info(f"新增文件已归属既有模块: {file_path} -> {assigned_slug}")
+        else:
+            temp_section = _build_temporary_section(file_path)
+            sections.append(temp_section)
+            sections_by_slug[temp_section["slug"]] = temp_section
+            affected_slugs.add(temp_section["slug"])
+            logger.warning(f"新增文件归属判断失败，已追加临时章节: {file_path}")
+
+    if not affected_slugs:
+        logger.info("认知导航无受影响模块，跳过 annotations 增量更新")
+        return
+
+    # 重新生成受影响模块；无文件的模块移除
+    final_sections: list[dict[str, Any]] = []
+    module_specs: list[tuple[str, str, list[IndexEntry]]] = []
+    removed_slugs: set[str] = set()
+
+    for section in sections:
+        slug = section["slug"]
+        if slug not in affected_slugs:
+            final_sections.append(section)
+            continue
+        file_paths = [p for p in _dedupe_keep_order(section["file_paths"]) if p in entries_map]
+        if not file_paths:
+            removed_slugs.add(slug)
+            logger.info(f"模块已无文件，移除认知章节: {section['name']}")
+            continue
+        _update_section_file_list(section, file_paths)
+        final_sections.append(section)
+        module_specs.append((section["name"], slug, [entries_map[p] for p in file_paths]))
+
+    await _write_module_files(module_specs, modules_dir, model)
+
+    for slug in removed_slugs:
+        module_path = modules_dir / f"{slug}.md"
+        if module_path.exists():
+            await asyncio.to_thread(module_path.unlink, missing_ok=True)
+
+    await _atomic_write_text(index_path, _render_index_md(header, final_sections))
+    logger.info(
+        f"认知导航增量更新完成: {len(module_specs)} 个模块重建, {len(removed_slugs)} 个模块移除"
+    )
 
 
 # ============================================================================
@@ -694,22 +1248,11 @@ async def build_index(
         f"耗时 {build_stats.duration_ms}ms"
     )
 
-    # LLM 语义注解(可降级)
-    annotations = await _generate_annotations(entries, project_meta, model=model)
-    if annotations:
-        try:
-            memory_item = MemoryItem(
-                item_id=str(uuid.uuid4()),
-                item_type=MemoryItemType.SUMMARY,
-                content=annotations,
-                tags=["annotations", "index"],
-                related_files=[],
-                created_at=datetime.now(timezone.utc),
-            )
-            await append_memory(memory_item, root_path=memory_root_path)
-            logger.info("语义注解已写入 Memory")
-        except Exception as e:
-            logger.warning(f"写入语义注解失败(已降级): {e}")
+    # 渐进式认知导航(可降级)
+    try:
+        await _write_annotations(entries, project_meta, memory_root_path, model=model)
+    except Exception as e:
+        logger.warning(f"写入项目认知导航失败(已降级): {e}")
 
     return snapshot
 
@@ -722,6 +1265,7 @@ async def build_index_incremental(
     changed_files: list[str],
     deleted_files: list[str] | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
+    model: str | None = None,
 ) -> IndexSnapshot:
     """增量索引更新：仅重建变更文件，合并到已有索引。
 
@@ -751,6 +1295,7 @@ async def build_index_incremental(
             serena_client=serena_client,
             memory_root=memory_root,
             concurrency=concurrency,
+            model=model,
         )
 
     # 过滤有效的代码文件
@@ -828,5 +1373,18 @@ async def build_index_incremental(
         f"合计 {len(merged_entries)} 文件, "
         f"耗时 {build_stats.duration_ms}ms"
     )
+
+    # 增量更新认知导航(可降级)
+    try:
+        await _update_annotations_incremental(
+            merged_entries,
+            project_meta,
+            memory_root_path,
+            changed_files=effective_changes,
+            deleted_files=sorted(deleted),
+            model=model,
+        )
+    except Exception as e:
+        logger.warning(f"增量更新项目认知导航失败(已降级): {e}")
 
     return snapshot

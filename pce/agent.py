@@ -903,7 +903,10 @@ class PCEAgent:
             return f"(读取 {path.name} 失败)"
 
     async def _build_system_prompt(self, memory_root: Path | None) -> str:
-        """构建 system prompt,注入 structure.md 和 annotations.md 内容。
+        """构建 system prompt,注入 structure.md 和 annotations/index.md 内容。
+
+        annotations/index.md 是轻量的模块导航入口；各模块深度认知文档（modules/*.md）
+        由 PCE Agent 在 ReAct 循环中按需通过 read_file 工具自主加载。
 
         若 insight_cache 已配置，在末尾追加动态认知块（top-k 条目）。
         """
@@ -911,7 +914,7 @@ class PCEAgent:
         pce_dir = root / ".pce"
 
         structure_md = await self._read_pce_file(pce_dir / "structure.md")
-        annotations_md = await self._read_pce_file(pce_dir / "annotations.md")
+        annotations_index_md = await self._read_pce_file(pce_dir / "annotations" / "index.md")
 
         sections = [
             SYSTEM_PROMPT_HEADER,
@@ -919,8 +922,8 @@ class PCEAgent:
             "## 项目结构 (structure.md)",
             structure_md.strip(),
             "",
-            "## 语义注解 (annotations.md)",
-            annotations_md.strip(),
+            "## 项目认知导航 (annotations/index.md)",
+            annotations_index_md.strip(),
         ]
 
         if self._insight_cache is not None:
