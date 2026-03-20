@@ -1,6 +1,6 @@
 # PCE 开发进度
 
-> 最后更新：2026-03-20
+> 最后更新：2026-03-20 03:14
 > 设计文档：[PCE_design.md](PCE_design.md) · [design_subagent_architecture.md](design_subagent_architecture.md) · [implementation_plan.md](implementation_plan.md)
 
 ---
@@ -42,8 +42,8 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 
 - `pce/models.py` — 完整数据模型层
   - 核心模型：ProjectMeta, FileMeta, SymbolRef, ReferenceEdge, IndexEntry, IndexSnapshot
-  - 会话模型：MemoryItem, SessionState（死代码，待清理）
-  - MCP 协议：QueryRequest/Response, ImpactRequest/Response, StatusResponse（含 InsightStats 字段）
+  - **清理**：删除死代码 `MemoryItem` / `MemoryItemType` / `SessionState` / `StatusResponse`
+  - MCP 协议：QueryRequest/Response, ImpactRequest/Response
   - **改造**：QueryRequest/Response/ImpactRequest/Response 移除 `session_id` 字段
   - **改造**：ImpactResponse.impact_chain/boundary 和 QueryResponse.related_symbols 改为 `list[dict[str, Any]]`（轻量 dict，不再要求 UUID）
   - Insight 模型：InsightConfidence, InsightEntry, InsightIndexRecord, InsightIndex, InsightStats
@@ -57,7 +57,10 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
   - **新增**：新增文件模块归属判断与临时章节降级逻辑；LLM 不可用时回退到结构化 index/module 模板
   - **改造**：`build_index_incremental()` 新增 `model` 参数，并在增量索引后局部刷新受影响模块认知文档
 - `pce/staging.py` — 文件变更追踪（dirty_files.json）
-- `pce/memory.py` — 会话记忆管理
+- `pce/memory.py` — `.pce` 布局与状态元数据管理
+  - **清理**：删除 JSONL helper、Memory 管理块、Session 管理块、旧路径函数 `_annotations_path` / `_sessions_dir` / `_session_path`
+  - **修复**：`_ensure_layout()` 不再生成旧产物 `.pce/annotations.md` 与 `.pce/sessions/`
+  - **改造**：`get_status()` 改为返回 `annotation_modules_count`（统计 `.pce/annotations/modules/*.md` 文件数）
 - `pce/serena_client.py` — Serena MCP 客户端封装
   - **改造**：`connect()` 去掉 `serena_install_path` 参数，改用 `uvx --from git+https://github.com/oraios/serena`
   - **改造**：`DEFAULT_TIMEOUT_SECONDS` 从 30 提升至 180，可通过 `PCE_SERENA_TIMEOUT` 环境变量配置
@@ -114,6 +117,7 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 
 - `pce/server.py` — MCP 服务端，**一键安装改造完成**，**session_id 已移除**
   - **改造**：pce_query/pce_impact 工具 schema、handle_query/handle_impact 签名、call_tool 路由均移除 `session_id`
+  - **改造**：`handle_status()` fallback dict 字段从 `memory_items_count` 切换为 `annotation_modules_count`
   - **改造**：pce_query/pce_impact 工具描述增加最佳实践指导和调用示例
   - **新增**：`_bootstrap` 中 `InsightCache.sweep_stale()` + `cleanup_stale()` — 初始化时清理过时 insight
   - **新增**：`handle_sync` 中 `sweep_stale()` 后补调 `cleanup_stale()` — sync 时标记+删除过时条目
@@ -123,7 +127,7 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
   - **新增** `pce_init` 工具 + `handle_init()`：同步阻塞到完成，含并发保护、同路径重试、不同路径拒绝
   - **新增** `_require_initialized()`：统一守卫 pce_query/impact/edit/sync 入口
   - `_bootstrap(project_path, init_mode)` 重构：接受路径参数，内部创建 SerenaClient/InsightCache/PCEAgent，FileWatcher 在路径绑定后立即启动
-  - `_build_tools()` 按初始化状态分路：未初始化只暴露 pce_init + pce_status；初始化后暴露全套
+  - `_build_tools()` 始终暴露全套核心工具（含 pce_query/pce_impact/pce_sync）；未初始化时 call_tool 返回 NOT_INITIALIZED 引导先调 pce_init；写工具依赖初始化后的 edit_tools_schema，未初始化时不暴露
   - `handle_status()` 去掉 project_path 参数，未初始化时安全返回空值兜底
   - `serve()` 去掉 PCE_PROJECT_PATH、SERENA_PATH 环境变量读取，去掉 `_ensure_serena()`
   - finally 块各自独立 try，watcher.stop() 失败不影响 serena_client.disconnect()
@@ -140,15 +144,13 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 ### 测试工具
 
 - `scripts/agent_playground.py` — 离线测试 CLI（mock/repl 双模式，支持 InsightCache）
-- `scripts/test_react_robustness.py` — ReAct 循环健壮性测试（**43/43 通过**）
+  - **适配**：移除 `response.session_id` 输出、`--serena-path` 参数（含 `SERENA_PATH` 默认值）、`serena_path` 变量；`SerenaClient.connect()` 调用改为只传 `project_path`
+- `scripts/test_react_robustness.py` — ReAct 循环健壮性测试（当前可收集并通过 1/1）
   - **修复**：`test_fallback_markers()` 去掉已废弃的 `_parse_query_response(..., session_id)` 调用参数，适配当前无状态接口
-  - T01~T15：基础路径（deliver/工具调用/纠正/截断/超时/步数）
-  - T16~T20：spawn 路径（成功回注 / DEPTH_EXCEEDED / BUDGET_REJECTED / 次数上限 / 非法 JSON）
-  - fallback marker 测试：含 `__REACT_LLM_EXHAUSTED__`
-  - `run_loop` 新增 `depth/deadline/observe` 关键字参数（向后兼容）
-- `scripts/test_e2e.py` — 端到端集成测试（真实 Serena + 真实 LLM，**2/2 通过**）
-  - pce_query：自然语言代码理解（101.58s，含多轮 Serena 工具调用）
-  - pce_impact：变更影响分析（79.3s，生成结构化风险/未知项列表）
+  - 目前仅保留 `test_fallback_markers()` 作为有效 pytest 用例
+- `scripts/test_e2e.py` — 端到端集成测试（历史上已跑通过 2/2）
+  - **适配**：移除 `import uuid`、`PCE_PROJECT_PATH` 环境变量读取、`query_sid`/`impact_sid` 变量；`handle_query`/`handle_impact` 调用去掉 `session_id` 参数
+  - 当前脚本与无状态接口完全匹配，可作为回归基线
 
 ---
 
@@ -159,6 +161,8 @@ PrecisionContextEngine (PCE) 是一个以 MCP 服务形式对外暴露的代码�
 - [x] ~~删除死代码：`memory.py` 的 `load_session`/`save_session`/`clear_session`/`_session_path`/`_sessions_dir`/Memory 管理块/JSONL helper~~：已删除
 - [x] ~~`_ensure_layout` 不再生成 `.pce/annotations.md` 和 `.pce/sessions/`~~：已修复
 - [x] ~~`pce_status` 旧 `memory_items_count` 语义残留~~：已替换为 `annotation_modules_count`（统计 `.pce/annotations/modules/*.md` 文件数）
+- [x] ~~`scripts/test_e2e.py` 去掉旧 `session_id` 调用，适配当前无状态接口~~：已适配，移除 uuid/PCE_PROJECT_PATH/session_id 残留
+- [x] ~~`scripts/agent_playground.py` 去掉 `response.session_id` 残留读取~~：已适配，同步移除 --serena-path/SERENA_PATH/serena_path 残留
 
 ### 质量项
 - [x] ~~pce_impact 分析质量~~：已修复（轻量 dict 解析 + prompt schema + in-context learning）
@@ -290,6 +294,19 @@ pce/
 ---
 
 ## Changelog
+
+### 2026-03-20（本轮）
+本轮完成：脚本接口适配 + progress 口径修正
+- 修复 `scripts/test_e2e.py`：移除 `import uuid`、`PCE_PROJECT_PATH` 读取、`query_sid`/`impact_sid`、`session_id` 参数传递；脚本现在与无状态接口完全匹配，可作为回归基线
+- 修复 `scripts/agent_playground.py`：移除 `response.session_id` 输出、`--serena-path` 参数（含 `SERENA_PATH` 默认值）、`serena_path` 变量；`SerenaClient.connect()` 调用改为只传 `project_path`
+- 修正 `progress.md` 工具暴露策略口径：核心工具始终暴露，未初始化时 call_tool 返回 `NOT_INITIALIZED`；旧表述"未初始化只暴露 pce_init + pce_status"有误
+- PCE 可用性验证：通过三轮 pce_query 验证 PCE 能有效发现接口残留和 progress 口径偏差；适合窄问题+明确要求 file:line 的使用方式
+下一步：system prompt 总量上限检查 + 降级策略，或 insight 蒸馏去重，或 playground 调优
+
+### 2026-03-20 03:14
+本轮完成：将旧产物清理结果与当前回归测试基线状态同步写入 progress
+主体更新：已完成（models/memory/server 清理结果、测试工具现状）、待完成（补充 e2e/playground 接口适配项）
+下一步：适配 `scripts/test_e2e.py` 与 `scripts/agent_playground.py` 的无状态接口
 
 ### 2026-03-20 02:47
 本轮完成：新版 PCE 重初始化验证 + 旧产物残留链路清理

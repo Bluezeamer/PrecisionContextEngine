@@ -2,6 +2,10 @@
 test_video/
 serena/
 .serena/
+.env.bak
+.mcp*
+/docs
+!docs/progress.md
 
 # Python
 __pycache__/

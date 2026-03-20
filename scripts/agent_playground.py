@@ -12,7 +12,7 @@
   uv run python scripts/agent_playground.py --mode mock --recording temp/rec.json --query "..."
 
   # repl 模式，连接真实 Serena
-  uv run python scripts/agent_playground.py --mode repl --project-path . --serena-path ../serena
+  uv run python scripts/agent_playground.py --mode repl --project-path .
 
   # repl 模式，同时录制交互
   uv run python scripts/agent_playground.py --mode repl --recording temp/session.json ...
@@ -96,7 +96,6 @@ def _print_result(
     print()
     print("═" * 60)
     print(f"  状态: {status}")
-    print(f"  会话: {response.session_id}")
     print(f"  耗时: {elapsed_s:.1f}s")
     print(f"  工具调用: {total_calls}")
     if stats:
@@ -205,12 +204,11 @@ async def run_repl(args: argparse.Namespace) -> None:
     from pce.serena_client import SerenaClient
 
     project_path = Path(args.project_path).resolve()
-    serena_path = Path(args.serena_path).resolve()
 
-    print(f"正在连接 Serena (project={project_path}, serena={serena_path})...")
+    print(f"正在连接 Serena (project={project_path})...")
     client = SerenaClient()
     try:
-        await client.connect(project_path, serena_path)
+        await client.connect(project_path)
     except Exception as exc:
         print(f"Serena 连接失败: {exc}")
         return
@@ -366,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
   uv run python scripts/agent_playground.py --mode mock --query "查找 PCEAgent 的定义"
 
   # REPL 模式
-  uv run python scripts/agent_playground.py --mode repl --project-path . --serena-path ../serena
+  uv run python scripts/agent_playground.py --mode repl --project-path .
 
   # REPL + 录制
   uv run python scripts/agent_playground.py --mode repl --recording temp/rec.json ...
@@ -424,11 +422,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--project-path",
         default=".",
         help="repl 模式: 目标项目路径",
-    )
-    parser.add_argument(
-        "--serena-path",
-        default=os.getenv("SERENA_PATH", str(_project_root / "serena")),
-        help="repl 模式: Serena 安装路径",
     )
     parser.add_argument(
         "--log-level",

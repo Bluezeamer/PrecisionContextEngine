@@ -16,7 +16,6 @@ import logging
 import os
 import time
 import traceback
-import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -104,7 +103,7 @@ async def main() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    project_path = Path(os.getenv("PCE_PROJECT_PATH", str(root))).resolve()
+    project_path = root
 
     _banner("PCE 端到端集成测试")
     _pprint("配置", {
@@ -136,23 +135,19 @@ async def main() -> None:
             raise RuntimeError(f"初始化失败: {init_result.get('error', '未知原因')}")
 
         # ── 场景 1: pce_query ───────────────────────────────────
-        query_sid = str(uuid.uuid4())
         results.append(await _run_case(
             "pce_query",
             lambda: ctx.handle_query(
                 query="PCEAgent 的 ReAct 循环是如何处理 deliver 调用的？",
-                session_id=query_sid,
             ),
         ))
 
         # ── 场景 2: pce_impact ──────────────────────────────────
-        impact_sid = str(uuid.uuid4())
         results.append(await _run_case(
             "pce_impact",
             lambda: ctx.handle_impact(
                 target="SerenaClient",
                 change_type="modify",
-                session_id=impact_sid,
                 file=None,
             ),
         ))
