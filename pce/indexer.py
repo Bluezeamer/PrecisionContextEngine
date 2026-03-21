@@ -22,7 +22,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ import aiofiles
 import litellm
 
 from .memory import load_index, save_index
+from .module_registry import ModuleRegistryManager
 from .models import (
     BuildStats,
     FileMeta,
@@ -491,6 +492,7 @@ async def _llm_complete_text(
     return content.strip() or None
 
 
+
 def _format_entry_outline(entry: IndexEntry) -> str:
     """将单个 IndexEntry 格式化为提示词摘要行（含主要符号名）。"""
     symbol_summary = ", ".join(
@@ -674,14 +676,18 @@ def _build_fallback_module_md(module_name: str, module_entries: list[IndexEntry]
 def _parse_index_section(module_name: str, body_lines: list[str]) -> dict[str, Any]:
     """将 index.md 单个模块章节解析为结构化记录。"""
     file_paths: list[str] = []
+    slug = _module_slug(module_name)
     for line in body_lines:
         m = re.match(r"^文件[:：]\s*(.+)$", line.strip())
         if m:
             file_paths = [p.strip() for p in m.group(1).split(",") if p.strip()]
-            break
+            continue
+        detail_match = re.search(r"modules/([^/\s]+)\.md", line.strip())
+        if detail_match:
+            slug = detail_match.group(1).strip()
     return {
         "name": module_name,
-        "slug": _module_slug(module_name),
+        "slug": slug,
         "body_lines": body_lines[:],
         "file_paths": file_paths,
     }
@@ -752,11 +758,35 @@ def _update_section_file_list(section: dict[str, Any], file_paths: list[str]) ->
     section["file_paths"] = normalized
 
 
+def _update_section_module_link(section: dict[str, Any], *, slug: str) -> None:
+    """就地替换章节中的 `详细认知：` 行，并更新 slug。"""
+    detail_line = f"详细认知：.pce/annotations/modules/{slug}.md"
+    new_body: list[str] = []
+    replaced = False
+    for line in section["body_lines"]:
+        if not replaced and re.match(r"^详细认知[:：]\s*", line.strip()):
+            new_body.append(detail_line)
+            replaced = True
+        else:
+            new_body.append(line)
+    if not replaced:
+        new_body.append(detail_line)
+    section["body_lines"] = new_body
+    section["slug"] = slug
+
+
+def _fallback_slug_from_file(file_path: str) -> str:
+    stem = Path(file_path).stem.lower().replace("_", "-").replace(".", "-")
+    stem = re.sub(r"[^a-z0-9-]+", "-", stem)
+    stem = re.sub(r"-+", "-", stem).strip("-")
+    return stem or "unnamed-module"
+
+
 def _build_temporary_section(file_path: str) -> dict[str, Any]:
     """为无法自动归属的新增文件创建临时模块章节。"""
     stem = Path(file_path).stem.replace(".", "-")
     module_name = f"临时归类 {stem}"
-    slug = _module_slug(module_name)
+    slug = _fallback_slug_from_file(file_path)
     return {
         "name": module_name,
         "slug": slug,
@@ -787,6 +817,39 @@ def _prepare_module_specs(
             (section["name"], section["slug"], [entries_map[p] for p in file_paths])
         )
     return valid_sections, module_specs
+
+
+def _extract_module_key_symbols(module_entries: list[IndexEntry]) -> list[str]:
+    symbols: list[str] = []
+    for entry in module_entries:
+        symbols.extend(sym.name for sym in entry.symbols[:12])
+    return _dedupe_keep_order(symbols)
+
+
+async def _stabilize_sections_with_registry(
+    sections: list[dict[str, Any]],
+    *,
+    root_path: Path,
+    entries_map: dict[str, IndexEntry],
+) -> list[dict[str, Any]]:
+    """根据 module registry 稳定模块 slug。"""
+    manager = ModuleRegistryManager(root_path)
+    stabilized: list[dict[str, Any]] = []
+    for section in sections:
+        file_paths = [p for p in _dedupe_keep_order(section["file_paths"]) if p in entries_map]
+        if not file_paths:
+            stabilized.append(section)
+            continue
+        record = await manager.get_or_create_module(
+            display_name=section["name"],
+            file_paths=file_paths,
+            key_symbols=_extract_module_key_symbols([entries_map[p] for p in file_paths]),
+        )
+        section["name"] = record.display_name
+        _update_section_file_list(section, file_paths)
+        _update_section_module_link(section, slug=record.slug)
+        stabilized.append(section)
+    return stabilized
 
 
 async def _generate_index_md(
@@ -858,7 +921,7 @@ async def _write_module_files(
         *[_generate_module_annotation(name, entries, model=model) for name, _, entries in module_specs],
         return_exceptions=True,
     )
-    for (module_name, slug, module_entries), result in zip(module_specs, results):
+    for (module_name, slug, module_entries), result in zip(module_specs, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(f"模块认知文档生成异常，使用回退内容: {module_name}: {result}")
             content = None
@@ -893,6 +956,11 @@ async def _write_annotations(
 
     entries_map = {str(e.file_meta.path): e for e in entries}
     header, sections = _split_index_md(index_content)
+    sections = await _stabilize_sections_with_registry(
+        sections,
+        root_path=root_path,
+        entries_map=entries_map,
+    )
     valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
 
     if not valid_sections:
@@ -930,7 +998,7 @@ async def _update_annotations_incremental(
     modules_dir = _annotation_modules_dir(root_path)
 
     try:
-        async with aiofiles.open(index_path, "r", encoding="utf-8") as f:
+        async with aiofiles.open(index_path, encoding="utf-8") as f:
             index_content = await f.read()
     except FileNotFoundError:
         logger.info("未找到认知导航 index.md，降级为全量认知文档重建")
@@ -993,7 +1061,6 @@ async def _update_annotations_incremental(
 
     # 重新生成受影响模块；无文件的模块移除
     final_sections: list[dict[str, Any]] = []
-    module_specs: list[tuple[str, str, list[IndexEntry]]] = []
     removed_slugs: set[str] = set()
 
     for section in sections:
@@ -1008,7 +1075,13 @@ async def _update_annotations_incremental(
             continue
         _update_section_file_list(section, file_paths)
         final_sections.append(section)
-        module_specs.append((section["name"], slug, [entries_map[p] for p in file_paths]))
+
+    final_sections = await _stabilize_sections_with_registry(
+        final_sections,
+        root_path=root_path,
+        entries_map=entries_map,
+    )
+    final_sections, module_specs = _prepare_module_specs(final_sections, entries_map)
 
     await _write_module_files(module_specs, modules_dir, model)
 
@@ -1128,10 +1201,10 @@ async def _index_file(file_path: str, serena_client: SerenaClient) -> IndexEntry
     # 收集文件统计信息
     try:
         stat = abs_path.stat()
-        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
         size_bytes = stat.st_size
     except Exception:
-        mtime = datetime.now(timezone.utc)
+        mtime = datetime.now(UTC)
         size_bytes = 0
 
     return IndexEntry(
@@ -1199,7 +1272,7 @@ async def build_index(
 
     entries: list[IndexEntry] = []
     failed_files: list[str] = []
-    for file_path, result in zip(files, results):
+    for file_path, result in zip(files, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(f"文件索引异常: {file_path}: {result}")
             failed_files.append(file_path)
@@ -1213,7 +1286,7 @@ async def build_index(
         logger.warning(f"有 {len(warnings)} 个文件索引失败")
 
     # 构建元数据
-    created_at = datetime.now(timezone.utc)
+    created_at = datetime.now(UTC)
     project_meta = ProjectMeta(
         root_path=root_path,
         created_at=created_at,
@@ -1323,7 +1396,7 @@ async def build_index_incremental(
     entries_map: dict[str, IndexEntry] = {str(e.file_meta.path): e for e in existing.entries}
 
     failed_files: list[str] = []
-    for file_path, result in zip(effective_changes, results):
+    for file_path, result in zip(effective_changes, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(f"增量索引异常: {file_path}: {result}")
             failed_files.append(file_path)
@@ -1359,7 +1432,7 @@ async def build_index_incremental(
     snapshot = IndexSnapshot(
         project_meta=project_meta,
         entries=merged_entries,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
         build_stats=build_stats,
     )
 

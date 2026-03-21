@@ -20,12 +20,13 @@ import json
 import logging
 import os
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import aiofiles
 
-from .models import IndexSnapshot, ProjectMeta
+from .models import FileBaseline, IndexSnapshot, ModuleRegistry, ProjectMeta, SymbolFact
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ PCE_DIR_NAME = ".pce"
 META_FILE = "meta.json"
 STRUCTURE_FILE = "structure.md"
 REFERENCES_FILE = "references.json"
+MODULE_REGISTRY_FILE = "module_registry.json"
+BASELINES_DIR = "baselines"
+BASELINE_FILES_DIR = "files"
 ANNOTATIONS_DIR = "annotations"
 ANNOTATIONS_MODULES_DIR = "modules"
 
@@ -75,6 +79,27 @@ def _meta_path(root_path: Path) -> Path:
 def _references_path(root_path: Path) -> Path:
     """返回 references.json 文件路径。"""
     return _pce_dir(root_path) / REFERENCES_FILE
+
+
+def _module_registry_path(root_path: Path) -> Path:
+    """返回 module_registry.json 文件路径。"""
+    return _pce_dir(root_path) / MODULE_REGISTRY_FILE
+
+
+def _baselines_dir(root_path: Path) -> Path:
+    """返回 .pce/baselines 目录路径。"""
+    return _pce_dir(root_path) / BASELINES_DIR
+
+
+def _baseline_files_dir(root_path: Path) -> Path:
+    """返回 .pce/baselines/files 目录路径。"""
+    return _baselines_dir(root_path) / BASELINE_FILES_DIR
+
+
+def _baseline_file_path(root_path: Path, rel_path: str | Path) -> Path:
+    """返回指定相对路径对应的 baseline 文件路径。"""
+    rel = Path(rel_path)
+    return _baseline_files_dir(root_path) / rel.parent / f"{rel.name}.json"
 
 
 def _structure_path(root_path: Path) -> Path:
@@ -148,6 +173,16 @@ async def _ensure_layout(root_path: Path) -> None:
     if not structure_path.exists():
         await _atomic_write_text(structure_path, STRUCTURE_TEMPLATE)
         logger.debug(f"初始化结构文件: {structure_path}")
+
+    registry_path = _module_registry_path(root_path)
+    if not registry_path.exists():
+        await _atomic_write_json(
+            registry_path,
+            ModuleRegistry().model_dump(mode="json"),
+        )
+        logger.debug(f"初始化模块注册表: {registry_path}")
+
+    _baseline_files_dir(root_path).mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
@@ -266,8 +301,87 @@ async def get_status(root_path: Path | None = None) -> dict[str, Any]:
         except Exception:
             logger.exception(f"读取模块认知文档目录失败: {modules_dir}")
 
+    module_count = 0
+    registry_path = _module_registry_path(root_path)
+    if registry_path.exists():
+        try:
+            registry = ModuleRegistry.model_validate(await _read_json(registry_path))
+            module_count = len(registry.records)
+        except Exception:
+            logger.exception(f"读取模块注册表失败: {registry_path}")
+
     return {
         "last_index_time": last_index_time.isoformat() if last_index_time else None,
         "index_version": index_version,
         "annotation_modules_count": annotation_modules_count,
+        "module_count": module_count,
     }
+
+
+async def get_module_annotation(
+    module_slug: str,
+    root_path: Path | None = None,
+) -> str | None:
+    """读取模块认知文档内容,不存在时返回 None。"""
+    root_path = _resolve_root(root_path)
+    path = _annotation_modules_dir(root_path) / f"{module_slug}.md"
+    if not path.exists():
+        return None
+    try:
+        return await _read_text(path)
+    except Exception:
+        logger.exception(f"读取模块认知文档失败: {path}")
+        return None
+
+
+async def save_file_baseline(
+    rel_path: str | Path,
+    *,
+    content: str,
+    content_hash: str,
+    symbols: list[SymbolFact],
+    root_path: Path | None = None,
+) -> None:
+    """保存单文件 baseline 快照。"""
+    root_path = _resolve_root(root_path)
+    await _ensure_layout(root_path)
+    payload = FileBaseline(
+        path=Path(rel_path),
+        content_hash=content_hash,
+        content=content,
+        symbols=symbols,
+        captured_at=datetime.now(UTC),
+    )
+    await _atomic_write_json(
+        _baseline_file_path(root_path, rel_path),
+        payload.model_dump(mode="json"),
+    )
+
+
+async def load_file_baseline(
+    rel_path: str | Path,
+    root_path: Path | None = None,
+) -> FileBaseline | None:
+    """读取单文件 baseline 快照，不存在时返回 None。"""
+    root_path = _resolve_root(root_path)
+    path = _baseline_file_path(root_path, rel_path)
+    if not path.exists():
+        return None
+    try:
+        return FileBaseline.model_validate(await _read_json(path))
+    except Exception:
+        logger.exception(f"读取文件 baseline 失败: {path}")
+        return None
+
+
+async def delete_file_baseline(
+    rel_path: str | Path,
+    root_path: Path | None = None,
+) -> None:
+    """删除单文件 baseline 快照。"""
+    root_path = _resolve_root(root_path)
+    path = _baseline_file_path(root_path, rel_path)
+    try:
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+    except Exception:
+        logger.exception(f"删除文件 baseline 失败: {path}")

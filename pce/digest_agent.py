@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -38,7 +39,10 @@ from .agent import (
     _should_fallback_model,
     _stringify_error,
 )
+from .digest_delta_builder import DigestDeltaBuilder
 from .insight_cache import InsightCache
+from .memory import delete_file_baseline, load_index, save_file_baseline
+from .models import ModuleDigestDelta, SymbolFact
 from .serena_client import SerenaClient, SerenaClientError
 from .staging import DirtyState
 
@@ -52,6 +56,12 @@ FIXED_SECTION_HEADINGS: tuple[str, ...] = (
     "关键流程",
     "外部协作",
     "风险与约束",
+)
+ALLOWED_EXTENSION_SECTION_PREFIXES: tuple[str, ...] = (
+    "专题：",
+    "变更专题：",
+    "设计约束：",
+    "已知问题：",
 )
 
 _DIGEST_TASKS_REL = Path(".pce") / "digest_tasks.json"
@@ -115,17 +125,13 @@ def _parse_model_fallbacks(raw: str) -> list[str]:
 @dataclass
 class DigestTaskItem:
     id: str
-    kind: str  # "insight" | "dirty_module" | "dirty_file"
+    kind: str  # "module"
     status: str  # "pending" | "done" | "skipped"
     note: str | None = None
-    # insight 类型字段
-    insight_id: str | None = None
-    scope: str | None = None
-    insight_summary: str | None = None
     temporal_stale: bool = False
-    # 模块/文件变更类型字段
     module_slug: str | None = None
     dirty_files: list[str] = field(default_factory=list)
+    digest_delta: ModuleDigestDelta | None = None
 
 
 @dataclass
@@ -140,15 +146,49 @@ class DigestTaskList:
     def pending_items(self) -> list[DigestTaskItem]:
         return [item for item in self.items if item.status == "pending"]
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_digest_delta: bool = True) -> dict[str, Any]:
+        serialized_items: list[dict[str, Any]] = []
+        for item in self.items:
+            payload = asdict(item)
+            if include_digest_delta and item.digest_delta is not None:
+                payload["digest_delta"] = item.digest_delta.model_dump(mode="json")
+            elif not include_digest_delta:
+                payload.pop("digest_delta", None)
+            serialized_items.append(payload)
         return {
             "created_at": self.created_at.isoformat(),
             "warnings": list(self.warnings),
-            "items": [asdict(item) for item in self.items],
+            "items": serialized_items,
+        }
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        for item in self.items:
+            items.append(
+                {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "status": item.status,
+                    "note": item.note,
+                    "temporal_stale": item.temporal_stale,
+                    "module_slug": item.module_slug,
+                    "dirty_files": list(item.dirty_files),
+                    "changed_files_count": (
+                        len(item.digest_delta.changed_files) if item.digest_delta is not None else 0
+                    ),
+                    "related_insights_count": (
+                        len(item.digest_delta.related_insights) if item.digest_delta is not None else 0
+                    ),
+                }
+            )
+        return {
+            "created_at": self.created_at.isoformat(),
+            "warnings": list(self.warnings),
+            "items": items,
         }
 
     async def save(self, path: Path) -> None:
-        payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        payload = json.dumps(self.to_dict(include_digest_delta=True), ensure_ascii=False, indent=2) + "\n"
         await _write_file_atomic(path, payload)
 
     async def delete(self, path: Path) -> None:
@@ -161,88 +201,41 @@ class DigestTaskList:
 
 
 class DigestPlanner:
-    """基于 annotations/index.md + InsightCache + DirtyState 构建 DigestTaskList。"""
+    """基于 DigestDelta 构建模块级 DigestTaskList。"""
 
     def __init__(self, project_root: Path, insight_cache: InsightCache) -> None:
         self._project_root = project_root.resolve()
         self._insight_cache = insight_cache
 
     async def build(self, dirty_state: DirtyState) -> DigestTaskList:
-        file_to_module, warnings = await self._load_file_module_map()
-        dirty_paths = list(dict.fromkeys(dirty_state.changed + dirty_state.deleted))
+        builder = DigestDeltaBuilder(self._project_root, self._insight_cache)
+        module_deltas = await builder.build_for_changes(
+            changed_files=dirty_state.changed,
+            deleted_files=dirty_state.deleted,
+        )
 
-        # 按模块归并 dirty files
-        module_dirty: dict[str, list[str]] = {}
-        orphan_dirty: list[str] = []
-        for path in dirty_paths:
-            slug = file_to_module.get(path)
-            if slug is None:
-                orphan_dirty.append(path)
-                warnings.append(f"dirty 文件未命中 annotation 模块映射，Agent 自行判断归属: {path}")
-            else:
-                module_dirty.setdefault(slug, []).append(path)
+        dirty_paths = set(dirty_state.changed + dirty_state.deleted)
+        covered_paths = {
+            str(file_fact.path)
+            for delta in module_deltas
+            for file_fact in delta.changed_files
+        }
+        warnings: list[str] = []
+        for path in sorted(dirty_paths - covered_paths):
+            warnings.append(f"dirty 文件暂未命中 module registry，后续需补归属: {path}")
 
-        items: list[DigestTaskItem] = []
-        records = await self._insight_cache.get_all_records(include_stale=True)
-        represented_modules: set[str] = set()
-
-        # insight 任务（含时序冲突标注）
-        for record in records:
-            slug = file_to_module.get(record.scope)
-            related_dirty = module_dirty.get(slug, []) if slug else []
-            # temporal_stale: insight 采集时间早于 dirty 或本身已 stale
-            temporal_stale = record.stale or bool(related_dirty)
-
-            if slug is None:
-                warnings.append(
-                    f"insight scope 未命中模块映射，Agent 自行决定如何处理: {record.scope}"
-                )
-            else:
-                represented_modules.add(slug)
-
-            summary = await self._insight_cache.get_entry_content(record.id)
-            items.append(
-                DigestTaskItem(
-                    id=f"insight:{record.id}",
-                    kind="insight",
-                    status="pending",
-                    insight_id=record.id,
-                    scope=record.scope,
-                    insight_summary=summary,
-                    temporal_stale=temporal_stale,
-                    module_slug=slug,
-                    dirty_files=list(related_dirty),
-                )
+        items = [
+            DigestTaskItem(
+                id=f"module:{delta.module_slug}",
+                kind="module",
+                status="pending",
+                temporal_stale=bool(delta.related_insights),
+                module_slug=delta.module_slug,
+                dirty_files=[str(file_fact.path) for file_fact in delta.changed_files],
+                digest_delta=delta,
             )
-
-        # dirty_module 任务（无对应 insight 的模块变更）
-        for slug, files in sorted(module_dirty.items()):
-            if slug in represented_modules:
-                continue
-            items.append(
-                DigestTaskItem(
-                    id=f"dirty:{slug}",
-                    kind="dirty_module",
-                    status="pending",
-                    temporal_stale=True,
-                    module_slug=slug,
-                    dirty_files=list(files),
-                )
-            )
-
-        # dirty_file 任务（未命中任何模块的文件，让 Agent 自主决定）
-        for path in orphan_dirty:
-            items.append(
-                DigestTaskItem(
-                    id=f"dirty-file:{path}",
-                    kind="dirty_file",
-                    status="pending",
-                    scope=path,
-                    temporal_stale=True,
-                    module_slug=None,
-                    dirty_files=[path],
-                )
-            )
+            for delta in module_deltas
+        ]
 
         return DigestTaskList(items=items, warnings=warnings, created_at=_utc_now())
 
@@ -381,14 +374,15 @@ class DigestAgent:
         }
 
     def _build_system_prompt(self, task_list: DigestTaskList) -> str:
-        task_json = json.dumps(task_list.to_dict(), ensure_ascii=False, indent=2)
+        task_json = json.dumps(task_list.to_summary_dict(), ensure_ascii=False, indent=2)
         fixed = "、".join(FIXED_SECTION_HEADINGS)
+        extension_prefixes = "、".join(f"`{prefix}...`" for prefix in ALLOWED_EXTENSION_SECTION_PREFIXES)
         return "\n".join(
             [
                 "你是 PCE 的 DigestAgent，负责把历史 insight 和代码变更内化到模块 annotation 文档。",
                 "",
                 "## 目标",
-                "1. 读取任务清单，理解每个待内化项（insight 或 dirty_file）。",
+                "1. 先用 read_task_list 查看模块级任务摘要，再用 read_digest_delta(task_id) 读取完整事实包。",
                 "2. 按需通过 Serena 工具探索代码获取最新证据。",
                 "3. 优先用 read_annotation + write_annotation_and_mark_done 一次性更新 annotation 并完成任务。",
                 "4. 只有确实需要分步编辑时，才单独使用 write_annotation_patch；编辑完成后立刻 mark_task_done。",
@@ -397,25 +391,29 @@ class DigestAgent:
                 "",
                 "## 固定约束",
                 f"- annotation 固定章节不可删除：{fixed}",
-                "- 可新增额外 `##` 章节（例如 `## Prompt 设计细节`）。",
+                f"- 可新增额外 `##` 章节，但标题必须使用受控前缀：{extension_prefixes}",
                 "- `replace` 按 `##` 级标题定位，替换整个章节正文（包含想保留的内容）。",
                 "- `rewrite` 提交完整 Markdown，必须显式保留全部 6 个固定章节。",
                 "- `append` 在指定章节末尾追加内容；target=null 时追加到文档末尾。",
                 "- 每个任务必须有明确结论（done 或 skipped），不允许静默跳过。",
                 "- mark_task_done / mark_task_skipped 的 note 字段必须填写。",
+                "- `digest_delta` 是模块级事实包，包含 annotation 基线、相关 insight、changed_files 与 patch_blocks。",
                 "",
                 "## 工作策略",
-                "- 先查看 task_id、module_slug、dirty_files、insight_summary，再决定是否需要 Serena。",
-                "- 若任务已给出 module_slug，先 read_annotation；只有 temporal_stale=true 或现有证据不足时再调用 Serena。",
+                "- 先用 read_task_list 看摘要，再对当前要处理的任务调用 read_digest_delta(task_id)。",
+                "- 优先消化 digest_delta 中的 annotation_baseline、related_insights、changed_files、patch_blocks。",
+                "- 若 changed_files_count=0 且 related_insights_count>0，默认先基于 annotation_baseline 和 related_insights 直接修正文档，不要先调用 Serena。",
+                "- 若 digest_delta 已足够支撑认知修正，尽量直接 deliver 或 write_annotation_and_mark_done，不要无谓探索。",
+                "- 若任务已给出 module_slug，先 read_annotation；只有 digest_delta 证据不足时再调用 Serena。",
                 "- 处理代码文件时优先使用 get_symbols_overview / find_symbol / search_for_pattern，避免大段 read_file。",
                 "- 同一 module_slug 的多个任务尽量连续处理，减少重复探索与重复写入。",
                 "- 一旦证据足够，立即调用 write_annotation_and_mark_done 或 mark_task_done 收尾，不要把收尾拖到最后。",
                 "- 若时间预算所剩不多且证据仍不足，调用 mark_task_skipped 写清原因，不要继续扩散探索。",
                 "",
-                "## 时序说明",
-                "- `temporal_stale=true` 表示该 insight 的采集时间早于文件变更，",
-                "  insight 内容可能已经过时，必须结合 Serena 工具验证最新代码再更新。",
+                "## 输入说明",
+                "- `temporal_stale=true` 表示该模块存在旧 insight 与新代码变更叠加，需优先校验 patch blocks 与 annotation 基线的一致性。",
                 "- `dirty_files` 是与该任务关联的最新改动文件，应优先核对。",
+                "- `changed_files_count=0` 不代表该任务无价值，通常表示“仅有 insight 待沉淀”的模块任务。",
                 "",
                 "## 当前任务清单",
                 task_json,
@@ -428,8 +426,22 @@ class DigestAgent:
                 "type": "function",
                 "function": {
                     "name": "read_task_list",
-                    "description": "读取当前 digest 任务清单（含任务状态）。",
+                    "description": "读取当前 digest 任务摘要（不含完整 digest_delta 正文）。",
                     "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_digest_delta",
+                    "description": "读取指定任务的完整 digest_delta 事实包。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type": "string", "description": "任务 ID"},
+                        },
+                        "required": ["task_id"],
+                    },
                 },
             },
             {
@@ -850,7 +862,18 @@ class DigestAgent:
             return None, summary
 
         if name == "read_task_list":
-            return _ok(_safe_json_dumps(self._task_list.to_dict()))
+            return _ok(_safe_json_dumps(self._task_list.to_summary_dict()))
+
+        if name == "read_digest_delta":
+            task_id = str(args.get("task_id") or "").strip()
+            if not task_id:
+                return _err("task_id 不能为空")
+            task = self._find_task(task_id)
+            if task is None:
+                return _err(f"未找到任务: {task_id}")
+            if task.digest_delta is None:
+                return _err(f"任务无 digest_delta: {task_id}")
+            return _ok(_safe_json_dumps(task.digest_delta.model_dump(mode="json")))
 
         if name in {"mark_task_done", "mark_task_skipped"}:
             task_id = str(args.get("task_id") or "").strip()
@@ -989,6 +1012,9 @@ class DigestAgent:
             missing = [h for h in FIXED_SECTION_HEADINGS if h not in headings]
             if missing:
                 raise ValueError(f"rewrite 缺少固定章节: {missing}")
+            invalid = [h for h in headings if h not in FIXED_SECTION_HEADINGS and not self._is_allowed_extra_heading(h)]
+            if invalid:
+                raise ValueError(f"rewrite 包含不受支持的扩展章节标题: {invalid}")
             return self._render_annotation(parsed)
 
         parsed = self._parse_annotation(original, module_slug, ensure_fixed=True)
@@ -1002,6 +1028,12 @@ class DigestAgent:
 
         if target is None:
             raise ValueError(f"{operation} 操作必须提供 target（章节标题）")
+
+        if target not in FIXED_SECTION_HEADINGS and not self._is_allowed_extra_heading(target):
+            raise ValueError(
+                "扩展章节标题必须使用受控前缀: "
+                + ", ".join(ALLOWED_EXTENSION_SECTION_PREFIXES)
+            )
 
         idx = next((i for i, s in enumerate(sections) if s["heading"] == target), None)
 
@@ -1023,6 +1055,10 @@ class DigestAgent:
             body.extend(extra)
             sections[idx]["body_lines"] = body
         return self._render_annotation(parsed)
+
+    @staticmethod
+    def _is_allowed_extra_heading(heading: str) -> bool:
+        return any(heading.startswith(prefix) for prefix in ALLOWED_EXTENSION_SECTION_PREFIXES)
 
     def _parse_annotation(
         self,
@@ -1138,6 +1174,7 @@ async def run_digest(
 
     if not task_list.items:
         logger.info("Digest 跳过：无 insight 也无 dirty_files")
+        await _seed_initial_file_baselines_if_missing(project_root=project_root)
         # 仍然执行 cleanup 清除已 stale 的条目
         try:
             removed = await insight_cache.cleanup_stale()
@@ -1156,16 +1193,14 @@ async def run_digest(
 
     task_list_path = project_root.resolve() / _DIGEST_TASKS_REL
     try:
-        await task_list.save(task_list_path)
-
-        agent = DigestAgent(
-            project_root=project_root,
+        result = await _run_module_tasks(
+            task_list=task_list,
             task_list_path=task_list_path,
+            project_root=project_root,
+            serena_client=serena_client,
             model=model,
             provider=provider,
         )
-
-        result = await agent.run(task_list=task_list, serena_client=serena_client)
     finally:
         # 无论成功失败，都尝试清理临时任务文件和 stale insight（各自独立兜底，不覆盖原始异常）
         try:
@@ -1179,10 +1214,11 @@ async def run_digest(
         except Exception as e:
             logger.warning("Digest cleanup_stale 失败（已忽略）: %s", e)
 
+    await _advance_file_baselines(project_root=project_root, task_list=task_list)
+    await _seed_initial_file_baselines_if_missing(project_root=project_root)
+
     # 只删除已被内化（done）的 insight；skipped 说明缺乏证据暂缓处理，保留供后续重试
-    consumed_ids = [
-        item.insight_id for item in task_list.items if item.insight_id and item.status == "done"
-    ]
+    consumed_ids = _collect_consumed_insight_ids(task_list)
     deleted_count = await insight_cache.delete_by_ids(consumed_ids)
 
     return {
@@ -1193,3 +1229,151 @@ async def run_digest(
         "deleted_insights": deleted_count,
         "warnings": result["warnings"],
     }
+
+
+async def _run_module_tasks(
+    *,
+    task_list: DigestTaskList,
+    task_list_path: Path,
+    project_root: Path,
+    serena_client: SerenaClient,
+    model: str | None,
+    provider: str | None,
+) -> dict[str, Any]:
+    """按模块并发执行 DigestAgent，收窄单任务上下文规模。"""
+    warnings: list[str] = list(task_list.warnings)
+    pending_items = [item for item in task_list.items if item.status == "pending"]
+
+    async def _run_one(index: int, item: DigestTaskItem) -> tuple[int, str, list[str]]:
+        sub_task_path = _module_task_list_path(task_list_path, item)
+        sub_task_list = DigestTaskList(
+            items=[item],
+            warnings=[],
+            created_at=_utc_now(),
+        )
+        await sub_task_list.save(sub_task_path)
+        try:
+            agent = DigestAgent(
+                project_root=project_root,
+                task_list_path=sub_task_path,
+                model=model,
+                provider=provider,
+            )
+            result = await agent.run(task_list=sub_task_list, serena_client=serena_client)
+        except Exception as exc:
+            return index, "", [f"任务执行失败: {item.id}: {exc}"]
+        finally:
+            try:
+                await sub_task_list.delete(sub_task_path)
+            except Exception as exc:
+                logger.warning("Digest 清理模块任务文件失败（已忽略）: %s", exc)
+
+        task_warnings = list(result.get("warnings", []))
+        if item.status == "pending":
+            task_warnings.append(f"任务未完成: {item.id}")
+        summary = str(result.get("summary") or "").strip()
+        return index, summary, task_warnings
+
+    results = await asyncio.gather(
+        *[_run_one(index, item) for index, item in enumerate(pending_items)],
+        return_exceptions=False,
+    )
+
+    ordered_summaries: list[str] = [""] * len(pending_items)
+    for index, summary, task_warnings in results:
+        ordered_summaries[index] = summary
+        warnings.extend(task_warnings)
+
+    summaries = [
+        f"[{item.module_slug}] {summary}"
+        for item, summary in zip(pending_items, ordered_summaries, strict=False)
+        if summary
+    ]
+
+    return {
+        "summary": "\n\n".join(summaries).strip(),
+        "resolved_tasks": sum(1 for item in task_list.items if item.status != "pending"),
+        "pending_tasks": len(task_list.pending_items()),
+        "warnings": warnings,
+    }
+
+
+def _module_task_list_path(base_path: Path, item: DigestTaskItem) -> Path:
+    suffix = item.module_slug or item.id.replace(":", "-")
+    return base_path.with_name(f"{base_path.stem}-{suffix}{base_path.suffix}")
+
+
+async def _advance_file_baselines(
+    *,
+    project_root: Path,
+    task_list: DigestTaskList,
+) -> None:
+    """仅将已成功消费的模块任务对应文件前移为新的 baseline。"""
+    for item in task_list.items:
+        if item.status != "done" or item.digest_delta is None:
+            continue
+        for file_fact in item.digest_delta.changed_files:
+            rel_path = str(file_fact.path)
+            if file_fact.status == "deleted":
+                await delete_file_baseline(rel_path, root_path=project_root)
+                continue
+            if file_fact.new_content is None or file_fact.new_hash is None:
+                continue
+            await save_file_baseline(
+                rel_path,
+                content=file_fact.new_content,
+                content_hash=file_fact.new_hash,
+                symbols=file_fact.new_symbols,
+                root_path=project_root,
+            )
+
+
+async def _seed_initial_file_baselines_if_missing(*, project_root: Path) -> None:
+    """若当前不存在任何 baseline，则用现有索引建立初始 baseline。"""
+    baselines_dir = project_root / ".pce" / "baselines" / "files"
+    if baselines_dir.exists():
+        existing = list(baselines_dir.rglob("*.json"))
+        if existing:
+            return
+
+    snapshot = await load_index(root_path=project_root)
+    if snapshot is None:
+        return
+
+    for entry in snapshot.entries:
+        rel_path = str(entry.file_meta.path)
+        abs_path = project_root / rel_path
+        try:
+            content = await asyncio.to_thread(abs_path.read_text, "utf-8")
+        except Exception:
+            logger.warning("初始化 baseline 失败，跳过文件: %s", rel_path)
+            continue
+        await save_file_baseline(
+            rel_path,
+            content=content,
+            content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            symbols=[
+                SymbolFact(
+                    name=sym.name,
+                    kind=sym.kind,
+                    line_start=sym.line_start,
+                    line_end=sym.line_end,
+                )
+                for sym in entry.symbols
+            ],
+            root_path=project_root,
+        )
+
+
+def _collect_consumed_insight_ids(task_list: DigestTaskList) -> list[str]:
+    """收集已成功消费模块任务中的 related_insights 条目 ID。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in task_list.items:
+        if item.status != "done" or item.digest_delta is None:
+            continue
+        for insight in item.digest_delta.related_insights:
+            if insight.id not in seen:
+                seen.add(insight.id)
+                result.append(insight.id)
+    return result

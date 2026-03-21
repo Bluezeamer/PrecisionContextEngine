@@ -239,6 +239,104 @@ class ImpactResponse(BaseSchema):
 
 
 # ============================================================================
+# DigestDelta / 模块 Registry
+# ============================================================================
+
+
+class SymbolFact(BaseSchema):
+    """轻量符号事实,用于差异事实包。"""
+
+    name: NonEmptyStr = Field(..., description="符号名")
+    kind: SymbolKind = Field(..., description="符号类型")
+    line_start: int = Field(..., ge=1, description="起始行号")
+    line_end: int = Field(..., ge=1, description="结束行号")
+
+    @model_validator(mode="after")
+    def _validate_line_range(self) -> SymbolFact:
+        if self.line_end < self.line_start:
+            raise ValueError("line_end must be >= line_start")
+        return self
+
+
+class PatchBlock(BaseSchema):
+    """代码块级 before/after 对照。"""
+
+    old_start: int | None = Field(default=None, ge=1, description="旧代码起始行")
+    old_end: int | None = Field(default=None, ge=1, description="旧代码结束行")
+    new_start: int | None = Field(default=None, ge=1, description="新代码起始行")
+    new_end: int | None = Field(default=None, ge=1, description="新代码结束行")
+    old_snippet: str = Field(default="", description="旧代码片段")
+    new_snippet: str = Field(default="", description="新代码片段")
+
+
+class ChangedFileFact(BaseSchema):
+    """模块差异事实包中的单文件事实。"""
+
+    path: Path = Field(..., description="相对项目根的文件路径")
+    status: Literal["modified", "created", "deleted"] = Field(..., description="文件变更状态")
+    old_hash: str | None = Field(default=None, description="旧文件哈希")
+    new_hash: str | None = Field(default=None, description="新文件哈希")
+    old_content: str | None = Field(default=None, description="旧文件内容")
+    new_content: str | None = Field(default=None, description="新文件内容")
+    old_symbols: list[SymbolFact] = Field(default_factory=list, description="旧文件符号概览")
+    new_symbols: list[SymbolFact] = Field(default_factory=list, description="新文件符号概览")
+    patch_blocks: list[PatchBlock] = Field(default_factory=list, description="代码块差异列表")
+
+
+class FileBaseline(BaseSchema):
+    """文件 baseline 快照。"""
+
+    path: Path = Field(..., description="相对项目根的文件路径")
+    content_hash: NonEmptyStr = Field(..., description="文件内容哈希")
+    content: str = Field(default="", description="文件基线内容")
+    symbols: list[SymbolFact] = Field(default_factory=list, description="文件基线符号概览")
+    captured_at: UTCDateTime = Field(..., description="基线采集时间（UTC）")
+
+
+class ModuleDigestDelta(BaseSchema):
+    """模块级认知修正事实包。"""
+
+    module_id: UUIDStr = Field(..., description="模块稳定 ID")
+    module_slug: NonEmptyStr = Field(..., description="模块稳定 slug")
+    module_name: NonEmptyStr = Field(..., description="模块展示名")
+    annotation_baseline: str = Field(default="", description="当前模块认知基线")
+    related_insights: list[InsightFact] = Field(
+        default_factory=list, description="与该模块相关的 insight"
+    )
+    changed_files: list[ChangedFileFact] = Field(
+        default_factory=list, description="该模块相关的文件差异事实"
+    )
+    external_context: list[str] = Field(
+        default_factory=list, description="模块级外部上下文提示"
+    )
+
+
+class ModuleRecord(BaseSchema):
+    """模块 Registry 中的单条记录。"""
+
+    module_id: UUIDStr = Field(..., description="模块稳定 ID")
+    slug: NonEmptyStr = Field(..., description="模块稳定 slug")
+    display_name: NonEmptyStr = Field(..., description="模块展示名")
+    file_paths: list[NonEmptyStr] = Field(default_factory=list, description="模块覆盖文件")
+    key_symbols: list[NonEmptyStr] = Field(default_factory=list, description="模块关键符号")
+    created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
+    updated_at: UTCDateTime = Field(..., description="最近更新时间（UTC）")
+    aliases: list[NonEmptyStr] = Field(default_factory=list, description="历史展示名")
+    status: Literal["active", "merged", "deprecated"] = Field(
+        default="active", description="模块状态"
+    )
+
+
+class ModuleRegistry(BaseSchema):
+    """模块稳定 identity 注册表。"""
+
+    version: str = Field(default="1", description="Registry 版本号")
+    records: dict[str, ModuleRecord] = Field(
+        default_factory=dict, description="模块记录映射（key 为 module_id）"
+    )
+
+
+# ============================================================================
 # Insight Cache
 # ============================================================================
 
@@ -249,6 +347,16 @@ class InsightConfidence(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+
+
+class InsightFact(BaseSchema):
+    """供 DigestDelta 使用的轻量 insight 事实。"""
+
+    id: UUIDStr = Field(..., description="Insight 条目 ID")
+    scope: NonEmptyStr = Field(..., description="Insight 作用域")
+    content: NonEmptyStr = Field(..., description="Insight 正文")
+    confidence: InsightConfidence = Field(..., description="Insight 置信度")
+    created_at: UTCDateTime = Field(..., description="Insight 创建时间（UTC）")
 
 
 class InsightEntry(BaseSchema):
