@@ -768,7 +768,7 @@ class DigestAgent:
             return None, summary
 
         if name == "read_task_list":
-            return _ok(_safe_json_dumps(self._task_list.to_dict())), None
+            return _ok(_safe_json_dumps(self._task_list.to_dict()))
 
         if name in {"mark_task_done", "mark_task_skipped"}:
             task_id = str(args.get("task_id") or "").strip()
@@ -783,14 +783,14 @@ class DigestAgent:
             task.status = "done" if name == "mark_task_done" else "skipped"
             task.note = note
             await self._task_list.save(self._task_list_path)
-            return _ok(f"任务 {task_id} 已标记为 {task.status}"), None
+            return _ok(f"任务 {task_id} 已标记为 {task.status}")
 
         if name == "read_annotation":
             module_slug = str(args.get("module_slug") or "").strip()
             if not module_slug:
                 return _err("module_slug 不能为空")
             content = await self._load_annotation(module_slug)
-            return _ok(content), None
+            return _ok(content)
 
         if name == "write_annotation_patch":
             module_slug = str(args.get("module_slug") or "").strip()
@@ -807,11 +807,11 @@ class DigestAgent:
                 return _ok(
                     f"annotation 已更新: module={module_slug}, operation={operation}, "
                     f"target={target_str!r}"
-                ), None
+                )
             except Exception as e:
-                return _err(f"annotation 更新失败: {e}"), None
+                return _err(f"annotation 更新失败: {e}")
 
-        return _err(f"未知虚拟工具: {name}"), None
+        return _err(f"未知虚拟工具: {name}")
 
     # ------------------------------------------------------------------
     # Annotation 解析 / patch / 渲染
