@@ -62,7 +62,7 @@ _FALLBACK_MARKERS = {
 
 def _detect_status(response: QueryResponse) -> str:
     """从 QueryResponse 判断终止状态。"""
-    answer = response.answer
+    answer = response.markdown
     for marker, desc in _FALLBACK_MARKERS.items():
         if marker in answer:
             return f"异常终止: {desc}"
@@ -107,7 +107,7 @@ def _print_result(
         if stats.get("misses", 0) > 0:
             print(f"  未命中: {stats['misses']}")
     print("─" * 60)
-    print(f"  回答:\n{_truncate(response.answer)}")
+    print(f"  回答:\n{_truncate(response.markdown)}")
     print("═" * 60)
     print()
 

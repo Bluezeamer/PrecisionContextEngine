@@ -36,6 +36,7 @@ from .indexer import build_index, build_index_incremental
 from .models import InitResponse
 from .staging import DirtyState, FileWatcher, StagingArea
 from .memory import get_status, index_exists, load_index
+from ._env import configure_litellm_runtime
 from .serena_client import (
     DEFAULT_TIMEOUT_SECONDS,
     SerenaClient,
@@ -63,6 +64,11 @@ def _make_tool_description(summary: str, trigger: str, replaces: str) -> str:
 def _text_response(content: Any) -> list[TextContent]:
     """将任意数据序列化为 MCP TextContent 列表。"""
     return [TextContent(type="text", text=json.dumps(content, ensure_ascii=False, indent=2))]
+
+
+def _markdown_response(content: str) -> list[TextContent]:
+    """返回 Markdown 文本响应。"""
+    return [TextContent(type="text", text=content)]
 
 
 def _error_response(error_code: str, message: str) -> list[TextContent]:
@@ -821,6 +827,9 @@ async def serve() -> None:
         handlers=[logging.StreamHandler()],
     )
 
+    # stdio MCP 服务必须避免第三方库污染 stdout
+    configure_litellm_runtime()
+
     logger.info("PCE Server 启动（等待 pce_init 绑定项目）")
     ctx = PCEContext()
 
@@ -862,7 +871,7 @@ async def serve() -> None:
                 if not query:
                     return _error_response("INVALID_INPUT", "query 参数不能为空")
                 result = await ctx.handle_query(query=query)
-                return _text_response(result)
+                return _markdown_response(result["markdown"])
 
             if name == "pce_impact":
                 target = arguments.get("target", "")
@@ -874,7 +883,7 @@ async def serve() -> None:
                     change_type=change_type,
                     file=arguments.get("file"),
                 )
-                return _text_response(result)
+                return _markdown_response(result["markdown"])
 
             if name == "pce_sync":
                 result = await ctx.handle_sync()

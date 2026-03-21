@@ -186,64 +186,48 @@ spawn_agent 将一个"可独立求解"的子问题委托给子 Agent 推理，�
 - ok=false：不要中断；根据 error_code 降级为直接调用 Serena 工具继续推理
 
 **交付格式指引**:
-上层 Agent 可在 query 中补充字段要求或格式细节,PCE Agent 必须在下述 JSON schema 内表达最终结果。
+上层 Agent 可在 query 中补充字段要求或格式细节。PCE 的主输出协议为**结构化 Markdown**。
 无论是 query 还是 impact,最终都必须调用 `deliver(answer=..., confidence=...)`。
-其中 `deliver(answer=...)` 的 `answer` 必须是**严格 JSON 字符串**:
-- 只能包含一个合法 JSON object
-- 不得包含 Markdown 代码块、注释、解释性前后缀或省略号
-- 字段名必须与 schema 一致;未知字段可省略,不要伪造 UUID
+其中 `deliver(answer=...)` 的 `answer` 必须是**结构清晰的 Markdown 文本**,不得输出 JSON。
 
-query 任务默认 schema:
-{
-  "answer": "基于工具证据的结论（自然语言,凡提及代码位置必须附 file:line）",
-  "evidence": ["证据 1: file:line ...", "证据 2: file:line ..."],
-  "related_symbols": [
-    {
-      "name": "符号名",
-      "kind": "function|class|method|variable|module|import",
-      "file_path": "相对路径",
-      "line_start": 10,
-      "line_end": 24,
-      "name_path": "Parent/child"
-    }
-  ],
-  "related_files": ["相对路径1", "相对路径2"]
-}
+query 任务默认 Markdown 结构:
+## 结论
+...
 
-impact 任务默认 schema:
-{
-  "impact_chain": [
-    {
-      "file": "引用点所在相对路径",
-      "line": 123,
-      "referencing_symbol": "包含该引用的函数/方法/模块名",
-      "snippet": "引用点附近代码片段",
-      "relation": "calls|imports|uses|inherits"
-    }
-  ],
-  "boundary": [
-    {
-      "name": "受影响符号名",
-      "kind": "function|class|method|variable|module|import",
-      "file_path": "定义所在相对路径",
-      "line_start": 10,
-      "line_end": 20
-    }
-  ],
-  "risks": ["真实风险、回归面或建议修改顺序"],
-  "unknowns": ["证据不足或工具未覆盖的项"]
-}
+## 关键证据
+- `path:line` ...
 
-impact 任务交付示例（注意 answer 是纯 JSON 字符串,无 Markdown 包裹）:
-deliver(
-  answer='{"impact_chain":[{"file":"pce/server.py","line":351,"referencing_symbol":"PCEContext/_run_index_refresh","snippet":"await build_index_incremental(","relation":"calls"},{"file":"pce/server.py","line":682,"referencing_symbol":"PCEContext/handle_sync","snippet":"snapshot = await build_index_incremental(","relation":"calls"},{"file":"pce/server.py","line":34,"referencing_symbol":"(module)","snippet":"from .indexer import build_index, build_index_incremental","relation":"imports"}],"boundary":[{"name":"_run_index_refresh","kind":"method","file_path":"pce/server.py","line_start":314,"line_end":361},{"name":"handle_sync","kind":"method","file_path":"pce/server.py","line_start":660,"line_end":717}],"risks":["先更新 handle_sync 和 _run_index_refresh 的调用签名,再更新 import 语句"],"unknowns":[]}',
-  confidence="high"
-)
+## 相关符号
+- `symbol` — `kind` — `path:line`
+
+## 相关文件
+- `path`
+
+## 不确定项
+- ...
+
+impact 任务默认 Markdown 结构:
+## 直接影响点
+- `path:line` — 为什么这里会受影响
+
+## 边界符号
+- `symbol` — `kind` — `path:line`
+
+## 风险
+- ...
+
+## 不确定项
+- ...
+
+## 建议修改顺序
+1. ...
+2. ...
 
 输出要求:
 - 回答简洁精准,优先给出文件路径和行号定位
-- 影响分析时列出所有直接引用点,不要遗漏
-- 若某字段无法确认,将其写入 unknowns,不要编造或伪造 UUID\
+- 使用固定标题,不要改写标题名称
+- impact 必须继续追踪 downstream 传播链,不要只停留在符号导入层
+- 若某项无法确认,写入“不确定项”,不要编造\
 """
 
 # deliver 是一个虚拟工具,不转发给 Serena,由循环内部拦截处理
@@ -254,14 +238,14 @@ DELIVER_TOOL: dict[str, Any] = {
         "name": "deliver",
         "description": (
             "提交最终结论并结束当前任务。完成推理后必须调用此工具,不得直接以文字回答。"
-            "answer 必须是严格 JSON 字符串,不得包含 Markdown 代码块或额外说明。"
+            "answer 必须是结构化 Markdown 文本,不得输出 JSON 或 Markdown 代码块。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "answer": {
                     "type": "string",
-                    "description": "最终结论内容，必须是严格 JSON 字符串",
+                    "description": "最终结论内容，必须是结构化 Markdown 文本",
                 },
                 "confidence": {
                     "type": "string",
@@ -632,6 +616,53 @@ def _extract_lightweight_edge(item: dict[str, Any]) -> dict[str, Any] | None:
     return edge if "file" in edge else None
 
 
+def _looks_like_markdown_sections(content: str) -> bool:
+    """判断文本是否已经具备分段 Markdown 结构。"""
+    return "## " in content
+
+
+def _render_query_markdown(body: str, *, fallback_note: str | None = None) -> str:
+    body = body.strip() or "未能生成有效回答。"
+    lines = [
+        "## 结论",
+        body,
+        "",
+        "## 关键证据",
+        "- （未结构化提供）",
+        "",
+        "## 相关符号",
+        "- （未结构化提供）",
+        "",
+        "## 相关文件",
+        "- （未结构化提供）",
+        "",
+        "## 不确定项",
+        f"- {fallback_note or '输出未按协议分段，上述内容来自原始 deliver 文本。'}",
+    ]
+    return "\n".join(lines).strip()
+
+
+def _render_impact_markdown(body: str, *, fallback_note: str | None = None) -> str:
+    body = body.strip() or "分析结果无法解析。"
+    lines = [
+        "## 直接影响点",
+        "- （未结构化提供）",
+        "",
+        "## 边界符号",
+        "- （未结构化提供）",
+        "",
+        "## 风险",
+        f"- {body}",
+        "",
+        "## 不确定项",
+        f"- {fallback_note or '输出未按协议分段，上述内容来自原始 deliver 文本。'}",
+        "",
+        "## 建议修改顺序",
+        "1. 重新运行 impact，并要求按 Markdown 协议输出",
+    ]
+    return "\n".join(lines).strip()
+
+
 # ============================================================================
 # 响应解析
 # ============================================================================
@@ -649,46 +680,13 @@ def _parse_query_response(content: str) -> QueryResponse:
         "__REACT_LLM_EXHAUSTED__": "Agent 的模型降级链已全部失败，请检查模型配置或限流状态后重试。",
     }
     if content in _FALLBACK_ANSWERS:
-        return QueryResponse(
-            answer=_FALLBACK_ANSWERS[content],
-            evidence=[],
-            related_symbols=[],
-            related_files=[],
-        )
+        return QueryResponse(markdown=_render_query_markdown(_FALLBACK_ANSWERS[content]))
 
-    payload = _try_parse_json(content)
+    text = str(content).strip() if content else ""
+    if _looks_like_markdown_sections(text):
+        return QueryResponse(markdown=text)
 
-    if isinstance(payload, dict):
-        answer = str(payload.get("answer") or payload.get("content") or content)
-
-        related_symbols: list[dict[str, Any]] = []
-        for item in payload.get("related_symbols") or []:
-            if isinstance(item, dict):
-                normalized = _extract_lightweight_symbol(item)
-                if normalized:
-                    related_symbols.append(normalized)
-
-        related_files: list[Path] = []
-        for item in payload.get("related_files") or payload.get("files") or []:
-            path_text = _norm_text(item)
-            if path_text:
-                related_files.append(Path(path_text))
-
-        evidence = [str(e) for e in (payload.get("evidence") or []) if e]
-
-        return QueryResponse(
-            answer=answer,
-            evidence=evidence,
-            related_symbols=related_symbols,
-            related_files=related_files,
-        )
-
-    return QueryResponse(
-        answer=str(content) if content else "未能生成有效回答",
-        evidence=[],
-        related_symbols=[],
-        related_files=[],
-    )
+    return QueryResponse(markdown=_render_query_markdown(text))
 
 
 def _parse_impact_response(content: str) -> ImpactResponse:
@@ -703,47 +701,13 @@ def _parse_impact_response(content: str) -> ImpactResponse:
         "__REACT_LLM_EXHAUSTED__": "Agent 的模型降级链已全部失败，请检查模型配置或限流状态后重试。",
     }
     if content in _FALLBACK_RISKS:
-        return ImpactResponse(
-            impact_chain=[],
-            boundary=[],
-            risks=[_FALLBACK_RISKS[content]],
-            unknowns=[],
-        )
+        return ImpactResponse(markdown=_render_impact_markdown(_FALLBACK_RISKS[content]))
 
-    payload = _try_parse_json(content)
+    text = str(content).strip() if content else ""
+    if _looks_like_markdown_sections(text):
+        return ImpactResponse(markdown=text)
 
-    if isinstance(payload, dict):
-        impact_chain: list[dict[str, Any]] = []
-        for item in payload.get("impact_chain") or []:
-            if isinstance(item, dict):
-                normalized = _extract_lightweight_edge(item)
-                if normalized:
-                    impact_chain.append(normalized)
-
-        boundary: list[dict[str, Any]] = []
-        for item in payload.get("boundary") or []:
-            if isinstance(item, dict):
-                normalized = _extract_lightweight_symbol(item)
-                if normalized:
-                    boundary.append(normalized)
-
-        risks = [str(r) for r in (payload.get("risks") or []) if r]
-        unknowns = [str(u) for u in (payload.get("unknowns") or []) if u]
-
-        return ImpactResponse(
-            impact_chain=impact_chain,
-            boundary=boundary,
-            risks=risks,
-            unknowns=unknowns,
-        )
-
-    # 无法解析为结构化格式，将原始内容作为风险描述
-    return ImpactResponse(
-        impact_chain=[],
-        boundary=[],
-        risks=[str(content)] if content else ["分析结果无法解析"],
-        unknowns=[],
-    )
+    return ImpactResponse(markdown=_render_impact_markdown(text))
 
 
 # ============================================================================
@@ -1673,7 +1637,7 @@ class PCEAgent:
             acknowledge_cb: 认知确认回调,Agent 探索变更文件后触发
 
         Returns:
-            结构化的查询响应
+            Markdown 格式的查询响应
 
         Raises:
             SerenaClientError: serena_client 未提供
@@ -1724,7 +1688,7 @@ class PCEAgent:
             acknowledge_cb: 认知确认回调,Agent 探索变更文件后触发
 
         Returns:
-            结构化的影响分析响应
+            Markdown 格式的影响分析响应
 
         Raises:
             SerenaClientError: serena_client 未提供
@@ -1751,39 +1715,29 @@ class PCEAgent:
                     "任务要求:",
                     "1. 必须先使用 Serena 工具定位目标定义、所有直接引用点及直接受影响的边界符号。",
                     "2. 最终必须调用 deliver(answer=..., confidence=...)；"
-                    "其中 answer 必须是严格 JSON 字符串，不得包含 Markdown、注释或额外解释。",
-                    "3. 只返回已被工具证实的信息；无法确认的内容写入 unknowns，不要编造 UUID。",
+                    "其中 answer 必须是结构化 Markdown 文本，不得输出 JSON、代码块或额外协议包装。",
+                    "3. 只返回已被工具证实的信息；无法确认的内容写入“不确定项”，不要编造。",
                     "",
-                    "deliver(answer=...) 的 JSON schema:",
-                    "{",
-                    '  "impact_chain": [',
-                    "    {",
-                    '      "file": "引用点所在相对路径",',
-                    '      "line": 123,',
-                    '      "referencing_symbol": "包含该引用的函数/方法/模块名",',
-                    '      "snippet": "引用点附近代码片段",',
-                    '      "relation": "calls|imports|uses|inherits"',
-                    "    }",
-                    "  ],",
-                    '  "boundary": [',
-                    "    {",
-                    '      "name": "受影响符号名",',
-                    '      "kind": "function|class|method|variable|module|import",',
-                    '      "file_path": "定义所在相对路径",',
-                    '      "name_path": "Parent/child 格式的符号路径(可选)",',
-                    '      "line_start": 10,',
-                    '      "line_end": 20',
-                    "    }",
-                    "  ],",
-                    '  "risks": ["真实风险、回归面或建议修改顺序"],',
-                    '  "unknowns": ["证据不足或工具未覆盖的项"]',
-                    "}",
+                    "deliver(answer=...) 的 Markdown 结构:",
+                    "## 直接影响点",
+                    "- `path:line` — 为什么这里会受影响",
                     "",
-                    "字段说明:",
-                    "- impact_chain: 所有直接引用点；每项必须含 file/line/referencing_symbol/snippet/relation，不要返回 UUID。",
-                    "- boundary: 需要联动检查的定义点；每项只含 name/kind/file_path/line_start/line_end。",
-                    "- risks: 真实风险，并给出建议修改顺序（叶节点优先，再适配层，最后核心定义）。",
-                    "- unknowns: 仅记录工具证据不足的事项。",
+                    "## 边界符号",
+                    "- `symbol` — `kind` — `path:line`",
+                    "",
+                    "## 风险",
+                    "- 真实风险或回归面",
+                    "",
+                    "## 不确定项",
+                    "- 仅记录工具证据不足的事项",
+                    "",
+                    "## 建议修改顺序",
+                    "1. ...",
+                    "",
+                    "额外要求:",
+                    "- 直接影响点必须尽量覆盖：直接调用点、后端响应/解析点、前端接收点、前端继续传递点、UI消费点。",
+                    "- 边界符号只保留关键定义点。",
+                    "- 风险区块只放自然语言总结，不要嵌套结构化对象。",
                 ]
             )
             messages.append({"role": "user", "content": prompt})

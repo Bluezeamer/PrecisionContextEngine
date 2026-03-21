@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 from dotenv import load_dotenv
 
 from pce.server import PCEContext
+from pce._env import configure_litellm_runtime, get_base_url, get_completion_overrides, get_env_text
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -82,9 +83,10 @@ async def _cleanup(ctx: PCEContext | None) -> None:
             logger.info("FileWatcher 已停止")
         except Exception as exc:
             logger.warning("FileWatcher 停止失败: %s", exc)
-    if ctx.serena_client is not None:
+    serena_client = getattr(ctx, "serena_client", None)
+    if serena_client is not None:
         try:
-            await ctx.serena_client.disconnect()
+            await serena_client.disconnect()
             logger.info("Serena 已断开")
         except Exception as exc:
             logger.warning("Serena 断开失败: %s", exc)
@@ -96,6 +98,7 @@ async def _cleanup(ctx: PCEContext | None) -> None:
 async def main() -> None:
     root = _root()
     load_dotenv(root / ".env")
+    configure_litellm_runtime()
 
     # 日志
     logging.basicConfig(
@@ -103,18 +106,25 @@ async def main() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    project_path = root
+    project_path = Path(get_env_text("PCE_PROJECT_PATH") or root).resolve()
 
     _banner("PCE 端到端集成测试")
+    provider = get_env_text("PCE_PROVIDER")
+    model = get_env_text("PCE_MODEL")
+    overrides = get_completion_overrides()
     _pprint("配置", {
         "project_path": str(project_path),
-        "model": os.getenv("PCE_MODEL", "(default)"),
+        "provider": provider or "(missing)",
+        "model": model or "(missing)",
         "max_seconds": MAX_SECONDS,
-        "openrouter_key": "已设置" if os.getenv("OPENROUTER_API_KEY") else "未设置",
+        "api_key": "已设置" if overrides.get("api_key") else "未设置",
+        "base_url": get_base_url() or "(default)",
     })
 
-    if not os.getenv("OPENROUTER_API_KEY"):
-        raise RuntimeError("OPENROUTER_API_KEY 未配置，请检查 .env")
+    if not provider or not model:
+        raise RuntimeError("PCE_PROVIDER / PCE_MODEL 未配置，请检查 .env")
+    if not overrides.get("api_key"):
+        raise RuntimeError("PCE_API_KEY 未配置，请检查 .env")
 
     ctx: PCEContext | None = None
     results: list[dict[str, Any]] = []

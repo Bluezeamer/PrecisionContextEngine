@@ -211,10 +211,12 @@ class QueryRequest(BaseSchema):
 class QueryResponse(BaseSchema):
     """pce_query 工具的响应结果。"""
 
-    answer: NonEmptyStr = Field(..., description="查询答案正文")
-    evidence: list[NonEmptyStr] = Field(default_factory=list, description="证据摘要列表")
-    related_symbols: list[dict[str, Any]] = Field(default_factory=list, description="相关符号列表（轻量 dict）")
-    related_files: list[Path] = Field(default_factory=list, description="相关文件路径列表")
+    markdown: NonEmptyStr = Field(..., description="Markdown 格式的查询结果")
+
+    @property
+    def answer(self) -> str:
+        """兼容旧调用点，返回 markdown 正文。"""
+        return self.markdown
 
 
 class ImpactRequest(BaseSchema):
@@ -228,10 +230,12 @@ class ImpactRequest(BaseSchema):
 class ImpactResponse(BaseSchema):
     """pce_impact 工具的响应结果。"""
 
-    impact_chain: list[dict[str, Any]] = Field(default_factory=list, description="影响链路引用点列表（轻量 dict）")
-    boundary: list[dict[str, Any]] = Field(default_factory=list, description="影响边界符号列表（轻量 dict）")
-    risks: list[NonEmptyStr] = Field(default_factory=list, description="风险提示列表")
-    unknowns: list[NonEmptyStr] = Field(default_factory=list, description="不确定项列表")
+    markdown: NonEmptyStr = Field(..., description="Markdown 格式的影响分析结果")
+
+    @property
+    def answer(self) -> str:
+        """兼容旧调用点，返回 markdown 正文。"""
+        return self.markdown
 
 
 # ============================================================================

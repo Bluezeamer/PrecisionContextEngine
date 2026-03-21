@@ -689,7 +689,7 @@ def test_fallback_markers():
     }
     for marker, keyword in markers.items():
         r = _parse_query_response(marker)
-        assert_in(f"fallback {marker}", keyword, r.answer)
+        assert_in(f"fallback {marker}", keyword, r.markdown)
 
 
 # ── 主程序 ────────────────────────────────────────────────────────────────────

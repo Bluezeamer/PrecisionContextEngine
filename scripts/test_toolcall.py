@@ -22,9 +22,14 @@ if env_path.exists():
 
 import litellm
 
+from pce._env import build_litellm_model, configure_litellm_runtime, get_completion_overrides
+
+configure_litellm_runtime()
+
 PROVIDER = os.getenv("PCE_PROVIDER", "openrouter")
 MODEL_NAME = os.getenv("PCE_MODEL", "stepfun/step-3.5-flash:free")
-MODEL = f"{PROVIDER}/{MODEL_NAME}"
+MODEL = build_litellm_model(PROVIDER, MODEL_NAME)
+COMPLETION_OVERRIDES = get_completion_overrides()
 
 # ── 工具定义 ──────────────────────────────────────────────────
 TOOLS = [
@@ -126,6 +131,7 @@ def run_test(title: str, messages: list, max_steps: int = 5):
             messages=messages,
             tools=TOOLS,
             temperature=0.2,
+            **COMPLETION_OVERRIDES,
         )
 
         msg = resp.choices[0].message

@@ -40,6 +40,42 @@ def get_completion_overrides() -> dict[str, Any]:
     return overrides
 
 
+def configure_litellm_runtime() -> None:
+    """尽可能关闭 litellm 对 stdout/stderr 的调试污染。
+
+    PCE 的 MCP 服务运行在 stdio 模式下，任何第三方库向 stdout 输出非协议内容
+    都可能破坏 MCP 传输。这里集中关闭 litellm 的调试输出与 provider 提示噪音。
+
+    说明：
+    - 仅做 best-effort 配置，不因 litellm 版本差异抛异常
+    - 该函数应在服务入口和本地调试脚本启动时调用一次
+    """
+    try:
+        import litellm
+
+        # 关闭 provider 识别失败时的 stdout 提示
+        litellm.suppress_debug_info = True
+        # 关闭遗留 print_verbose 路径
+        litellm.set_verbose = False
+
+        try:
+            from litellm._logging import _disable_debugging
+
+            _disable_debugging()
+        except Exception:
+            pass
+
+        for logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
+            try:
+                logger = __import__("logging").getLogger(logger_name)
+                logger.disabled = True
+            except Exception:
+                pass
+    except Exception:
+        # litellm 不可用或内部接口变化时，不影响主流程
+        pass
+
+
 def get_system_prompt_soft_limit() -> int:
     """根据 PCE_CONTEXT_WINDOW 计算动态注入块的 token 软上限。
 
