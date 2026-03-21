@@ -537,10 +537,19 @@ class DigestAgent:
         length_continuations = 0
         deliver_guard_used = False
         start = time.monotonic()
+        round_num = 0
 
         while True:
-            if time.monotonic() - start >= self._max_seconds:
+            elapsed = time.monotonic() - start
+            if elapsed >= self._max_seconds:
                 raise RuntimeError("DigestAgent ReAct 循环超时，已达最大时间预算")
+            round_num += 1
+            logger.info(
+                "DigestAgent round=%d elapsed=%.1fs pending=%d",
+                round_num,
+                elapsed,
+                len(self._task_list.pending_items()) if self._task_list else -1,
+            )
 
             # 模型调用（含单步超时重试）
             timeout_retries = 0
@@ -891,24 +900,40 @@ class DigestAgent:
                 ],
             }
 
+        # heading_index: 已出现的章节名 → sections 列表中的下标，用于重复章节合并
+        heading_index: dict[str, int] = {}
+
+        def _flush() -> None:
+            if current_heading is None:
+                return
+            if current_heading in heading_index:
+                # 重复章节：将内容合并到第一次出现的章节末尾
+                existing_section = sections[heading_index[current_heading]]
+                extra = [l for l in current_body if l.strip()]
+                if extra:
+                    if existing_section["body_lines"]:
+                        existing_section["body_lines"].append("")
+                    existing_section["body_lines"].extend(extra)
+            else:
+                heading_index[current_heading] = len(sections)
+                sections.append({
+                    "heading": current_heading,
+                    "body_lines": current_body[:],
+                })
+
         for line in raw.splitlines():
             if line.startswith("# ") and title == module_slug:
                 title = line[2:].strip() or module_slug
                 continue
             if line.startswith("## "):
-                if current_heading is not None:
-                    sections.append({
-                        "heading": current_heading,
-                        "body_lines": current_body[:],
-                    })
+                _flush()
                 current_heading = line[3:].strip()
                 current_body = []
                 continue
             if current_heading is not None:
                 current_body.append(line.rstrip())
 
-        if current_heading is not None:
-            sections.append({"heading": current_heading, "body_lines": current_body[:]})
+        _flush()
 
         if ensure_fixed:
             existing = {s["heading"] for s in sections}
