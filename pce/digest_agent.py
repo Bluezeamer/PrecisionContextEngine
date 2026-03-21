@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +59,9 @@ _DEFAULT_MAX_SECONDS = 300.0
 _MAX_NO_TOOL_RETRIES = 3
 _MAX_TIMEOUT_RETRIES = 1
 _MAX_LENGTH_CONT = 2
+_BUDGET_WARNING_RATIO = 0.25
+_BUDGET_WARNING_MIN_SECONDS = 45.0
+_BUDGET_WARNING_MAX_SECONDS = 90.0
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +70,7 @@ _MAX_LENGTH_CONT = 2
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _module_slug_from_name(name: str) -> str:
@@ -112,8 +115,8 @@ def _parse_model_fallbacks(raw: str) -> list[str]:
 @dataclass
 class DigestTaskItem:
     id: str
-    kind: str             # "insight" | "dirty_module" | "dirty_file"
-    status: str           # "pending" | "done" | "skipped"
+    kind: str  # "insight" | "dirty_module" | "dirty_file"
+    status: str  # "pending" | "done" | "skipped"
     note: str | None = None
     # insight 类型字段
     insight_id: str | None = None
@@ -264,9 +267,7 @@ class DigestPlanner:
                 return
             for fp in current_files:
                 if fp in mapping and mapping[fp] != current_slug:
-                    warnings.append(
-                        f"文件归属到多个模块，取最后一次映射: {fp} -> {current_slug}"
-                    )
+                    warnings.append(f"文件归属到多个模块，取最后一次映射: {fp} -> {current_slug}")
                 mapping[fp] = current_slug
 
         for line in raw.splitlines():
@@ -323,9 +324,7 @@ class DigestAgent:
             self._provider = get_env_text("PCE_PROVIDER")
             self._model = get_env_text("PCE_MODEL")
             if not self._provider or not self._model:
-                raise ValueError(
-                    "未配置 PCE_PROVIDER / PCE_MODEL，DigestAgent 无法调用模型"
-                )
+                raise ValueError("未配置 PCE_PROVIDER / PCE_MODEL，DigestAgent 无法调用模型")
         else:
             self._provider = explicit_provider
             self._model = explicit_model
@@ -340,9 +339,7 @@ class DigestAgent:
         self._task_list_path = task_list_path
         self._max_seconds = max_seconds
         self._virtual_tools = self._build_virtual_tools()
-        self._virtual_tool_names = {
-            schema["function"]["name"] for schema in self._virtual_tools
-        }
+        self._virtual_tool_names = {schema["function"]["name"] for schema in self._virtual_tools}
         self._task_list: DigestTaskList | None = None
 
     async def run(
@@ -393,9 +390,10 @@ class DigestAgent:
                 "## 目标",
                 "1. 读取任务清单，理解每个待内化项（insight 或 dirty_file）。",
                 "2. 按需通过 Serena 工具探索代码获取最新证据。",
-                "3. 用 read_annotation + write_annotation_patch 更新对应模块的 annotation。",
-                "4. 完成或跳过每个任务后，调用 mark_task_done / mark_task_skipped 记录结论。",
-                "5. 所有任务处理完毕后，调用 deliver(summary=...) 结束。",
+                "3. 优先用 read_annotation + write_annotation_and_mark_done 一次性更新 annotation 并完成任务。",
+                "4. 只有确实需要分步编辑时，才单独使用 write_annotation_patch；编辑完成后立刻 mark_task_done。",
+                "5. 完成或跳过每个任务后，调用 mark_task_done / mark_task_skipped 记录结论。",
+                "6. 所有任务处理完毕后，调用 deliver(summary=...) 结束。",
                 "",
                 "## 固定约束",
                 f"- annotation 固定章节不可删除：{fixed}",
@@ -405,6 +403,14 @@ class DigestAgent:
                 "- `append` 在指定章节末尾追加内容；target=null 时追加到文档末尾。",
                 "- 每个任务必须有明确结论（done 或 skipped），不允许静默跳过。",
                 "- mark_task_done / mark_task_skipped 的 note 字段必须填写。",
+                "",
+                "## 工作策略",
+                "- 先查看 task_id、module_slug、dirty_files、insight_summary，再决定是否需要 Serena。",
+                "- 若任务已给出 module_slug，先 read_annotation；只有 temporal_stale=true 或现有证据不足时再调用 Serena。",
+                "- 处理代码文件时优先使用 get_symbols_overview / find_symbol / search_for_pattern，避免大段 read_file。",
+                "- 同一 module_slug 的多个任务尽量连续处理，减少重复探索与重复写入。",
+                "- 一旦证据足够，立即调用 write_annotation_and_mark_done 或 mark_task_done 收尾，不要把收尾拖到最后。",
+                "- 若时间预算所剩不多且证据仍不足，调用 mark_task_skipped 写清原因，不要继续扩散探索。",
                 "",
                 "## 时序说明",
                 "- `temporal_stale=true` 表示该 insight 的采集时间早于文件变更，",
@@ -478,6 +484,9 @@ class DigestAgent:
                 "function": {
                     "name": "write_annotation_patch",
                     "description": (
+                        "仅在需要分步编辑、暂时还不打算结束任务时使用。"
+                        "常规完成任务请优先改用 write_annotation_and_mark_done。"
+                        "\n"
                         "更新模块 annotation 文档。"
                         "append: 追加到章节末尾（target=null 追加到文档末尾）；"
                         "replace: 替换整个章节正文（需在 content 中包含想保留的内容）；"
@@ -511,6 +520,41 @@ class DigestAgent:
             {
                 "type": "function",
                 "function": {
+                    "name": "write_annotation_and_mark_done",
+                    "description": (
+                        "推荐默认使用：先更新 annotation，再将任务原子化标记为 done。"
+                        "适合“证据已足够，准备收尾”的场景，可避免只写文档却忘记 mark done。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type": "string", "description": "任务 ID"},
+                            "note": {"type": "string", "description": "完成说明（必填）"},
+                            "module_slug": {
+                                "type": "string",
+                                "description": "模块 slug；省略时默认使用任务自身的 module_slug",
+                            },
+                            "operation": {
+                                "type": "string",
+                                "enum": ["append", "replace", "rewrite"],
+                                "description": "annotation 更新类型",
+                            },
+                            "target": {
+                                "type": ["string", "null"],
+                                "description": "目标 `##` 章节标题；rewrite 或末尾追加时为 null",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "待写入的 Markdown 内容",
+                            },
+                        },
+                        "required": ["task_id", "note", "operation", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "deliver",
                     "description": "提交本轮 digest 总结并结束循环。所有任务 resolved 后才能调用。",
                     "parameters": {
@@ -536,6 +580,7 @@ class DigestAgent:
         no_tool_retries = 0
         length_continuations = 0
         deliver_guard_used = False
+        budget_warning_used = False
         start = time.monotonic()
         round_num = 0
 
@@ -543,6 +588,24 @@ class DigestAgent:
             elapsed = time.monotonic() - start
             if elapsed >= self._max_seconds:
                 raise RuntimeError("DigestAgent ReAct 循环超时，已达最大时间预算")
+            remaining = self._max_seconds - elapsed
+            warn_threshold = min(
+                _BUDGET_WARNING_MAX_SECONDS,
+                max(_BUDGET_WARNING_MIN_SECONDS, self._max_seconds * _BUDGET_WARNING_RATIO),
+            )
+            if not budget_warning_used and remaining <= warn_threshold:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"时间预算仅剩约 {int(remaining)} 秒。请停止扩散探索：\n"
+                            "1) 对证据已足够的任务，立即用 write_annotation_and_mark_done 或 mark_task_done 收尾；\n"
+                            "2) 对暂时证据不足的任务，直接用 mark_task_skipped 说明原因；\n"
+                            "3) 不要再做大范围 Serena 探索，全部任务 resolved 后再 deliver。"
+                        ),
+                    }
+                )
+                budget_warning_used = True
             round_num += 1
             logger.info(
                 "DigestAgent round=%d elapsed=%.1fs pending=%d",
@@ -559,12 +622,12 @@ class DigestAgent:
                     break
                 except LLMCompletionError:
                     raise
-                except asyncio.TimeoutError:
+                except TimeoutError as exc:
                     timeout_retries += 1
                     if timeout_retries <= _MAX_TIMEOUT_RETRIES:
                         logger.warning("DigestAgent 模型调用超时，正在重试")
                         continue
-                    raise RuntimeError("DigestAgent 模型调用超时，重试次数耗尽")
+                    raise RuntimeError("DigestAgent 模型调用超时，重试次数耗尽") from exc
 
             message = _extract_message(response)
             if "role" not in message:
@@ -576,23 +639,28 @@ class DigestAgent:
                 length_continuations += 1
                 if length_continuations > _MAX_LENGTH_CONT:
                     raise RuntimeError("DigestAgent 输出连续被截断，已放弃本轮")
-                messages.append({
-                    "role": "user",
-                    "content": "输出被截断了，请继续完成剩余内容，并继续用工具调用处理任务。",
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "输出被截断了，请继续完成剩余内容，并继续用工具调用处理任务。",
+                    }
+                )
                 continue
 
             tool_calls = _extract_tool_calls(message)
             if not tool_calls:
                 no_tool_retries += 1
                 if no_tool_retries <= _MAX_NO_TOOL_RETRIES:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "你刚才没有调用工具。DigestAgent 必须通过工具处理任务，"
-                            "请用 read_task_list 查看任务，再继续操作。"
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "你刚才没有调用工具。DigestAgent 必须通过工具处理任务，"
+                                "请先用 read_task_list 查看任务，"
+                                "然后优先用 read_annotation / write_annotation_and_mark_done / mark_task_skipped 收尾。"
+                            ),
+                        }
+                    )
                     continue
                 raise RuntimeError("DigestAgent 连续未产生 tool_calls，已终止")
 
@@ -640,13 +708,17 @@ class DigestAgent:
                         }
                         for item in self._task_list.pending_items()
                     ]
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"还有 {len(pending)} 个未解决的任务，请继续处理后再 deliver：\n"
-                            f"{json.dumps(pending, ensure_ascii=False, indent=2)}"
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"还有 {len(pending)} 个未解决的任务，请继续处理后再 deliver。\n"
+                                "优先使用 write_annotation_and_mark_done 收尾；"
+                                "若证据不足则调用 mark_task_skipped，禁止继续空转：\n"
+                                f"{json.dumps(pending, ensure_ascii=False, indent=2)}"
+                            ),
+                        }
+                    )
                     deliver_guard_used = True
                     continue
                 if not self._task_list.all_resolved():
@@ -664,8 +736,7 @@ class DigestAgent:
     ) -> tuple[Any, str]:
         overrides = get_completion_overrides()
         model_chain = [
-            build_litellm_model(self._provider, m)
-            for m in [self._model, *self._model_fallbacks]
+            build_litellm_model(self._provider, m) for m in [self._model, *self._model_fallbacks]
         ]
         attempts: list[dict[str, str]] = []
 
@@ -685,16 +756,18 @@ class DigestAgent:
                 if idx > 0:
                     logger.info("DigestAgent 模型降级成功: %s", full_model)
                 return response, _extract_finish_reason(response)
-            except (asyncio.TimeoutError, litellm_exc.Timeout):
-                raise asyncio.TimeoutError("litellm timeout")
+            except (TimeoutError, litellm_exc.Timeout) as exc:
+                raise TimeoutError("litellm timeout") from exc
             except Exception as exc:
                 if not _should_fallback_model(exc):
                     raise
-                attempts.append({
-                    "model": full_model,
-                    "error_type": type(exc).__name__,
-                    "reason": _stringify_error(exc),
-                })
+                attempts.append(
+                    {
+                        "model": full_model,
+                        "error_type": type(exc).__name__,
+                        "reason": _stringify_error(exc),
+                    }
+                )
                 if idx < len(model_chain) - 1:
                     logger.warning("DigestAgent 模型调用失败，尝试降级: %s", full_model)
                     continue
@@ -786,12 +859,14 @@ class DigestAgent:
                 return _err("task_id 不能为空")
             if not note:
                 return _err("note 不能为空")
-            task = next((item for item in self._task_list.items if item.id == task_id), None)
+            task = self._find_task(task_id)
             if task is None:
                 return _err(f"未找到任务: {task_id}")
-            task.status = "done" if name == "mark_task_done" else "skipped"
-            task.note = note
-            await self._task_list.save(self._task_list_path)
+            await self._update_task_status(
+                task,
+                "done" if name == "mark_task_done" else "skipped",
+                note,
+            )
             return _ok(f"任务 {task_id} 已标记为 {task.status}")
 
         if name == "read_annotation":
@@ -810,9 +885,12 @@ class DigestAgent:
             if not module_slug:
                 return _err("module_slug 不能为空")
             try:
-                original = await self._load_annotation(module_slug)
-                updated = self._apply_patch(original, operation, target_str, content, module_slug)
-                await _write_file_atomic(self._annotation_path(module_slug), updated)
+                await self._write_annotation_patch(
+                    module_slug=module_slug,
+                    operation=operation,
+                    target=target_str,
+                    content=content,
+                )
                 return _ok(
                     f"annotation 已更新: module={module_slug}, operation={operation}, "
                     f"target={target_str!r}"
@@ -820,7 +898,74 @@ class DigestAgent:
             except Exception as e:
                 return _err(f"annotation 更新失败: {e}")
 
+        if name == "write_annotation_and_mark_done":
+            task_id = str(args.get("task_id") or "").strip()
+            note = str(args.get("note") or "").strip()
+            module_slug = str(args.get("module_slug") or "").strip()
+            operation = str(args.get("operation") or "").strip().lower()
+            target = args.get("target")
+            target_str = str(target).strip() if isinstance(target, str) and target.strip() else None
+            content = str(args.get("content") or "")
+            if not task_id:
+                return _err("task_id 不能为空")
+            if not note:
+                return _err("note 不能为空")
+            task = self._find_task(task_id)
+            if task is None:
+                return _err(f"未找到任务: {task_id}")
+            effective_module_slug = module_slug or (task.module_slug or "")
+            if not effective_module_slug:
+                return _err("module_slug 不能为空，且任务自身未提供 module_slug")
+            try:
+                await self._write_annotation_patch(
+                    module_slug=effective_module_slug,
+                    operation=operation,
+                    target=target_str,
+                    content=content,
+                )
+                await self._update_task_status(task, "done", note)
+                return _ok(
+                    f"annotation 已更新并完成任务: task={task_id}, "
+                    f"module={effective_module_slug}, operation={operation}, target={target_str!r}"
+                )
+            except Exception as e:
+                return _err(f"更新 annotation 并完成任务失败: {e}")
+
         return _err(f"未知虚拟工具: {name}")
+
+    def _find_task(self, task_id: str) -> DigestTaskItem | None:
+        assert self._task_list is not None
+        return next((item for item in self._task_list.items if item.id == task_id), None)
+
+    async def _update_task_status(
+        self,
+        task: DigestTaskItem,
+        status: str,
+        note: str,
+    ) -> None:
+        assert self._task_list is not None
+        prev_status = task.status
+        prev_note = task.note
+        task.status = status
+        task.note = note
+        try:
+            await self._task_list.save(self._task_list_path)
+        except Exception:
+            task.status = prev_status
+            task.note = prev_note
+            raise
+
+    async def _write_annotation_patch(
+        self,
+        *,
+        module_slug: str,
+        operation: str,
+        target: str | None,
+        content: str,
+    ) -> None:
+        original = await self._load_annotation(module_slug)
+        updated = self._apply_patch(original, operation, target, content, module_slug)
+        await _write_file_atomic(self._annotation_path(module_slug), updated)
 
     # ------------------------------------------------------------------
     # Annotation 解析 / patch / 渲染
@@ -895,9 +1040,7 @@ class DigestAgent:
         if not raw:
             return {
                 "title": module_slug,
-                "sections": [
-                    {"heading": h, "body_lines": []} for h in FIXED_SECTION_HEADINGS
-                ],
+                "sections": [{"heading": h, "body_lines": []} for h in FIXED_SECTION_HEADINGS],
             }
 
         # heading_index: 已出现的章节名 → sections 列表中的下标，用于重复章节合并
@@ -909,17 +1052,19 @@ class DigestAgent:
             if current_heading in heading_index:
                 # 重复章节：将内容合并到第一次出现的章节末尾
                 existing_section = sections[heading_index[current_heading]]
-                extra = [l for l in current_body if l.strip()]
+                extra = [line for line in current_body if line.strip()]
                 if extra:
                     if existing_section["body_lines"]:
                         existing_section["body_lines"].append("")
                     existing_section["body_lines"].extend(extra)
             else:
                 heading_index[current_heading] = len(sections)
-                sections.append({
-                    "heading": current_heading,
-                    "body_lines": current_body[:],
-                })
+                sections.append(
+                    {
+                        "heading": current_heading,
+                        "body_lines": current_body[:],
+                    }
+                )
 
         for line in raw.splitlines():
             if line.startswith("# ") and title == module_slug:
@@ -961,9 +1106,7 @@ class DigestAgent:
         return self._render_annotation(parsed)
 
     def _annotation_path(self, module_slug: str) -> Path:
-        return (
-            self._project_root / ".pce" / "annotations" / "modules" / f"{module_slug}.md"
-        )
+        return self._project_root / ".pce" / "annotations" / "modules" / f"{module_slug}.md"
 
 
 # ---------------------------------------------------------------------------
@@ -1038,9 +1181,7 @@ async def run_digest(
 
     # 只删除已被内化（done）的 insight；skipped 说明缺乏证据暂缓处理，保留供后续重试
     consumed_ids = [
-        item.insight_id
-        for item in task_list.items
-        if item.insight_id and item.status == "done"
+        item.insight_id for item in task_list.items if item.insight_id and item.status == "done"
     ]
     deleted_count = await insight_cache.delete_by_ids(consumed_ids)
 
