@@ -31,12 +31,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from pce.agent import (
+    PCEAgent,
+    _MAX_LENGTH_CONT,
+    _MAX_NO_TOOL_RETRIES,
+    _extract_message,
+    _parse_query_response,
+)
+from pce.agent_runtime.contracts import SpawnErrorCode
 
 # 加载 .env
 env_path = Path(__file__).parent.parent / ".env"
@@ -45,17 +56,7 @@ if env_path.exists():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
-            import os
             os.environ.setdefault(k.strip(), v.strip())
-
-from pce.agent import (
-    PCEAgent,
-    _MAX_LENGTH_CONT,
-    _MAX_NO_TOOL_RETRIES,
-    _MAX_TIMEOUT_RETRIES,
-    _parse_query_response,
-)
-from pce.agent_runtime.contracts import SpawnErrorCode
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -138,6 +139,41 @@ def make_deliver_tc(answer: str, confidence: str = "high") -> dict:
 
 def make_tool_tc(name: str = "find_symbol", args: dict | None = None) -> dict:
     return {"name": name, "args": args or {"query": "test"}}
+
+
+def make_model_dump_response(
+    *,
+    content: str | None = None,
+    tool_calls: list[dict] | None = None,
+    finish_reason: str = "tool_calls",
+) -> tuple[MagicMock, str]:
+    """构造 message 为对象且带 model_dump 的响应，用于验证 _extract_message 不丢 tool_calls。"""
+    tc_objects = []
+    if tool_calls:
+        for tc in tool_calls:
+            tc_obj = MagicMock()
+            tc_obj.id = tc.get("id", str(uuid.uuid4()))
+            fn = MagicMock()
+            fn.name = tc["name"]
+            fn.arguments = json.dumps(tc.get("args", {}))
+            tc_obj.function = fn
+            tc_objects.append(tc_obj)
+
+    message = MagicMock()
+    message.model_dump.return_value = {
+        "role": "assistant",
+        "content": content or "",
+    }
+    message.tool_calls = tc_objects
+    message.function_call = None
+
+    choice = MagicMock()
+    choice.message = message
+    choice.finish_reason = finish_reason
+
+    response = MagicMock()
+    response.choices = [choice]
+    return response, finish_reason
 
 
 # ── 核心测试运行器 ────────────────────────────────────────────────────────────
@@ -359,7 +395,7 @@ async def t12_timeout_retry_success():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            raise asyncio.TimeoutError()  # 第一次超时
+            raise TimeoutError()  # 第一次超时
         return make_response(tool_calls=[make_deliver_tc("答案H")])  # 重试成功
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
@@ -377,7 +413,7 @@ async def t13_timeout_exhausted():
     serena = make_serena_mock()
 
     async def always_timeout(messages, tools):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=always_timeout):
@@ -678,7 +714,6 @@ async def t20_spawn_invalid_json_args():
 
 def test_fallback_markers():
     """验证所有兜底标记都能被 _parse_query_response 正确识别"""
-    sid = str(uuid.uuid4())
     markers = {
         "__REACT_MAX_STEPS_EXCEEDED__": "步数",
         "__REACT_NO_TOOL_EXHAUSTED__": "未调用工具",
@@ -690,6 +725,13 @@ def test_fallback_markers():
     for marker, keyword in markers.items():
         r = _parse_query_response(marker)
         assert_in(f"fallback {marker}", keyword, r.markdown)
+
+
+def test_extract_message_preserves_model_dump_tool_calls():
+    response, _ = make_model_dump_response(tool_calls=[make_tool_tc("find_symbol", {"query": "x"})])
+    message = _extract_message(response)
+    assert "tool_calls" in message
+    assert len(message["tool_calls"]) == 1
 
 
 # ── 主程序 ────────────────────────────────────────────────────────────────────

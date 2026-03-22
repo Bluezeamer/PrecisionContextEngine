@@ -212,8 +212,14 @@ query 任务默认 Markdown 结构:
 - ...
 
 impact 任务默认 Markdown 结构:
-## 直接影响点
+## 直接调用点
 - `path:line` — 为什么这里会受影响
+
+## 数据契约/返回值消费者
+- `path:line` — 哪个返回值、字段、解析点或消费者会直接受影响
+
+## 间接传播链
+- `path:line` — 下游传递、UI 触发或后续消费链路
 
 ## 边界符号
 - `symbol` — `kind` — `path:line`
@@ -232,7 +238,29 @@ impact 任务默认 Markdown 结构:
 - 回答简洁精准,优先给出文件路径和行号定位
 - 使用固定标题,不要改写标题名称
 - impact 必须继续追踪 downstream 传播链,不要只停留在符号导入层
+- 只有工具证据直接确认过的定位才能写成 `path:line`; 若只确认到文件层,写 `path`，不要编造行号
+- 每条 bullet 只能绑定一个定位；说明必须只描述该定位所在文件中的直接行为，跨文件关系必须拆成多条
+- 在 deliver 前，应回读或检索你准备写出的每一个 `path:line`；无法复核的条目必须去掉行号
+- `直接调用点` 只写直接调用、直接解析、直接构造、直接字段消费的位置；按钮触发、页面跳转、后续流程归入“间接传播链”
+- `数据契约/返回值消费者` 只写返回值、响应字段、表单字段、序列化/反序列化等直接契约面
+- 不要用上游文件的位置去承载下游文件的行为；如果要描述前端接收，就必须列前端文件自己的定位
 - 若某项无法确认,写入“不确定项”,不要编造\
+"""
+
+IMPACT_STRATEGY_SYSTEM_PROMPT = """\
+你是 PCE 的 impact 前置策略分析器。
+
+职责：
+1. 仅根据任务描述判断当前 impact 更偏向 symbol-first、dataflow-first 还是 mixed。
+2. 给出“优先取证顺序”和“工具使用倾向”，用于指导后续主 Agent。
+3. 这是策略画像，不是最终答案；不要分析代码事实，不要假装已经验证过任何结论。
+
+要求：
+- 输出简短、克制、可直接嵌入提示词。
+- 不输出 JSON。
+- 不要写不存在的文件、行号、符号。
+- 工具使用建议只能表达“优先级和倾向”，不能写成硬性禁令。
+- 若任务语义同时包含符号边界与字段传播，请优先判定为 mixed。
 """
 
 # deliver 是一个虚拟工具,不转发给 Serena,由循环内部拦截处理
@@ -303,7 +331,9 @@ _INSIGHT_MAX_SCOPES = 3  # 每次 deliver 最多写入的 scope 数量
 # 不含 SYSTEM_PROMPT_HEADER 和工具 schema。
 # 计算方式：PCE_CONTEXT_WINDOW / 10，默认 200k / 10 = 20000。
 _SYSTEM_PROMPT_SOFT_LIMIT: int = get_system_prompt_soft_limit()
-_SYSTEM_PROMPT_TRUNCATED_NOTICE = "\n\n(以上内容因 system prompt token 预算限制已被截断，如需完整信息请通过工具按需读取)"
+_SYSTEM_PROMPT_TRUNCATED_NOTICE = (
+    "\n\n(以上内容因 system prompt token 预算限制已被截断，如需完整信息请通过工具按需读取)"
+)
 _SYSTEM_PROMPT_PLACEHOLDER = "(内容因 system prompt token 超限未注入，请通过工具按需读取)"
 _INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
 # 从文本中提取形如 pce/agent.py 或 ./src/foo.py:123 的路径
@@ -356,7 +386,11 @@ def _key_arg_preview(tool_name: str, args: dict[str, Any] | None) -> str:
         return tool_name
 
     truncated = value[:57].rstrip() + "..." if len(value) > 60 else value
-    return f"{tool_name}({display_key}={truncated!r})" if display_key else f"{tool_name}({truncated!r})"
+    return (
+        f"{tool_name}({display_key}={truncated!r})"
+        if display_key
+        else f"{tool_name}({truncated!r})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -450,18 +484,18 @@ def _extract_message(response: Any) -> dict[str, Any]:
     if message is None and isinstance(choice, dict):
         message = choice.get("message", {})
 
-        if hasattr(message, "model_dump"):
-            dumped = message.model_dump(exclude_none=False)
-            # 防御: model_dump 可能丢失 tool_calls 字段(某些模型返回格式差异)
-            if "tool_calls" not in dumped and hasattr(message, "tool_calls"):
-                tc = message.tool_calls
-                if tc is not None:
-                    dumped["tool_calls"] = tc
-            # 兼容旧版 function_call 格式
-            if "function_call" not in dumped and hasattr(message, "function_call"):
-                fc = message.function_call
-                if fc is not None:
-                    dumped["function_call"] = fc
+    if hasattr(message, "model_dump"):
+        dumped = message.model_dump(exclude_none=False)
+        # 防御: model_dump 可能丢失 tool_calls 字段(某些模型返回格式差异)
+        if "tool_calls" not in dumped and hasattr(message, "tool_calls"):
+            tc = message.tool_calls
+            if tc is not None:
+                dumped["tool_calls"] = tc
+        # 兼容旧版 function_call 格式
+        if "function_call" not in dumped and hasattr(message, "function_call"):
+            fc = message.function_call
+            if fc is not None:
+                dumped["function_call"] = fc
         # StepFun 等 provider 要求 assistant 消息的 content 字段必须存在
         if dumped.get("content") is None:
             dumped["content"] = ""
@@ -626,6 +660,393 @@ def _looks_like_markdown_sections(content: str) -> bool:
     return "## " in content
 
 
+_SECTION_TITLE_RE = re.compile(r"^##\s+(.+?)\s*$")
+_LOCATION_TOKEN_RE = re.compile(r"`((?:\./)?[A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::(\d+))?`")
+_KEYWORD_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]{2,}")
+_COMMENT_PREFIXES = ("#", "//", "/*", "*", "<!--")
+_GENERIC_LOCATION_WORDS = {
+    "backend",
+    "frontend",
+    "layer",
+    "order",
+    "result",
+    "value",
+    "data",
+    "path",
+    "line",
+    "jsonresponse",
+    "function",
+    "symbol",
+    "change",
+    "signature",
+    "target",
+}
+_GENERIC_STRATEGY_KEYS = {
+    "backend",
+    "frontend",
+    "modify",
+    "change",
+    "signature",
+    "delete",
+    "rename",
+    "field",
+    "file",
+    "target",
+    "function",
+    "response",
+    "request",
+    "return",
+    "data",
+}
+
+
+def _split_markdown_sections(content: str) -> list[tuple[str, list[str]]]:
+    """按二级标题切分 Markdown，保留每个 section 的原始行。"""
+    sections: list[tuple[str, list[str]]] = []
+    current_title: str | None = None
+    current_lines: list[str] = []
+
+    for line in content.splitlines():
+        matched = _SECTION_TITLE_RE.match(line)
+        if matched:
+            if current_title is not None:
+                sections.append((current_title, current_lines))
+            current_title = matched.group(1).strip()
+            current_lines = []
+            continue
+        current_lines.append(line)
+
+    if current_title is not None:
+        sections.append((current_title, current_lines))
+    return sections
+
+
+def _extract_location_keywords(bullet: str) -> list[str]:
+    """从 bullet 文本中提取用于纠偏的关键词。"""
+    text = _LOCATION_TOKEN_RE.sub(" ", bullet)
+    backticked = re.findall(r"`([^`]+)`", text)
+    keywords: list[str] = []
+    seen: set[str] = set()
+
+    def add_token(token: str) -> None:
+        normalized = token.strip().strip("`'\"").lower()
+        if len(normalized) < 3 or normalized in seen or normalized in _GENERIC_LOCATION_WORDS:
+            return
+        seen.add(normalized)
+        keywords.append(normalized)
+
+    for token in backticked:
+        for piece in _KEYWORD_TOKEN_RE.findall(token):
+            add_token(piece)
+    for piece in _KEYWORD_TOKEN_RE.findall(text):
+        add_token(piece)
+
+    lowered = text.lower()
+    if "接收" in text or "响应" in text or "receive" in lowered or "response" in lowered:
+        for hint in ("data.data", "res.json", ".value =", "await fetch", "await res.json"):
+            add_token(hint)
+    if "发送" in text or "传递" in text or "submit" in lowered or "post" in lowered:
+        for hint in ("json.stringify", "formdata", "fd.append", "await fetch", "/api/"):
+            add_token(hint)
+    if "调用" in text or "call" in lowered:
+        for hint in ("(", "return", "="):
+            add_token(hint)
+    return keywords
+
+
+def _score_line_window(lines: list[str], line_no: int, keywords: list[str]) -> int:
+    """对某行附近窗口进行关键词匹配打分。"""
+    if line_no < 1 or line_no > len(lines):
+        return -1
+    start = max(0, line_no - 2)
+    end = min(len(lines), line_no + 1)
+    window = "\n".join(lines[start:end]).lower()
+    exact = lines[line_no - 1].lower()
+    exact_hits = sum(1 for kw in keywords if kw in exact)
+    window_hits = sum(1 for kw in keywords if kw in window)
+    return exact_hits * 2 + window_hits
+
+
+def _line_looks_unreliable(lines: list[str], line_no: int) -> bool:
+    """判断某行是否像是注释/空行/装饰行，适合作为纠偏候选。"""
+    if line_no < 1 or line_no > len(lines):
+        return True
+    text = lines[line_no - 1].strip()
+    if not text:
+        return True
+    return text.startswith(_COMMENT_PREFIXES)
+
+
+def _find_better_line_in_file(
+    lines: list[str], claimed_line: int, keywords: list[str]
+) -> int | None:
+    """在文件内为某个 bullet 找更可信的行号；找不到则返回 None。"""
+    current_score = _score_line_window(lines, claimed_line, keywords)
+    current_unreliable = _line_looks_unreliable(lines, claimed_line)
+
+    best_line = claimed_line
+    best_score = current_score
+
+    for candidate in range(max(1, claimed_line - 3), min(len(lines), claimed_line + 3) + 1):
+        score = _score_line_window(lines, candidate, keywords)
+        if score > best_score:
+            best_score = score
+            best_line = candidate
+
+    if best_line != claimed_line and best_score > current_score:
+        return best_line
+
+    if not current_unreliable and current_score > 0:
+        return claimed_line
+
+    search_best_line = claimed_line
+    search_best_score = current_score
+    for idx in range(1, len(lines) + 1):
+        score = _score_line_window(lines, idx, keywords)
+        if score > search_best_score:
+            search_best_score = score
+            search_best_line = idx
+
+    if search_best_score > max(current_score, 0):
+        return search_best_line
+    return None if current_unreliable or current_score <= 0 else claimed_line
+
+
+def _normalize_location_token(
+    file_token: str,
+    line_token: str | None,
+    *,
+    project_root: Path | None,
+    bullet: str,
+) -> str:
+    """复核并修正 Markdown 中的 `path:line` 定位，失败时降级为 `path`。"""
+    file_path = file_token[2:] if file_token.startswith("./") else file_token
+    if project_root is None:
+        return f"`{file_path}:{line_token}`" if line_token else f"`{file_path}`"
+
+    abs_path = project_root / file_path
+    if not abs_path.exists() or not abs_path.is_file():
+        return f"`{file_path}`"
+    if not line_token:
+        return f"`{file_path}`"
+
+    try:
+        lines = abs_path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        try:
+            lines = abs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            return f"`{file_path}`"
+    except Exception:
+        return f"`{file_path}`"
+
+    claimed_line = _norm_line(line_token)
+    if claimed_line is None:
+        return f"`{file_path}`"
+
+    keywords = _extract_location_keywords(bullet)
+    better_line = _find_better_line_in_file(lines, claimed_line, keywords)
+    if better_line is None:
+        return f"`{file_path}`"
+    return f"`{file_path}:{better_line}`"
+
+
+def _post_validate_markdown_locations(
+    content: str, *, project_root: str | Path | None = None
+) -> str:
+    """对 Markdown 做轻量复核与纠偏，主要校验 `path:line`。"""
+    root_path = Path(project_root).resolve() if project_root else None
+    rebuilt_sections: list[str] = []
+
+    for title, lines in _split_markdown_sections(content):
+        rebuilt_sections.append(f"## {title}")
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("- "):
+                updated = _LOCATION_TOKEN_RE.sub(
+                    lambda m: _normalize_location_token(
+                        m.group(1), m.group(2), project_root=root_path, bullet=line
+                    ),
+                    line,
+                )
+                rebuilt_sections.append(updated)
+            else:
+                rebuilt_sections.append(line)
+        rebuilt_sections.append("")
+
+    return "\n".join(rebuilt_sections).strip()
+
+
+def _build_impact_task_prompt(target: str, change_type: str) -> str:
+    """构造 impact 任务提示词，强调先证据、后分层归类。"""
+    return "\n".join(
+        [
+            f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
+            "",
+            "任务要求:",
+            "1. 必须先使用 Serena 工具定位目标定义、所有直接引用点及关键边界符号。",
+            "2. 必须把结果拆分为：直接调用点、数据契约/返回值消费者、间接传播链。",
+            "3. 最终必须调用 deliver(answer=..., confidence=...)；"
+            "其中 answer 必须是结构化 Markdown 文本，不得输出 JSON、代码块或额外协议包装。",
+            "4. 只返回已被工具证实的信息；无法确认的内容写入“不确定项”，不要编造。",
+            "",
+            "证据约束:",
+            "- 只有被工具直接确认过的定位才能写成 `path:line`。",
+            "- 如果只确认到文件，写 `path`，不要猜测行号。",
+            "- 不要把目标定义文件的行号误写成调用点的行号。",
+            "- 每条 bullet 只能绑定一个定位，说明必须只描述该定位所在文件中的直接行为。",
+            "- 跨文件关系必须拆成多条，不要用上游文件的位置去承载下游文件的行为。",
+            "- 在 deliver 前，应回读或检索你准备写出的每一个 `path:line`；无法复核的条目必须去掉行号。",
+            "- 不要把按钮触发、页面入口、宏观流程误写成“直接调用点”，除非那里直接读取了目标符号或目标字段。",
+            "",
+            "deliver(answer=...) 的 Markdown 结构:",
+            "## 直接调用点",
+            "- `path:line` — 这里如何直接调用/解析/构造目标",
+            "",
+            "## 数据契约/返回值消费者",
+            "- `path:line` — 哪个字段、返回值、解析点或消费者会直接受影响",
+            "",
+            "## 间接传播链",
+            "- `path:line` — 下游传递、后续接口、UI 展示或其他间接消费",
+            "",
+            "## 边界符号",
+            "- `symbol` — `kind` — `path:line`",
+            "",
+            "## 风险",
+            "- 真实风险或回归面",
+            "",
+            "## 不确定项",
+            "- 仅记录工具证据不足的事项",
+            "",
+            "## 建议修改顺序",
+            "1. ...",
+            "",
+            "额外要求:",
+            "- `直接调用点` 只保留真正直接受影响的位置，不要把间接上下游混入这一节。",
+            "- `数据契约/返回值消费者` 优先覆盖：后端响应构造点、后端解析点、前端接收点、前端继续传递点。",
+            "- `间接传播链` 再记录 UI 消费点、后续流程和更远的传播链。",
+            "- `边界符号` 只保留关键定义点。",
+            "- `风险` 区块只放自然语言总结，不要嵌套结构化对象。",
+        ]
+    )
+
+
+def _build_impact_strategy_prompt(target: str, change_type: str) -> str:
+    """构造 impact 前置策略画像请求。"""
+    return "\n".join(
+        [
+            "请为下面这个 impact 任务生成一份很短的“策略画像”。",
+            "",
+            f"- target: {target}",
+            f"- change_type: {change_type}",
+            "",
+            "输出格式固定为：",
+            "## 策略画像",
+            "- task_profile: symbol-first | dataflow-first | mixed",
+            "- primary_evidence: 先取哪类证据",
+            "- secondary_evidence: 再补哪类证据",
+            "- tool_guidance: 推荐的工具使用倾向（强调优先级，不是禁令）",
+            "- pitfalls: 最容易犯的偏差或误判",
+            "",
+            "## 首轮证据计划",
+            "1. 先确认的第一类证据",
+            "2. 先确认的第二类证据",
+            "3. 先确认的第三类证据",
+            "",
+            "## 首轮检索键",
+            "1. 第一个最值得先搜的字面量或标识符",
+            "2. 第二个最值得先搜的字面量或标识符",
+            "3. 第三个最值得先搜的字面量或标识符",
+            "",
+            "限制：",
+            "- 每条只写一句",
+            "- 不要写文件行号",
+            "- 不要输出最终分析结论",
+        ]
+    )
+
+
+def _derive_strategy_search_keys(target: str) -> list[str]:
+    """从 target 中提取保守的默认检索键。"""
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add_key(value: str) -> None:
+        token = value.strip().strip("`'\"")
+        lowered = token.lower()
+        if not token or lowered in seen or lowered in _GENERIC_STRATEGY_KEYS or len(token) < 3:
+            return
+        seen.add(lowered)
+        keys.append(token)
+
+    for endpoint in re.findall(r"/api/[A-Za-z0-9_./-]+", target):
+        add_key(endpoint)
+    for identifier in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", target):
+        add_key(identifier)
+    return keys[:3]
+
+
+def _normalize_impact_strategy(text: str, *, target: str = "") -> str:
+    """将前置策略画像标准化为可注入的短 Markdown。"""
+    stripped = (text or "").strip()
+    fallback_keys = _derive_strategy_search_keys(target)
+    if not stripped:
+        return "\n".join(
+            [
+                "## 策略画像",
+                "- task_profile: mixed",
+                "- primary_evidence: 先确认直接调用/定义点，再确认字段或返回值消费者",
+                "- secondary_evidence: 补充下游传播链和 UI 消费点",
+                "- tool_guidance: 先按更可靠的证据类型取证，再视结果补另一类工具",
+                "- pitfalls: 不要过早总结，也不要把某一类工具当成唯一来源",
+                "",
+                "## 首轮证据计划",
+                "1. 先确认目标定义点或字段构造点。",
+                "2. 先确认最直接的调用点、解析点或接收点。",
+                "3. 再确认下游传递点、关键消费者或 UI 展示点。",
+                "",
+                "## 首轮检索键",
+                *[
+                    f"{idx}. {key}"
+                    for idx, key in enumerate(fallback_keys or ["layer_order"], start=1)
+                ],
+            ]
+        )
+    if "## 策略画像" not in stripped:
+        lines = [line.strip("- ").strip() for line in stripped.splitlines() if line.strip()]
+        stripped = "\n".join(["## 策略画像", *[f"- {line}" for line in lines[:5]]])
+    if "## 首轮证据计划" not in stripped:
+        stripped = "\n\n".join(
+            [
+                stripped,
+                "\n".join(
+                    [
+                        "## 首轮证据计划",
+                        "1. 先确认目标定义点或字段构造点。",
+                        "2. 先确认最直接的调用点、解析点或接收点。",
+                        "3. 再确认下游传递点、关键消费者或 UI 展示点。",
+                    ]
+                ),
+            ]
+        )
+    if "## 首轮检索键" not in stripped:
+        stripped = "\n\n".join(
+            [
+                stripped,
+                "\n".join(
+                    [
+                        "## 首轮检索键",
+                        *[
+                            f"{idx}. {key}"
+                            for idx, key in enumerate(fallback_keys or ["layer_order"], start=1)
+                        ],
+                    ]
+                ),
+            ]
+        )
+    return stripped
+
+
 def _render_query_markdown(body: str, *, fallback_note: str | None = None) -> str:
     body = body.strip() or "未能生成有效回答。"
     lines = [
@@ -650,7 +1071,13 @@ def _render_query_markdown(body: str, *, fallback_note: str | None = None) -> st
 def _render_impact_markdown(body: str, *, fallback_note: str | None = None) -> str:
     body = body.strip() or "分析结果无法解析。"
     lines = [
-        "## 直接影响点",
+        "## 直接调用点",
+        "- （未结构化提供）",
+        "",
+        "## 数据契约/返回值消费者",
+        "- （未结构化提供）",
+        "",
+        "## 间接传播链",
         "- （未结构化提供）",
         "",
         "## 边界符号",
@@ -668,12 +1095,53 @@ def _render_impact_markdown(body: str, *, fallback_note: str | None = None) -> s
     return "\n".join(lines).strip()
 
 
+def _extract_strategy_search_keys(strategy_markdown: str) -> list[str]:
+    """从策略块中提取首轮检索键。"""
+    keys: list[str] = []
+    in_section = False
+    for raw_line in strategy_markdown.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            in_section = line == "## 首轮检索键"
+            continue
+        if not in_section or not line:
+            continue
+        match = re.match(r"^(?:[-*]|\d+\.)\s*(.+)$", line)
+        if not match:
+            continue
+        key = match.group(1).strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys[:3]
+
+
+def _summarize_search_hits(pattern: str, raw: Any) -> str:
+    """将 search_for_pattern 结果压缩为短 Markdown 片段。"""
+    if not isinstance(raw, dict) or not raw:
+        return f"- 搜索 `{pattern}`：未找到直接命中"
+
+    lines = [f"- 搜索 `{pattern}`："]
+    shown = 0
+    for path, matches in raw.items():
+        if shown >= 3:
+            break
+        if not isinstance(matches, list) or not matches:
+            continue
+        snippet = str(matches[0]).strip()
+        snippet = snippet[:160] + "..." if len(snippet) > 160 else snippet
+        lines.append(f"  - `{path}` — {snippet}")
+        shown += 1
+    if shown == 0:
+        return f"- 搜索 `{pattern}`：未找到直接命中"
+    return "\n".join(lines)
+
+
 # ============================================================================
 # 响应解析
 # ============================================================================
 
 
-def _parse_query_response(content: str) -> QueryResponse:
+def _parse_query_response(content: str, *, project_root: str | Path | None = None) -> QueryResponse:
     """将 Agent 输出解析为 QueryResponse。"""
     _FALLBACK_ANSWERS = {
         "__REACT_MAX_STEPS_EXCEEDED__": "Agent 未能在限定步数内完成推理，请缩小问题范围后重试。",
@@ -689,12 +1157,16 @@ def _parse_query_response(content: str) -> QueryResponse:
 
     text = str(content).strip() if content else ""
     if _looks_like_markdown_sections(text):
-        return QueryResponse(markdown=text)
+        return QueryResponse(
+            markdown=_post_validate_markdown_locations(text, project_root=project_root)
+        )
 
     return QueryResponse(markdown=_render_query_markdown(text))
 
 
-def _parse_impact_response(content: str) -> ImpactResponse:
+def _parse_impact_response(
+    content: str, *, project_root: str | Path | None = None
+) -> ImpactResponse:
     """将 Agent 输出解析为 ImpactResponse。"""
     _FALLBACK_RISKS = {
         "__REACT_MAX_STEPS_EXCEEDED__": "Agent 未能在限定步数内完成影响分析，请缩小分析范围后重试。",
@@ -710,7 +1182,9 @@ def _parse_impact_response(content: str) -> ImpactResponse:
 
     text = str(content).strip() if content else ""
     if _looks_like_markdown_sections(text):
-        return ImpactResponse(markdown=text)
+        return ImpactResponse(
+            markdown=_post_validate_markdown_locations(text, project_root=project_root)
+        )
 
     return ImpactResponse(markdown=_render_impact_markdown(text))
 
@@ -958,11 +1432,16 @@ class PCEAgent:
 
         # 正常路径：只对可压缩的动态注入块做 token 估算（不含 HEADER 和工具 schema）
         # HEADER 和工具 schema 不可压缩、不应参与上限判断
-        dynamic_content = "\n\n".join(filter(None, [
-            structure_md.strip(),
-            annotations_index_md.strip(),
-            injected.strip(),
-        ]))
+        dynamic_content = "\n\n".join(
+            filter(
+                None,
+                [
+                    structure_md.strip(),
+                    annotations_index_md.strip(),
+                    injected.strip(),
+                ],
+            )
+        )
         token_count = litellm.token_counter(
             model=self._model,
             messages=[{"role": "system", "content": dynamic_content}],
@@ -1418,7 +1897,11 @@ class PCEAgent:
                     content_len = len(result_msg.get("content", ""))
                     logger.info(
                         "[req=%s] round=%d -> %s %.2fs %dchars",
-                        req_id, round_num, preview, elapsed_s, content_len,
+                        req_id,
+                        round_num,
+                        preview,
+                        elapsed_s,
+                        content_len,
                     )
                     tool_msg = {"role": "tool", **result_msg}
                     messages.append(tool_msg)
@@ -1512,7 +1995,10 @@ class PCEAgent:
                 messages.append(spawn_msg)
                 logger.info(
                     "[req=%s] round=%d -> spawn_agent ok=%s %.1fs",
-                    req_id, round_num, spawn_result.ok, spawn_result.elapsed_seconds,
+                    req_id,
+                    round_num,
+                    spawn_result.ok,
+                    spawn_result.elapsed_seconds,
                 )
                 if trace:
                     await trace.write(spawn_msg)
@@ -1546,7 +2032,9 @@ class PCEAgent:
                 messages.append(ack_msg)
                 logger.info(
                     "[req=%s] round=%d -> acknowledge_changes paths=%d",
-                    req_id, round_num, len(paths),
+                    req_id,
+                    round_num,
+                    len(paths),
                 )
                 if trace:
                     await trace.write(ack_msg)
@@ -1571,16 +2059,21 @@ class PCEAgent:
                 elapsed = time.monotonic() - start
                 logger.info(
                     "[req=%s] DELIVER confidence=%s elapsed=%.1fs rounds=%d",
-                    req_id, confidence, elapsed, round_num,
+                    req_id,
+                    confidence,
+                    elapsed,
+                    round_num,
                 )
                 if trace:
-                    await trace.write({
-                        "event": "deliver",
-                        "confidence": confidence,
-                        "elapsed_seconds": elapsed,
-                        "rounds": round_num,
-                        "answer": str(answer),
-                    })
+                    await trace.write(
+                        {
+                            "event": "deliver",
+                            "confidence": confidence,
+                            "elapsed_seconds": elapsed,
+                            "rounds": round_num,
+                            "answer": str(answer),
+                        }
+                    )
                 return str(answer), str(confidence) if confidence else None
 
             # 本轮仅有 Serena 工具调用，重置无工具计数，继续下一轮
@@ -1646,6 +2139,70 @@ class PCEAgent:
                 "_preview": preview,
             }
 
+    async def _plan_impact_strategy(
+        self,
+        *,
+        target: str,
+        change_type: str,
+        trace: _TraceWriter | None = None,
+    ) -> str:
+        """生成 impact 前置策略画像。失败时返回保守的默认策略。"""
+        prompt = _build_impact_strategy_prompt(target=target, change_type=change_type)
+        messages = [
+            {"role": "system", "content": IMPACT_STRATEGY_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response, _ = await self._completion(messages, [])
+            message = _extract_message(response)
+            strategy = _normalize_impact_strategy(str(message.get("content") or ""), target=target)
+            if trace:
+                await trace.write({"role": "system", "content": IMPACT_STRATEGY_SYSTEM_PROMPT})
+                await trace.write({"role": "user", "content": prompt})
+                await trace.write({"event": "impact_strategy", "content": strategy})
+            return strategy
+        except Exception as exc:
+            logger.warning("impact 前置策略画像失败，降级为默认策略: %s", exc)
+            strategy = _normalize_impact_strategy("", target=target)
+            if trace:
+                await trace.write(
+                    {
+                        "event": "impact_strategy_fallback",
+                        "reason": str(exc),
+                        "content": strategy,
+                    }
+                )
+            return strategy
+
+    async def _collect_impact_evidence_seeds(
+        self,
+        *,
+        strategy_markdown: str,
+        serena_client: SerenaClient,
+        trace: _TraceWriter | None = None,
+    ) -> str:
+        """依据策略块中的首轮检索键做轻量检索，生成证据种子。"""
+        search_keys = _extract_strategy_search_keys(strategy_markdown)
+        if not search_keys:
+            return "## 首轮证据种子\n- 未生成可执行的检索键，请主 Agent 自主规划取证。"
+
+        bullets: list[str] = ["## 首轮证据种子"]
+        for key in search_keys[:3]:
+            try:
+                raw = await serena_client.search_for_pattern(
+                    key,
+                    context_lines_before=1,
+                    context_lines_after=1,
+                )
+                bullets.append(_summarize_search_hits(key, raw))
+            except Exception as exc:
+                bullets.append(f"- 搜索 `{key}`：执行失败（{exc}）")
+
+        summary = "\n".join(bullets)
+        if trace:
+            await trace.write({"event": "impact_evidence_seeds", "content": summary})
+        return summary
+
     # ============================================================================
     # 公开接口
     # ============================================================================
@@ -1690,10 +2247,13 @@ class PCEAgent:
                 await trace.write({"role": "user", "content": question})
 
             answer, confidence = await self._run_react_loop(
-                messages, serena_client, acknowledge_cb, trace=trace,
+                messages,
+                serena_client,
+                acknowledge_cb,
+                trace=trace,
             )
             await self._persist_insights(question=question, answer=answer, confidence=confidence)
-            return _parse_query_response(answer)
+            return _parse_query_response(answer, project_root=serena_client.project_path)
         finally:
             if trace:
                 await trace.rotate()
@@ -1729,44 +2289,35 @@ class PCEAgent:
         token = _req_id_var.set(req_id)
         trace = _TraceWriter.from_env(req_id)
         try:
-            logger.info('[req=%s] IMPACT target="%s" change_type=%s', req_id, target[:80], change_type)
+            logger.info(
+                '[req=%s] IMPACT target="%s" change_type=%s', req_id, target[:80], change_type
+            )
             memory_path = Path(memory_root) if memory_root else None
             system_content = await self._build_system_prompt(memory_path)
+            strategy_note = await self._plan_impact_strategy(
+                target=target,
+                change_type=change_type,
+                trace=trace,
+            )
+            evidence_seed_note = await self._collect_impact_evidence_seeds(
+                strategy_markdown=strategy_note,
+                serena_client=serena_client,
+                trace=trace,
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_content},
             ]
 
-            # 构造影响分析专用提示词
-            prompt = "\n".join(
+            prompt = "\n\n".join(
                 [
-                    f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
-                    "",
-                    "任务要求:",
-                    "1. 必须先使用 Serena 工具定位目标定义、所有直接引用点及直接受影响的边界符号。",
-                    "2. 最终必须调用 deliver(answer=..., confidence=...)；"
-                    "其中 answer 必须是结构化 Markdown 文本，不得输出 JSON、代码块或额外协议包装。",
-                    "3. 只返回已被工具证实的信息；无法确认的内容写入“不确定项”，不要编造。",
-                    "",
-                    "deliver(answer=...) 的 Markdown 结构:",
-                    "## 直接影响点",
-                    "- `path:line` — 为什么这里会受影响",
-                    "",
-                    "## 边界符号",
-                    "- `symbol` — `kind` — `path:line`",
-                    "",
-                    "## 风险",
-                    "- 真实风险或回归面",
-                    "",
-                    "## 不确定项",
-                    "- 仅记录工具证据不足的事项",
-                    "",
-                    "## 建议修改顺序",
-                    "1. ...",
-                    "",
-                    "额外要求:",
-                    "- 直接影响点必须尽量覆盖：直接调用点、后端响应/解析点、前端接收点、前端继续传递点、UI消费点。",
-                    "- 边界符号只保留关键定义点。",
-                    "- 风险区块只放自然语言总结，不要嵌套结构化对象。",
+                    _build_impact_task_prompt(target=target, change_type=change_type),
+                    "以下是本轮任务的前置策略画像，请将其视为取证顺序建议，而不是硬性禁令：",
+                    strategy_note,
+                    "以下是根据首轮检索键预采集的证据种子，请优先消化这些证据后再扩展检索：",
+                    evidence_seed_note,
+                    "执行要求补充：",
+                    "- 在开始总结前，优先完成“首轮证据计划”中的确认动作。",
+                    "- 若首轮证据不足，再自行补充工具取证，不要机械拘泥于策略块。",
                 ]
             )
             messages.append({"role": "user", "content": prompt})
@@ -1776,10 +2327,13 @@ class PCEAgent:
                 await trace.write({"role": "user", "content": prompt})
 
             answer, confidence = await self._run_react_loop(
-                messages, serena_client, acknowledge_cb, trace=trace,
+                messages,
+                serena_client,
+                acknowledge_cb,
+                trace=trace,
             )
             await self._persist_insights(question=prompt, answer=answer, confidence=confidence)
-            return _parse_impact_response(answer)
+            return _parse_impact_response(answer, project_root=serena_client.project_path)
         finally:
             if trace:
                 await trace.rotate()
