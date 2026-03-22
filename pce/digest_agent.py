@@ -1,7 +1,7 @@
 """DigestAgent — 认知整合 Agent。
 
 在 pce_init / pce_sync 完成 Serena 索引重建后，将 InsightCache 积累的细粒度观察
-和 dirty_files 带来的代码变更，内化到 `.pce/annotations/modules/*.md` 中。
+和模块级代码变化事实，内化到 `.pce/annotations/modules/*.md` 中。
 
 设计原则：
 - 一次完整 ReAct 循环，Agent 自主决定探索和更新顺序
@@ -20,7 +20,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -128,9 +128,7 @@ class DigestTaskItem:
     kind: str  # "module"
     status: str  # "pending" | "done" | "skipped"
     note: str | None = None
-    temporal_stale: bool = False
     module_slug: str | None = None
-    dirty_files: list[str] = field(default_factory=list)
     digest_delta: ModuleDigestDelta | None = None
 
 
@@ -139,6 +137,33 @@ class DigestTaskList:
     items: list[DigestTaskItem]
     warnings: list[str]
     created_at: datetime
+
+    @staticmethod
+    def _summarize_item(item: DigestTaskItem) -> dict[str, Any]:
+        delta = item.digest_delta
+        changed_paths = [str(file_fact.path) for file_fact in delta.changed_files] if delta else []
+        insight_scopes = list(dict.fromkeys(insight.scope for insight in delta.related_insights)) if delta else []
+        changed_preview = changed_paths[:5]
+        insight_preview = insight_scopes[:5]
+        if len(changed_paths) > 5:
+            changed_preview.append(f"... (+{len(changed_paths) - 5} more)")
+        if len(insight_scopes) > 5:
+            insight_preview.append(f"... (+{len(insight_scopes) - 5} more)")
+
+        return {
+            "id": item.id,
+            "kind": item.kind,
+            "status": item.status,
+            "note": item.note,
+            "module_slug": item.module_slug,
+            "module_name": delta.module_name if delta is not None else None,
+            "changed_files_count": len(delta.changed_files) if delta is not None else 0,
+            "related_insights_count": len(delta.related_insights) if delta is not None else 0,
+            "external_context_count": len(delta.external_context) if delta is not None else 0,
+            "insight_only": bool(delta and not delta.changed_files and delta.related_insights),
+            "changed_paths_preview": changed_preview,
+            "insight_scopes_preview": insight_preview,
+        }
 
     def all_resolved(self) -> bool:
         return not any(item.status == "pending" for item in self.items)
@@ -162,29 +187,10 @@ class DigestTaskList:
         }
 
     def to_summary_dict(self) -> dict[str, Any]:
-        items: list[dict[str, Any]] = []
-        for item in self.items:
-            items.append(
-                {
-                    "id": item.id,
-                    "kind": item.kind,
-                    "status": item.status,
-                    "note": item.note,
-                    "temporal_stale": item.temporal_stale,
-                    "module_slug": item.module_slug,
-                    "dirty_files": list(item.dirty_files),
-                    "changed_files_count": (
-                        len(item.digest_delta.changed_files) if item.digest_delta is not None else 0
-                    ),
-                    "related_insights_count": (
-                        len(item.digest_delta.related_insights) if item.digest_delta is not None else 0
-                    ),
-                }
-            )
         return {
             "created_at": self.created_at.isoformat(),
             "warnings": list(self.warnings),
-            "items": items,
+            "items": [self._summarize_item(item) for item in self.items],
         }
 
     async def save(self, path: Path) -> None:
@@ -229,9 +235,7 @@ class DigestPlanner:
                 id=f"module:{delta.module_slug}",
                 kind="module",
                 status="pending",
-                temporal_stale=bool(delta.related_insights),
                 module_slug=delta.module_slug,
-                dirty_files=[str(file_fact.path) for file_fact in delta.changed_files],
                 digest_delta=delta,
             )
             for delta in module_deltas
@@ -397,7 +401,7 @@ class DigestAgent:
                 "- `append` 在指定章节末尾追加内容；target=null 时追加到文档末尾。",
                 "- 每个任务必须有明确结论（done 或 skipped），不允许静默跳过。",
                 "- mark_task_done / mark_task_skipped 的 note 字段必须填写。",
-                "- `digest_delta` 是模块级事实包，包含 annotation 基线、相关 insight、changed_files 与 patch_blocks。",
+                "- `digest_delta` 是模块级事实包，包含 annotation 基线、相关 insight、changed_files、patch_blocks 与必要的外部上下文提示。",
                 "",
                 "## 工作策略",
                 "- 先用 read_task_list 看摘要，再对当前要处理的任务调用 read_digest_delta(task_id)。",
@@ -411,8 +415,9 @@ class DigestAgent:
                 "- 若时间预算所剩不多且证据仍不足，调用 mark_task_skipped 写清原因，不要继续扩散探索。",
                 "",
                 "## 输入说明",
-                "- `temporal_stale=true` 表示该模块存在旧 insight 与新代码变更叠加，需优先校验 patch blocks 与 annotation 基线的一致性。",
-                "- `dirty_files` 是与该任务关联的最新改动文件，应优先核对。",
+                "- `changed_paths_preview` 是当前模块改动文件的预览，优先据此定位需要核对的 patch blocks。",
+                "- `related_insights_count>0` 表示该模块存在待内化的短期认知，需结合 annotation_baseline 校验是否已过时。",
+                "- `insight_only=true` 表示当前没有代码差异文件，重点是把已有 insight 稳定沉淀到 annotation。",
                 "- `changed_files_count=0` 不代表该任务无价值，通常表示“仅有 insight 待沉淀”的模块任务。",
                 "",
                 "## 当前任务清单",
@@ -711,13 +716,7 @@ class DigestAgent:
                 assert self._task_list is not None
                 if not self._task_list.all_resolved() and not deliver_guard_used:
                     pending = [
-                        {
-                            "id": item.id,
-                            "kind": item.kind,
-                            "module_slug": item.module_slug,
-                            "scope": item.scope,
-                            "dirty_files": item.dirty_files,
-                        }
+                        self._task_list._summarize_item(item)
                         for item in self._task_list.pending_items()
                     ]
                     messages.append(
@@ -1173,7 +1172,7 @@ async def run_digest(
     task_list = await planner.build(dirty_state)
 
     if not task_list.items:
-        logger.info("Digest 跳过：无 insight 也无 dirty_files")
+        logger.info("Digest 跳过：当前无可执行的模块级 delta")
         await _seed_initial_file_baselines_if_missing(project_root=project_root)
         # 仍然执行 cleanup 清除已 stale 的条目
         try:

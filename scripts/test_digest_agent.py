@@ -155,6 +155,13 @@ async def _test_task_summary_and_digest_delta_split() -> None:
     _assert("digest_delta" not in summary["items"][0], "任务摘要不应直接携带完整 digest_delta")
     _assert(summary["items"][0]["related_insights_count"] == 1, "任务摘要应保留 insight 数量")
     _assert(summary["items"][0]["changed_files_count"] == 0, "任务摘要应正确暴露 changed_files_count")
+    _assert(summary["items"][0]["insight_only"] is True, "insight-only 任务应被正确标记")
+    _assert(
+        summary["items"][0]["insight_scopes_preview"] == ["pce/core.py"],
+        "任务摘要应暴露 insight scope 预览",
+    )
+    _assert("temporal_stale" not in summary["items"][0], "任务摘要不应再暴露旧的 temporal_stale 字段")
+    _assert("dirty_files" not in summary["items"][0], "任务摘要不应再暴露旧的 dirty_files 字段")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -238,7 +245,7 @@ async def main() -> None:
                 "tests": [
                     "system prompt 包含原子化收尾、digest_delta 读取和 insight-only 内化指引",
                     "write_annotation_and_mark_done 可同时写 annotation 与持久化 done 状态",
-                    "read_task_list 与 read_digest_delta 已完成摘要/明细分离",
+                    "read_task_list 与 read_digest_delta 已完成摘要/明细分离，并移除旧字段摘要",
                     "annotation 扩展标题受控前缀约束已生效",
                 ],
             },

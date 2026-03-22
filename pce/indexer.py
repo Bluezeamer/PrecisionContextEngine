@@ -1,7 +1,7 @@
 """PCE 索引构建模块。
 
 负责构建三层索引:
-1. structure.md — 目录职责与模块清单
+1. structure.md — 项目结构导航
 2. references.json — 符号引用索引 (通过 save_index)
 3. annotations/index.md + annotations/modules/*.md — 渐进式项目认知导航
 
@@ -21,7 +21,9 @@ import logging
 import os
 import re
 import time
+import tomllib
 import uuid
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,7 @@ from .models import (
     FileMeta,
     IndexEntry,
     IndexSnapshot,
+    ModuleRegistry,
     ProjectMeta,
     ReferenceEdge,
     ReferenceRelation,
@@ -339,44 +342,664 @@ async def _atomic_write_text(path: Path, content: str) -> None:
 # ============================================================================
 
 
-def _build_structure_md(entries: list[IndexEntry]) -> str:
-    """生成 structure.md 文本内容。"""
-    # 收集顶层目录
-    top_dirs: dict[str, list[str]] = {}
+_STRUCTURE_STATE_FILE = "structure_state.json"
+_STRUCTURE_REQUIRED_HEADINGS: tuple[str, ...] = (
+    "## 项目形态概览",
+    "## 顶层区域",
+    "## 关键入口候选",
+    "## 模块对齐提示",
+    "## 导航建议",
+)
+_STRUCTURE_HEDGE_MARKERS: tuple[str, ...] = (
+    "候选",
+    "可优先",
+    "可先",
+    "可视为",
+    "可能",
+    "线索",
+    "提示",
+    "建议",
+)
+_STRUCTURE_CAUTIOUS_SECTION_HEADINGS: tuple[str, ...] = (
+    "## 项目形态概览",
+    "## 顶层区域",
+    "## 关键入口候选",
+    "## 模块对齐提示",
+)
+_FRONTEND_HINTS = frozenset({"frontend", "web", "ui", "client", "vite", "react", "vue"})
+_BACKEND_HINTS = frozenset({"backend", "api", "server", "service", "fastapi", "flask"})
+_SCRIPT_HINTS = frozenset({"script", "scripts", "tool", "tools", "cli", "cmd", "bin"})
+_TEST_HINTS = frozenset({"test", "tests", "spec", "specs"})
+_DOC_HINTS = frozenset({"doc", "docs", "design", "designs"})
+_CONFIG_HINTS = frozenset({"config", "configs", "setting", "settings", "env"})
+_ENTRY_FILE_PRIORITY: dict[str, tuple[int, str]] = {
+    "main.py": (100, "文件名命中 `main.*` 规则"),
+    "main.ts": (100, "文件名命中 `main.*` 规则"),
+    "main.js": (100, "文件名命中 `main.*` 规则"),
+    "main.rs": (100, "文件名命中 `main.*` 规则"),
+    "app.py": (96, "文件名命中 `app.*` 规则"),
+    "app.ts": (96, "文件名命中 `app.*` 规则"),
+    "app.js": (96, "文件名命中 `app.*` 规则"),
+    "server.py": (94, "文件名命中 `server.*` 规则"),
+    "server.ts": (94, "文件名命中 `server.*` 规则"),
+    "server.js": (94, "文件名命中 `server.*` 规则"),
+    "cli.py": (92, "文件名命中 `cli.*` 规则"),
+    "cli.ts": (92, "文件名命中 `cli.*` 规则"),
+    "cli.js": (92, "文件名命中 `cli.*` 规则"),
+    "__main__.py": (90, "文件名命中 Python 包入口规则"),
+    "lib.rs": (88, "文件名命中 Rust 库入口规则"),
+    "index.ts": (84, "文件名命中 `index.*` 规则"),
+    "index.js": (84, "文件名命中 `index.*` 规则"),
+}
+_DIRECTORY_HINT_GROUPS: tuple[tuple[frozenset[str], str], ...] = (
+    (_FRONTEND_HINTS, "路径 token 命中前端相关词"),
+    (_BACKEND_HINTS, "路径 token 命中服务端相关词"),
+    (_SCRIPT_HINTS, "路径 token 命中脚本/工具相关词"),
+    (_TEST_HINTS, "路径 token 命中测试相关词"),
+    (_DOC_HINTS, "路径 token 命中文档相关词"),
+    (_CONFIG_HINTS, "路径 token 命中配置相关词"),
+)
+_MISSING_COVERAGE_REPAIR_BATCH_SIZE = 24
+_MISSING_FACT_FULL_LINES = 60
+_MISSING_FACT_WINDOW_LINES = 20
+_MISSING_KIND_VALUES = {
+    "implementation",
+    "config",
+    "documentation",
+    "test",
+    "resource",
+    "shell",
+    "entrypoint",
+    "unknown",
+}
+
+
+def _structure_path(root_path: Path) -> Path:
+    return root_path / ".pce" / "structure.md"
+
+
+def _structure_state_path(root_path: Path) -> Path:
+    return root_path / ".pce" / _STRUCTURE_STATE_FILE
+
+
+def _tokenize_path_hint(raw: str) -> set[str]:
+    return {part for part in re.split(r"[\/_.-]+", raw.lower()) if part}
+
+
+def _compact_markdown_block(content: str) -> str:
+    normalized: list[str] = []
+    previous_blank = False
+    for raw in content.splitlines():
+        line = raw.rstrip()
+        blank = not line.strip()
+        if blank:
+            if previous_blank or not normalized:
+                continue
+            previous_blank = True
+            normalized.append("")
+            continue
+        previous_blank = False
+        normalized.append(line)
+    while normalized and not normalized[-1].strip():
+        normalized.pop()
+    return "\n".join(normalized).strip()
+
+
+def _select_representative_paths(entries: list[IndexEntry], max_items: int = 3) -> list[str]:
+    ranked = sorted(
+        entries,
+        key=lambda entry: (
+            len(Path(entry.file_meta.path).parts),
+            -len(entry.symbols),
+            -entry.file_meta.loc,
+            str(entry.file_meta.path),
+        ),
+    )
+    return [str(entry.file_meta.path) for entry in ranked[:max_items]]
+
+
+def _summarize_path_token_hints(tokens: set[str]) -> list[str]:
+    hints: list[str] = []
+    for candidates, label in _DIRECTORY_HINT_GROUPS:
+        matched = sorted(tokens & candidates)
+        if matched:
+            rendered = "/".join(f"`{item}`" for item in matched[:4])
+            hints.append(f"{label}（{rendered}）")
+    return hints
+
+
+def _format_language_summary(entries: list[IndexEntry], *, max_items: int = 4) -> str:
+    counter = Counter(entry.file_meta.language for entry in entries)
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    preview = [f"{lang}({count})" for lang, count in items[:max_items]]
+    if len(items) > max_items:
+        preview.append(f"... (+{len(items) - max_items} 种)")
+    return "、".join(preview) or "未知"
+
+
+def _describe_project_shape_candidate(
+    top_dir_entries: dict[str, list[IndexEntry]],
+    entry_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = sorted(directory for directory in top_dir_entries if directory != "./")
+    token_union: set[str] = set()
+    for directory in normalized:
+        token_union.update(_tokenize_path_hint(directory))
+
+    has_frontend = bool(token_union & _FRONTEND_HINTS)
+    has_backend = bool(token_union & _BACKEND_HINTS)
+    has_scripts = bool(token_union & _SCRIPT_HINTS)
+
+    if has_frontend and has_backend and has_scripts:
+        label = "前后端分层 + 工具链混合"
+    elif has_frontend and has_backend:
+        label = "前后端并存"
+    elif len(normalized) <= 1:
+        label = "单主目录"
+    elif len(normalized) >= 4:
+        label = "多目录混合"
+    else:
+        label = "多区域协作"
+
+    evidence = [
+        f"顶层目录 {len(normalized) + (1 if './' in top_dir_entries else 0)} 个",
+        f"入口候选 {len(entry_points)} 个",
+    ]
+    token_hints = _summarize_path_token_hints(token_union)
+    evidence.extend(token_hints[:3] if token_hints else ["未命中明显技术栈目录 token"])
+    return {"label": label, "evidence": evidence}
+
+
+def _build_top_level_candidates(top_dir_entries: dict[str, list[IndexEntry]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for directory, entries in sorted(top_dir_entries.items()):
+        tokens = _tokenize_path_hint(directory)
+        hints = _summarize_path_token_hints(tokens)
+        evidence = [f"文件数 {len(entries)}", f"语言分布 {_format_language_summary(entries, max_items=3)}"]
+        evidence.extend(hints[:2] if hints else ["未命中明显路径语义 token"])
+        candidates.append(
+            {
+                "path": directory,
+                "file_count": len(entries),
+                "representatives": _select_representative_paths(entries, max_items=3),
+                "evidence": evidence,
+            }
+        )
+    return candidates
+
+
+def _find_entry_points(entries: list[IndexEntry], *, max_items: int = 8) -> list[dict[str, Any]]:
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for entry in entries:
+        path = Path(entry.file_meta.path)
+        path_str = path.as_posix()
+        name = path.name.lower()
+        reason = ""
+        role_info = _ENTRY_FILE_PRIORITY.get(name)
+        if role_info is not None:
+            priority, reason = role_info
+        elif path.parent.name.lower() in {"bin", "cmd"}:
+            priority, reason = 80, "父目录命中 `bin/cmd` 规则"
+        elif name.startswith("test_"):
+            priority, reason = 48, "文件名命中测试脚本规则"
+        else:
+            continue
+
+        if "config" in name or name.endswith(".config.js") or name.endswith(".config.ts"):
+            continue
+        if path.parts and path.parts[0].lower() in {"docs", "doc"}:
+            continue
+        priority += max(0, 8 - len(path.parts))
+        candidates.append(
+            (
+                priority,
+                {
+                    "path": path_str,
+                    "evidence": [
+                        reason,
+                        f"路径深度 {len(path.parts)}",
+                        f"语言 {entry.file_meta.language}",
+                    ],
+                },
+            )
+        )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _, payload in sorted(candidates, key=lambda item: (-item[0], item[1]["path"])):
+        path_str = payload["path"]
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+        deduped.append(payload)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _select_core_areas(top_dir_entries: dict[str, list[IndexEntry]], *, max_items: int = 6) -> list[dict[str, Any]]:
+    areas: list[dict[str, Any]] = []
+
+    for directory, entries in top_dir_entries.items():
+        if directory == "./":
+            continue
+
+        nested_groups: dict[str, list[IndexEntry]] = defaultdict(list)
+        for entry in entries:
+            parts = Path(entry.file_meta.path).parts
+            if len(parts) >= 3:
+                nested_groups["/".join(parts[:2]) + "/"].append(entry)
+
+        selected_groups = [
+            (prefix, group_entries)
+            for prefix, group_entries in nested_groups.items()
+            if len(group_entries) >= 2
+        ]
+        if not selected_groups:
+            selected_groups = [(directory, entries)]
+
+        ranked_groups = sorted(
+            selected_groups,
+            key=lambda item: (
+                -len(item[1]),
+                -sum(len(entry.symbols) for entry in item[1]),
+                item[0],
+            ),
+        )
+        for prefix, group_entries in ranked_groups[:2]:
+            tokens = _tokenize_path_hint(prefix)
+            evidence = [
+                f"文件数 {len(group_entries)}",
+                f"符号数 {sum(len(entry.symbols) for entry in group_entries)}",
+                f"语言分布 {_format_language_summary(group_entries, max_items=3)}",
+            ]
+            evidence.extend(_summarize_path_token_hints(tokens)[:2])
+            areas.append(
+                {
+                    "prefix": prefix,
+                    "file_count": len(group_entries),
+                    "symbol_count": sum(len(entry.symbols) for entry in group_entries),
+                    "representatives": _select_representative_paths(group_entries, max_items=3),
+                    "evidence": evidence,
+                }
+            )
+
+    areas = sorted(
+        areas,
+        key=lambda item: (-item["file_count"], -item["symbol_count"], item["prefix"]),
+    )
+    return areas[:max_items]
+
+
+def _build_module_alignment_hints(
+    area_candidates: list[dict[str, Any]],
+    index_sections: list[dict[str, Any]],
+    *,
+    max_items: int = 6,
+) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    for area in area_candidates:
+        prefix = area["prefix"]
+        matched = [
+            section["name"]
+            for section in index_sections
+            if any(file_path.startswith(prefix) for file_path in section.get("file_paths", []))
+        ]
+        if not matched:
+            continue
+        hints.append(
+            {
+                "prefix": prefix,
+                "modules": _dedupe_keep_order(matched)[:4],
+                "evidence": [f"匹配到 {len(_dedupe_keep_order(matched))} 个模块章节"],
+            }
+        )
+        if len(hints) >= max_items:
+            break
+    return hints
+
+
+def _build_navigation_tips(
+    entry_points: list[dict[str, Any]],
+    area_candidates: list[dict[str, Any]],
+) -> list[str]:
+    tips: list[str] = []
+    if entry_points:
+        tips.append(f"若先确认运行链路，可先查看 `{entry_points[0]['path']}`。")
+    if len(entry_points) > 1:
+        tips.append(f"若首个入口线索不足，可继续查看 `{entry_points[1]['path']}`。")
+    if area_candidates:
+        tips.append(
+            "若先做结构定位，可优先浏览 "
+            + "、".join(f"`{area['prefix']}`" for area in area_candidates[:3])
+            + "。"
+        )
+    tips.append("若弱提示已足够，继续转到 `.pce/annotations/index.md` 按模块下钻。")
+    return tips
+
+
+def _build_structure_rule_bundle(
+    entries: list[IndexEntry],
+    *,
+    index_sections: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    top_dir_entries: dict[str, list[IndexEntry]] = {}
     for entry in entries:
         path = Path(entry.file_meta.path)
         parts = path.parts
         top_dir = f"{parts[0]}/" if len(parts) > 1 else "./"
-        top_dirs.setdefault(top_dir, []).append(path.as_posix())
+        top_dir_entries.setdefault(top_dir, []).append(entry)
 
-    lines = ["# 项目结构索引\n", "## 目录职责"]
-    for directory in sorted(top_dirs.keys()):
-        file_count = len(top_dirs[directory])
-        lines.append(f"- `{directory}` — {file_count} 个文件")
+    entry_points = _find_entry_points(entries)
+    area_candidates = _select_core_areas(top_dir_entries)
+    return {
+        "project_shape": _describe_project_shape_candidate(top_dir_entries, entry_points),
+        "top_level_candidates": _build_top_level_candidates(top_dir_entries),
+        "entrypoint_candidates": entry_points,
+        "area_candidates": area_candidates,
+        "module_alignment_hints": _build_module_alignment_hints(
+            area_candidates,
+            index_sections or [],
+        ),
+        "navigation_tips": _build_navigation_tips(entry_points, area_candidates),
+    }
 
-    lines.extend(
+
+def _render_rule_structure_md(bundle: dict[str, Any]) -> str:
+    lines = ["# 项目结构导航", "", "## 项目形态候选"]
+    shape = bundle["project_shape"]
+    lines.append(f"- 候选：{shape['label']}")
+    lines.extend(f"  - 依据：{item}" for item in shape["evidence"])
+
+    lines.extend(["", "## 顶层区域候选"])
+    for item in bundle["top_level_candidates"]:
+        representatives = "、".join(f"`{path}`" for path in item["representatives"]) or "(无)"
+        lines.append(f"- `{item['path']}`")
+        lines.extend(f"  - 观测：{evidence}" for evidence in item["evidence"])
+        lines.append(f"  - 代表：{representatives}")
+
+    lines.extend(["", "## 入口点候选"])
+    if bundle["entrypoint_candidates"]:
+        for item in bundle["entrypoint_candidates"]:
+            lines.append(f"- `{item['path']}`")
+            lines.extend(f"  - 依据：{evidence}" for evidence in item["evidence"])
+    else:
+        lines.append("- 暂未识别到明显入口点候选。")
+
+    lines.extend(["", "## 高密度代码区域候选"])
+    if bundle["area_candidates"]:
+        for item in bundle["area_candidates"]:
+            representatives = "、".join(f"`{path}`" for path in item["representatives"]) or "(无)"
+            lines.append(f"- `{item['prefix']}`")
+            lines.extend(f"  - 观测：{evidence}" for evidence in item["evidence"])
+            lines.append(f"  - 代表：{representatives}")
+    else:
+        lines.append("- 暂未识别到明显的高密度代码区域候选。")
+
+    lines.extend(["", "## 模块对齐提示"])
+    if bundle["module_alignment_hints"]:
+        for item in bundle["module_alignment_hints"]:
+            modules = "、".join(f"`{name}`" for name in item["modules"])
+            lines.append(f"- `{item['prefix']}` ↔ {modules}")
+            lines.extend(f"  - 依据：{evidence}" for evidence in item["evidence"])
+    else:
+        lines.append("- 暂无稳定的区域与模块对齐提示。")
+
+    lines.extend(["", "## 导航建议"])
+    lines.extend(f"- {tip}" for tip in bundle["navigation_tips"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _build_structure_refresh_signals(
+    bundle: dict[str, Any],
+    *,
+    index_sections: list[dict[str, Any]],
+    registry: ModuleRegistry,
+) -> dict[str, Any]:
+    active_records = [record for record in registry.records.values() if record.status == "active"]
+    return {
+        "project_shape": bundle["project_shape"]["label"],
+        "top_level_paths": [item["path"] for item in bundle["top_level_candidates"]],
+        "entrypoint_paths": [item["path"] for item in bundle["entrypoint_candidates"]],
+        "area_prefixes": [item["prefix"] for item in bundle["area_candidates"]],
+        "index_slugs": sorted(section["slug"] for section in index_sections),
+        "fallback_sections": sum(
+            1 for section in index_sections if section["name"].startswith("补充归类 ")
+        ),
+        "active_module_ids": sorted(record.module_id for record in active_records),
+        "active_module_slugs": sorted({record.slug for record in active_records}),
+    }
+
+
+async def _load_structure_state(root_path: Path) -> dict[str, Any] | None:
+    path = _structure_state_path(root_path)
+    if not path.exists():
+        return None
+    try:
+        raw = await asyncio.to_thread(path.read_text, "utf-8")
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+async def _save_structure_state(root_path: Path, signals: dict[str, Any]) -> None:
+    payload = {
+        "version": 1,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "signals": signals,
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    await _atomic_write_text(_structure_state_path(root_path), text)
+
+
+def _should_refresh_structure(
+    *,
+    existing_state: dict[str, Any] | None,
+    current_signals: dict[str, Any],
+    structure_exists: bool,
+    force: bool,
+) -> list[str]:
+    reasons: list[str] = []
+    if force:
+        reasons.append("force_refresh")
+    if not structure_exists:
+        reasons.append("structure_missing")
+
+    previous_signals = existing_state.get("signals") if isinstance(existing_state, dict) else None
+    if not isinstance(previous_signals, dict):
+        reasons.append("state_missing")
+        return reasons
+
+    watched_keys = {
+        "project_shape": "project_shape_changed",
+        "top_level_paths": "top_level_paths_changed",
+        "entrypoint_paths": "entrypoint_paths_changed",
+        "area_prefixes": "area_prefixes_changed",
+        "index_slugs": "index_slugs_changed",
+        "fallback_sections": "fallback_sections_changed",
+        "active_module_ids": "active_module_ids_changed",
+        "active_module_slugs": "active_module_slugs_changed",
+    }
+    for key, reason in watched_keys.items():
+        if previous_signals.get(key) != current_signals.get(key):
+            reasons.append(reason)
+    return reasons
+
+
+def _summarize_registry_for_structure(
+    registry: ModuleRegistry,
+    *,
+    max_items: int = 24,
+) -> str:
+    active_records = sorted(
+        (record for record in registry.records.values() if record.status == "active"),
+        key=lambda record: (record.slug, record.display_name),
+    )
+    lines = [f"- 活跃模块数：{len(active_records)}"]
+    for record in active_records[:max_items]:
+        file_preview = ", ".join(record.file_paths[:4]) or "(无覆盖文件)"
+        if len(record.file_paths) > 4:
+            file_preview += f", ... (+{len(record.file_paths) - 4} more)"
+        lines.append(
+            f"- {record.display_name} [{record.slug}] files={len(record.file_paths)} :: {file_preview}"
+        )
+    if len(active_records) > max_items:
+        lines.append(f"- ... (其余 {len(active_records) - max_items} 个模块省略)")
+    return "\n".join(lines)
+
+
+def _build_structure_md_prompt(
+    *,
+    rule_structure_md: str,
+    index_content: str,
+    registry_summary: str,
+) -> str:
+    return "\n".join(
         [
+            "你要基于规则骨架、模块导航和模块注册表，生成最终的 `structure.md`。",
+            "目标是为主 Agent 提供全局结构导航，而不是复述所有细节。",
             "",
-            "## 顶层模块清单",
-            "| 模块 | 文件 | 符号数 |",
-            "|------|------|--------|",
+            "输出要求：",
+            "- 输出 Markdown，不要代码块，不要额外解释。",
+            "- 第一行必须是 `# 项目结构导航`。",
+            "- 必须包含这些二级标题：`## 项目形态概览`、`## 顶层区域`、`## 关键入口候选`、`## 模块对齐提示`、`## 导航建议`。",
+            "- 所有章节都优先使用短 bullet，不要写大段总括段落。",
+            "- 表达必须保持克制，优先使用“候选 / 可优先查看 / 可视为 / 可能 / 线索 / 提示 / 建议”这类语气，避免过强断言。",
+            "- 不要写“就是 / 明确是 / 一定是 / 清晰区分 / 负责全部 / 由...构成”这类结论化表述。",
+            "- 以模块导航和注册表为主事实来源；规则骨架只作为弱提示，不要照抄其所有措辞。",
+            "- 不要输出全量文件枚举，不要输出符号表，不要输出无根据的架构结论。",
+            "",
+            "风格示例：",
+            "## 项目形态概览",
+            "- 可初步视为多区域协作型项目；线索：顶层目录分布较散，且存在多个入口候选。",
+            "",
+            "## 顶层区域",
+            "- `src/`：可优先作为主实现区域候选；线索：文件数较高，且与多个模块章节重叠。",
+            "",
+            "规则骨架：",
+            rule_structure_md.strip(),
+            "",
+            "模块导航：",
+            index_content.strip() or "(当前无 annotations/index.md)",
+            "",
+            "模块注册表摘要：",
+            registry_summary.strip(),
         ]
     )
-    for entry in sorted(entries, key=lambda e: str(e.file_meta.path)):
-        path = Path(entry.file_meta.path)
-        module = path.stem or path.name
-        file_path = path.as_posix()
-        symbol_count = len(entry.symbols)
-        lines.append(f"| {module} | {file_path} | {symbol_count} |")
-
-    return "\n".join(lines) + "\n"
 
 
-async def _write_structure_md(entries: list[IndexEntry], root_path: Path) -> None:
-    """将 structure.md 写入 .pce 目录。"""
-    path = root_path / ".pce" / "structure.md"
-    content = _build_structure_md(entries)
-    await _atomic_write_text(path, content)
+def _is_cautious_structure_markdown(content: str) -> bool:
+    compacted = _compact_markdown_block(content)
+    if not compacted.startswith("# 项目结构导航"):
+        return False
+    if not all(heading in compacted for heading in _STRUCTURE_REQUIRED_HEADINGS):
+        return False
+    # 至少出现若干弱提示标记，避免输出退化成强结论式总括。
+    marker_hits = sum(compacted.count(marker) for marker in _STRUCTURE_HEDGE_MARKERS)
+    if marker_hits < 6:
+        return False
+    current_heading = ""
+    for line in compacted.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            current_heading = stripped
+            continue
+        if current_heading not in _STRUCTURE_CAUTIOUS_SECTION_HEADINGS:
+            continue
+        if not stripped.startswith("- "):
+            continue
+        if not any(marker in stripped for marker in _STRUCTURE_HEDGE_MARKERS):
+            return False
+    return True
+
+
+async def _render_structure_markdown(
+    entries: list[IndexEntry],
+    *,
+    root_path: Path,
+    model: str | None,
+    force_refresh: bool,
+) -> tuple[str, dict[str, Any], list[str]]:
+    structure_path = _structure_path(root_path)
+    index_path = _annotation_index_path(root_path)
+    index_content = ""
+    if index_path.exists():
+        try:
+            index_content = await asyncio.to_thread(index_path.read_text, "utf-8")
+        except Exception:
+            index_content = ""
+    header, index_sections = _split_index_md(index_content) if index_content.strip() else ("# 项目认知导航", [])
+    _ = header  # 明示：这里只需要 sections
+
+    registry = await ModuleRegistryManager(root_path).load()
+    bundle = _build_structure_rule_bundle(entries, index_sections=index_sections)
+    rule_structure_md = _render_rule_structure_md(bundle)
+    current_signals = _build_structure_refresh_signals(
+        bundle,
+        index_sections=index_sections,
+        registry=registry,
+    )
+    existing_state = await _load_structure_state(root_path)
+    refresh_reasons = _should_refresh_structure(
+        existing_state=existing_state,
+        current_signals=current_signals,
+        structure_exists=structure_path.exists(),
+        force=force_refresh,
+    )
+    if not refresh_reasons and structure_path.exists():
+        return (
+            _compact_markdown_block(await asyncio.to_thread(structure_path.read_text, "utf-8")),
+            current_signals,
+            [],
+        )
+
+    content = rule_structure_md
+    if index_content.strip():
+        registry_summary = _summarize_registry_for_structure(registry)
+        llm_content = await _llm_complete_text(
+            _build_structure_md_prompt(
+                rule_structure_md=rule_structure_md,
+                index_content=_compact_markdown_block(index_content),
+                registry_summary=registry_summary,
+            ),
+            system_prompt=(
+                "你是代码库结构导航整理器。"
+                "你的职责是将规则骨架与模块导航整合成一个谨慎、可读、可用于初始化提示词的全局结构页。"
+            ),
+            model=model,
+            failure_log="structure.md 生成失败",
+        )
+        if llm_content:
+            compacted = _compact_markdown_block(llm_content)
+            if _is_cautious_structure_markdown(compacted):
+                content = compacted + "\n"
+            else:
+                logger.warning("structure.md LLM 输出未通过谨慎性校验，回退到 rule structure")
+
+    return content, current_signals, refresh_reasons
+
+
+async def _write_structure_md(
+    entries: list[IndexEntry],
+    root_path: Path,
+    *,
+    model: str | None = None,
+    force_refresh: bool = False,
+) -> None:
+    """在 annotation 生成后写入 structure.md。优先 LLM 归纳，失败时回退到规则骨架。"""
+    content, current_signals, refresh_reasons = await _render_structure_markdown(
+        entries,
+        root_path=root_path,
+        model=model,
+        force_refresh=force_refresh,
+    )
+    if not refresh_reasons and _structure_path(root_path).exists():
+        logger.info("structure.md 无需重算，沿用现有结果")
+        return
+    await _atomic_write_text(_structure_path(root_path), content)
+    await _save_structure_state(root_path, current_signals)
+    logger.info("structure.md 已更新: reasons=%s", ", ".join(refresh_reasons) or "unknown")
 
 
 # ============================================================================
@@ -706,6 +1329,137 @@ def _format_entry_outline(entry: IndexEntry) -> str:
     )
 
 
+def _extract_text_windows(text: str) -> dict[str, str]:
+    lines = text.splitlines()
+    if len(lines) <= _MISSING_FACT_FULL_LINES:
+        return {"full": "\n".join(lines).strip()}
+
+    head = "\n".join(lines[:_MISSING_FACT_WINDOW_LINES]).strip()
+    mid_start = max(0, (len(lines) // 2) - (_MISSING_FACT_WINDOW_LINES // 2))
+    middle = "\n".join(lines[mid_start: mid_start + _MISSING_FACT_WINDOW_LINES]).strip()
+    tail = "\n".join(lines[-_MISSING_FACT_WINDOW_LINES:]).strip()
+    return {
+        "head": head,
+        "middle": middle,
+        "tail": tail,
+    }
+
+
+def _extract_markdown_hints(text: str) -> list[str]:
+    hints: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            hints.append(stripped)
+        if len(hints) >= 4:
+            break
+    return hints
+
+
+def _extract_json_keys(text: str) -> list[str]:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        return [str(key) for key in list(payload.keys())[:8]]
+    return []
+
+
+def _extract_toml_keys(text: str) -> list[str]:
+    try:
+        payload = tomllib.loads(text)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        return [str(key) for key in list(payload.keys())[:8]]
+    return []
+
+
+def _extract_yaml_like_keys(text: str) -> list[str]:
+    keys: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*", stripped)
+        if match:
+            keys.append(match.group(1))
+        if len(keys) >= 8:
+            break
+    return keys
+
+
+def _extract_file_type_hints(path: Path, text: str) -> list[str]:
+    suffix = path.suffix.lower()
+    if suffix == ".md":
+        headings = _extract_markdown_hints(text)
+        return [f"Markdown headings: {', '.join(headings)}"] if headings else []
+    if suffix == ".json":
+        keys = _extract_json_keys(text)
+        return [f"JSON top-level keys: {', '.join(keys)}"] if keys else []
+    if suffix in {".toml"}:
+        keys = _extract_toml_keys(text)
+        return [f"TOML top-level keys: {', '.join(keys)}"] if keys else []
+    if suffix in {".yml", ".yaml"}:
+        keys = _extract_yaml_like_keys(text)
+        return [f"YAML-like keys: {', '.join(keys)}"] if keys else []
+    return []
+
+
+async def _build_missing_entry_fact(entry: IndexEntry, root_path: Path) -> dict[str, Any]:
+    rel_path = str(entry.file_meta.path)
+    abs_path = root_path / rel_path
+    fact: dict[str, Any] = {
+        "path": rel_path,
+        "language": entry.file_meta.language,
+        "loc": entry.file_meta.loc,
+        "symbol_summary": [
+            f"{sym.name}({sym.kind.value})" for sym in entry.symbols[:10]
+        ] or ["无显式符号"],
+    }
+
+    try:
+        text = await asyncio.to_thread(abs_path.read_text, "utf-8")
+    except Exception:
+        fact["content_windows"] = {"unavailable": "(文件内容读取失败或不可解码)"}
+        return fact
+
+    type_hints = _extract_file_type_hints(abs_path, text)
+    if type_hints:
+        fact["type_hints"] = type_hints
+    fact["content_windows"] = _extract_text_windows(text)
+    return fact
+
+
+def _format_missing_entry_fact_block(fact: dict[str, Any]) -> str:
+    lines = [
+        f"- path: {fact['path']}",
+        f"  language: {fact['language']}",
+        f"  loc: {fact['loc']}",
+        f"  symbol_summary: {', '.join(fact['symbol_summary'])}",
+    ]
+    type_hints = fact.get("type_hints") or []
+    for hint in type_hints:
+        lines.append(f"  type_hint: {hint}")
+
+    windows = fact.get("content_windows") or {}
+    if "full" in windows:
+        lines.append("  snippet_full:")
+        lines.append("```text")
+        lines.append(windows["full"])
+        lines.append("```")
+    else:
+        for key in ("head", "middle", "tail", "unavailable"):
+            if key not in windows:
+                continue
+            lines.append(f"  snippet_{key}:")
+            lines.append("```text")
+            lines.append(windows[key])
+            lines.append("```")
+    return "\n".join(lines)
+
+
 def _build_index_md_prompt(entries: list[IndexEntry], project_meta: ProjectMeta) -> str:
     """构建生成 annotations/index.md 的 LLM 提示词（含 in-context learning 示例）。"""
     summary_lines = [_format_entry_outline(entry) for entry in entries[:80]]
@@ -803,6 +1557,276 @@ def _build_module_assignment_prompt(entry: IndexEntry, index_content: str) -> st
             "- 不要输出 Markdown、代码块或解释",
         ]
     )
+
+
+def _build_missing_coverage_repair_prompt(
+    entry_facts: list[dict[str, Any]],
+    index_content: str,
+    known_slugs: set[str],
+) -> str:
+    fact_blocks = [_format_missing_entry_fact_block(fact) for fact in entry_facts]
+    return "\n".join(
+        [
+            "当前项目认知导航已有第一轮模块划分，但仍有少量文件未被任何模块覆盖。",
+            "请只处理这些遗漏文件，优先判断它们可能是什么性质，再决定是否应并入已有模块；只有确有必要时才创建新的补充模块。",
+            "注意：这里的 kind 与 action 都只是导航性推论，不是事实断言；若证据不足，优先 fallback。",
+            "",
+            "可用动作：",
+            "- attach: 并入已有模块（必须使用现有 module_slug）",
+            "- create: 创建一个新的补充模块（可让多个文件共享同一个 module_name）",
+            "- fallback: 暂不可靠归属，留给最终 fallback",
+            "",
+            "kind 可选值：",
+            "- implementation / config / documentation / test / resource / shell / entrypoint / unknown",
+            "",
+            "现有导航：",
+            index_content.strip(),
+            "",
+            "现有 module_slug 列表：",
+            ", ".join(sorted(known_slugs)) or "(无)",
+            "",
+            "遗漏文件 facts 包：",
+            *fact_blocks,
+            "",
+            "输出要求：",
+            '- 只输出 JSON，例如 {"decisions":[{"path":"src/main.py","kind":"entrypoint","action":"attach","module_slug":"agent-core"}]}',
+            "- path 必须来自 facts 包中的原文路径",
+            "- kind 必填，且必须来自给定 kind 列表",
+            "- attach 只能填现有 module_slug",
+            "- create 时必须提供 module_name，可选 responsibility；若多个文件属于同一新模块，请重复使用同一个 module_name",
+            "- 如果不确定，就用 fallback，不要勉强归类",
+            "- 不要输出 Markdown、代码块或解释",
+        ]
+    )
+
+
+def _build_additional_section(
+    module_name: str,
+    file_paths: list[str],
+    *,
+    responsibility: str | None = None,
+    slug: str | None = None,
+) -> dict[str, Any]:
+    normalized = _dedupe_keep_order(file_paths)
+    effective_slug = slug or ModuleRegistryManager.normalize_slug(module_name, file_paths=normalized)
+    responsibility_line = (
+        responsibility.strip()
+        if responsibility and responsibility.strip()
+        else "职责：该章节由二阶段补归属逻辑创建，用于承接第一轮主模块划分后仍遗漏、但具备独立语义的文件集合。"
+    )
+    return {
+        "name": module_name,
+        "slug": effective_slug,
+        "file_paths": normalized,
+        "body_lines": [
+            f"文件：{', '.join(normalized)}",
+            responsibility_line if responsibility_line.startswith("职责：") else f"职责：{responsibility_line}",
+            f"详细认知：.pce/annotations/modules/{effective_slug}.md",
+        ],
+    }
+
+
+def _ensure_unique_section_slug(base_slug: str, existing_slugs: set[str]) -> str:
+    if base_slug not in existing_slugs:
+        return base_slug
+    suffix = 2
+    while f"{base_slug}-{suffix}" in existing_slugs:
+        suffix += 1
+    return f"{base_slug}-{suffix}"
+
+
+def _parse_missing_coverage_repair_decisions(
+    content: str,
+    *,
+    candidate_paths: set[str],
+    known_slugs: set[str],
+) -> list[dict[str, str]]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    raw_items = payload.get("decisions") if isinstance(payload, dict) else None
+    if not isinstance(raw_items, list):
+        return []
+
+    decisions: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        action = str(item.get("action") or "").strip().lower()
+        if not path or path not in candidate_paths or path in seen_paths:
+            continue
+        if action not in {"attach", "create", "fallback"}:
+            continue
+        record: dict[str, str] = {"path": path, "action": action}
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in _MISSING_KIND_VALUES:
+            continue
+        record["kind"] = kind
+        if action == "attach":
+            slug = str(item.get("module_slug") or "").strip()
+            if slug not in known_slugs:
+                continue
+            record["module_slug"] = slug
+        elif action == "create":
+            module_name = str(item.get("module_name") or "").strip()
+            if not module_name:
+                continue
+            record["module_name"] = module_name
+            responsibility = str(item.get("responsibility") or "").strip()
+            if responsibility:
+                record["responsibility"] = responsibility
+        seen_paths.add(path)
+        decisions.append(record)
+    return decisions
+
+
+def _apply_missing_coverage_repair_decisions(
+    sections: list[dict[str, Any]],
+    entries_map: dict[str, IndexEntry],
+    decisions: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], set[str], list[str]]:
+    augmented = list(sections)
+    sections_by_slug = {section["slug"]: section for section in augmented}
+    changed_slugs: set[str] = set()
+
+    assigned_before = {
+        file_path
+        for section in augmented
+        for file_path in _dedupe_keep_order(section.get("file_paths", []))
+        if file_path in entries_map
+    }
+    unassigned_paths = sorted(path for path in entries_map if path not in assigned_before)
+    create_groups: dict[str, dict[str, Any]] = {}
+
+    for decision in decisions:
+        path = decision["path"]
+        action = decision["action"]
+        if path not in unassigned_paths:
+            continue
+        if action == "attach":
+            slug = decision["module_slug"]
+            section = sections_by_slug.get(slug)
+            if section is None:
+                continue
+            _update_section_file_list(section, section.get("file_paths", []) + [path])
+            changed_slugs.add(slug)
+            continue
+        if action == "create":
+            module_name = decision["module_name"]
+            responsibility = decision.get("responsibility") or ""
+            kind = decision.get("kind") or "unknown"
+            group = create_groups.setdefault(
+                module_name,
+                {"paths": [], "responsibility": responsibility, "kind": kind},
+            )
+            group["paths"].append(path)
+            if not group["responsibility"] and responsibility:
+                group["responsibility"] = responsibility
+            if not group["kind"] and kind:
+                group["kind"] = kind
+
+    existing_slugs = set(sections_by_slug.keys())
+    for module_name, payload in create_groups.items():
+        paths = _dedupe_keep_order(payload["paths"])
+        if not paths:
+            continue
+        slug = _ensure_unique_section_slug(
+            ModuleRegistryManager.normalize_slug(module_name, file_paths=paths),
+            existing_slugs,
+        )
+        section = _build_additional_section(
+            module_name,
+            paths,
+            responsibility=payload["responsibility"]
+            or f"该章节由二阶段补归属逻辑创建，当前更像 `{payload['kind']}` 类型的文件集合，仅供导航参考。",
+            slug=slug,
+        )
+        augmented.append(section)
+        sections_by_slug[slug] = section
+        existing_slugs.add(slug)
+        changed_slugs.add(slug)
+
+    final_assigned = {
+        file_path
+        for section in augmented
+        for file_path in _dedupe_keep_order(section.get("file_paths", []))
+        if file_path in entries_map
+    }
+    remaining = sorted(path for path in entries_map if path not in final_assigned)
+    return augmented, changed_slugs, remaining
+
+
+async def _supplement_unassigned_entries_with_llm(
+    sections: list[dict[str, Any]],
+    entries_map: dict[str, IndexEntry],
+    *,
+    root_path: Path,
+    model: str | None,
+) -> tuple[list[dict[str, Any]], set[str], list[str]]:
+    def _collect_unassigned_paths(current_sections: list[dict[str, Any]]) -> list[str]:
+        assigned = {
+            file_path
+            for section in current_sections
+            for file_path in _dedupe_keep_order(section.get("file_paths", []))
+            if file_path in entries_map
+        }
+        return sorted(path for path in entries_map if path not in assigned)
+
+    current_sections = list(sections)
+    pending = _collect_unassigned_paths(current_sections)
+    if not pending or model is None:
+        return current_sections, set(), pending
+
+    all_changed_slugs: set[str] = set()
+
+    while pending:
+        known_slugs = {section["slug"] for section in current_sections}
+        if not known_slugs:
+            break
+
+        batch_paths = pending[:_MISSING_COVERAGE_REPAIR_BATCH_SIZE]
+        batch_entries = [entries_map[path] for path in batch_paths if path in entries_map]
+        batch_facts = await asyncio.gather(
+            *[_build_missing_entry_fact(entry, root_path) for entry in batch_entries]
+        )
+        index_content = _render_index_md("# 项目认知导航", current_sections)
+        content = await _llm_complete_text(
+            _build_missing_coverage_repair_prompt(batch_facts, index_content, known_slugs),
+            system_prompt=(
+                "你是代码库模块补归属助手。"
+                "你的职责是在第一轮模块划分之后，只处理遗漏文件，先判断其性质(kind)，再谨慎决定 attach/create/fallback。"
+            ),
+            model=model,
+            failure_log="遗漏文件二阶段补归属失败",
+        )
+        if not content:
+            break
+
+        decisions = _parse_missing_coverage_repair_decisions(
+            content,
+            candidate_paths=set(batch_paths),
+            known_slugs=known_slugs,
+        )
+        if not decisions:
+            pending = pending[_MISSING_COVERAGE_REPAIR_BATCH_SIZE:]
+            continue
+
+        current_sections, changed_slugs, remaining = _apply_missing_coverage_repair_decisions(
+            current_sections,
+            entries_map,
+            decisions,
+        )
+        all_changed_slugs.update(changed_slugs)
+        pending = remaining
+
+        # 若本批没有实际消化任何文件，则避免死循环，继续处理下一批。
+        if not changed_slugs:
+            pending = pending[_MISSING_COVERAGE_REPAIR_BATCH_SIZE:]
+
+    return current_sections, all_changed_slugs, _collect_unassigned_paths(current_sections)
 
 
 def _build_fallback_index_md(entries: list[IndexEntry]) -> str:
@@ -922,10 +1946,28 @@ def _split_index_md(index_content: str) -> tuple[str, list[dict[str, Any]]]:
 
 def _render_index_md(header: str, sections: list[dict[str, Any]]) -> str:
     """将结构化章节列表渲染回 index.md 字符串。"""
+    def _normalize_body_lines(lines: list[str]) -> list[str]:
+        normalized: list[str] = []
+        previous_blank = False
+        for raw in lines:
+            line = raw.rstrip()
+            blank = not line.strip()
+            if blank:
+                if previous_blank or not normalized:
+                    continue
+                previous_blank = True
+                normalized.append("")
+                continue
+            previous_blank = False
+            normalized.append(line)
+        while normalized and not normalized[-1].strip():
+            normalized.pop()
+        return normalized
+
     lines = [header.strip() or "# 项目认知导航"]
     for section in sections:
         lines.extend(["", f"## {section['name']}"])
-        lines.extend(section["body_lines"])
+        lines.extend(_normalize_body_lines(section["body_lines"]))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1236,6 +2278,92 @@ def _dedupe_sections_by_slug(sections: list[dict[str, Any]]) -> list[dict[str, A
     return [merged[slug] for slug in order]
 
 
+def _normalize_section_name(name: str) -> str:
+    normalized = name.lower().replace("&", " and ")
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _section_body_signal(section: dict[str, Any]) -> int:
+    score = 0
+    for line in section.get("body_lines", []):
+        stripped = line.strip()
+        if stripped.startswith("职责："):
+            score += 3
+        elif stripped.startswith("文件：") or stripped.startswith("详细认知："):
+            score += 1
+        elif stripped:
+            score += 1
+    return score
+
+
+def _section_overlap_score(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_files = set(left.get("file_paths", []))
+    right_files = set(right.get("file_paths", []))
+    if not left_files or not right_files:
+        return 0.0
+    intersection = len(left_files & right_files)
+    union = len(left_files | right_files)
+    return intersection / union if union else 0.0
+
+
+def _should_merge_sections(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_name = _normalize_section_name(left["name"])
+    right_name = _normalize_section_name(right["name"])
+    left_files = set(left.get("file_paths", []))
+    right_files = set(right.get("file_paths", []))
+    if left_name == right_name:
+        return True
+
+    overlap = _section_overlap_score(left, right)
+    left_tokens = set(left_name.split())
+    right_tokens = set(right_name.split())
+    common = left_tokens & right_tokens
+    if overlap >= 0.45:
+        return bool(common) and (left_name in right_name or right_name in left_name or len(common) >= 2)
+
+    subset_relation = (
+        (left_files and left_files <= right_files)
+        or (right_files and right_files <= left_files)
+    )
+    return subset_relation and bool(common) and (left_name in right_name or right_name in left_name)
+
+
+def _prefer_section(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    left_rank = (
+        1 if not _is_fallback_section(left) else 0,
+        _section_body_signal(left),
+        len(left.get("file_paths", [])),
+    )
+    right_rank = (
+        1 if not _is_fallback_section(right) else 0,
+        _section_body_signal(right),
+        len(right.get("file_paths", [])),
+    )
+    return left if left_rank >= right_rank else right
+
+
+def _dedupe_semantic_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    for section in sections:
+        merged = False
+        for idx, existing in enumerate(deduped):
+            if not _should_merge_sections(existing, section):
+                continue
+            preferred = _prefer_section(existing, section)
+            other = section if preferred is existing else existing
+            _update_section_file_list(
+                preferred,
+                preferred.get("file_paths", []) + other.get("file_paths", []),
+            )
+            deduped[idx] = preferred
+            merged = True
+            break
+        if not merged:
+            deduped.append(section)
+    return deduped
+
+
 def _prepare_module_specs(
     sections: list[dict[str, Any]],
     entries_map: dict[str, IndexEntry],
@@ -1398,6 +2526,13 @@ async def _write_annotations(
         sections,
         await _load_sections_from_existing_module_docs(root_path),
     )
+    sections, _, _ = await _supplement_unassigned_entries_with_llm(
+        sections,
+        entries_map,
+        root_path=root_path,
+        model=model,
+    )
+    sections = _dedupe_semantic_sections(sections)
     sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
     sections = await _stabilize_sections_with_registry(
         sections,
@@ -1480,7 +2615,7 @@ async def _update_annotations_incremental(
         if slug:
             affected_slugs.add(slug)
 
-    # 新增文件（不在任何已知模块中）→ 尝试归属或创建临时章节
+    # 新增文件（不在任何已知模块中）→ 先尝试归属到既有模块，剩余项交给二阶段补归属
     for file_path in changed_files:
         if file_path in reverse_map:
             continue
@@ -1497,12 +2632,15 @@ async def _update_annotations_incremental(
             _update_section_file_list(section, section["file_paths"] + [file_path])
             affected_slugs.add(assigned_slug)
             logger.info(f"新增文件已归属既有模块: {file_path} -> {assigned_slug}")
-        else:
-            temp_section = _build_temporary_section(file_path)
-            sections.append(temp_section)
-            sections_by_slug[temp_section["slug"]] = temp_section
-            affected_slugs.add(temp_section["slug"])
-            logger.warning(f"新增文件归属判断失败，已追加临时章节: {file_path}")
+
+    sections, supplemental_slugs, _ = await _supplement_unassigned_entries_with_llm(
+        sections,
+        entries_map,
+        root_path=root_path,
+        model=model,
+    )
+    sections = _dedupe_semantic_sections(sections)
+    affected_slugs.update(supplemental_slugs)
 
     sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
     sections_by_slug = {section["slug"]: section for section in sections}
@@ -1761,7 +2899,6 @@ async def build_index(
 
     # 写入 Memory
     await save_index(snapshot, root_path=memory_root_path)
-    await _write_structure_md(entries, memory_root_path)
 
     logger.info(
         f"索引构建完成: {len(entries)} 个文件, "
@@ -1775,6 +2912,16 @@ async def build_index(
         await _write_annotations(entries, project_meta, memory_root_path, model=model)
     except Exception as e:
         logger.warning(f"写入项目认知导航失败(已降级): {e}")
+
+    try:
+        await _write_structure_md(
+            entries,
+            memory_root_path,
+            model=model,
+            force_refresh=True,
+        )
+    except Exception as e:
+        logger.warning(f"写入 structure.md 失败(已降级): {e}")
 
     return snapshot
 
@@ -1893,7 +3040,6 @@ async def build_index_incremental(
 
     # 写入 Memory
     await save_index(snapshot, root_path=memory_root_path)
-    await _write_structure_md(merged_entries, memory_root_path)
 
     logger.info(
         f"增量索引完成: {len(effective_changes)} 文件更新, "
@@ -1914,5 +3060,15 @@ async def build_index_incremental(
         )
     except Exception as e:
         logger.warning(f"增量更新项目认知导航失败(已降级): {e}")
+
+    try:
+        await _write_structure_md(
+            merged_entries,
+            memory_root_path,
+            model=model,
+            force_refresh=False,
+        )
+    except Exception as e:
+        logger.warning(f"增量更新 structure.md 失败(已降级): {e}")
 
     return snapshot

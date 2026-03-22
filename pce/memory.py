@@ -5,7 +5,7 @@
 文件布局:
 .pce/
 ├── meta.json              # 项目元数据
-├── structure.md           # 目录职责与模块清单
+├── structure.md           # 项目结构导航
 ├── references.json        # 符号引用索引
 └── annotations/
     ├── index.md           # 认知导航首页
@@ -42,15 +42,15 @@ ANNOTATIONS_DIR = "annotations"
 ANNOTATIONS_MODULES_DIR = "modules"
 
 # Markdown 模板
-STRUCTURE_TEMPLATE = """# PCE 项目结构索引
+STRUCTURE_TEMPLATE = """# PCE 项目结构导航
 
-> 本文件记录项目目录职责与模块清单,便于快速理解代码组织结构。
+> 本文件记录项目整体结构、关键入口点与导航建议，帮助快速建立宏观定位。
 
-## 目录职责
+## 项目形态概览
 
 (待索引器填充)
 
-## 顶层模块清单
+## 顶层目录职责
 
 (待索引器填充)
 """
@@ -148,7 +148,7 @@ async def _atomic_write_json(path: Path, payload: Any) -> None:
 
 async def _read_text(path: Path) -> str:
     """读取文本文件。"""
-    async with aiofiles.open(path, "r", encoding="utf-8") as f:
+    async with aiofiles.open(path, encoding="utf-8") as f:
         return await f.read()
 
 

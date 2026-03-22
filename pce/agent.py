@@ -19,19 +19,22 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Awaitable, Callable
 from typing import Any
-
-# 认知确认回调：接受文件路径列表，执行暂存区标记
-AcknowledgeCallback = Callable[[list[str]], Awaitable[None]]
 
 import aiofiles
 import litellm
 import litellm.exceptions as litellm_exc
 
+from ._env import (
+    build_litellm_model,
+    get_completion_overrides,
+    get_env_text,
+    get_system_prompt_soft_limit,
+)
 from .agent_runtime.contracts import (
     MAX_SPAWNS_PER_LOOP,
     SPAWN_AGENT_TOOL,
@@ -42,9 +45,11 @@ from .agent_runtime.contracts import (
 )
 from .agent_runtime.spawner import invoke_spawn
 from .insight_cache import InsightCache
-from .models import ImpactResponse, InsightConfidence, QueryResponse, ReferenceEdge, SymbolRef
+from .models import ImpactResponse, InsightConfidence, QueryResponse
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import build_litellm_model, get_completion_overrides, get_env_text, get_system_prompt_soft_limit
+
+# 认知确认回调：接受文件路径列表，执行暂存区标记
+AcknowledgeCallback = Callable[[list[str]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +378,7 @@ class _TraceWriter:
         self._path = trace_dir / f"{ts}_{req_id}.jsonl"
 
     @classmethod
-    def from_env(cls, req_id: str) -> "_TraceWriter | None":
+    def from_env(cls, req_id: str) -> _TraceWriter | None:
         """若 PCE_TRACE_DIR 已配置则创建实例，否则返回 None。"""
         raw = os.getenv("PCE_TRACE_DIR", "").strip()
         if not raw:
@@ -445,18 +450,18 @@ def _extract_message(response: Any) -> dict[str, Any]:
     if message is None and isinstance(choice, dict):
         message = choice.get("message", {})
 
-    if hasattr(message, "model_dump"):
-        dumped = message.model_dump(exclude_none=False)
-        # 防御: model_dump 可能丢失 tool_calls 字段(某些模型返回格式差异)
-        if "tool_calls" not in dumped and hasattr(message, "tool_calls"):
-            tc = getattr(message, "tool_calls")
-            if tc is not None:
-                dumped["tool_calls"] = tc
-        # 兼容旧版 function_call 格式
-        if "function_call" not in dumped and hasattr(message, "function_call"):
-            fc = getattr(message, "function_call")
-            if fc is not None:
-                dumped["function_call"] = fc
+        if hasattr(message, "model_dump"):
+            dumped = message.model_dump(exclude_none=False)
+            # 防御: model_dump 可能丢失 tool_calls 字段(某些模型返回格式差异)
+            if "tool_calls" not in dumped and hasattr(message, "tool_calls"):
+                tc = message.tool_calls
+                if tc is not None:
+                    dumped["tool_calls"] = tc
+            # 兼容旧版 function_call 格式
+            if "function_call" not in dumped and hasattr(message, "function_call"):
+                fc = message.function_call
+                if fc is not None:
+                    dumped["function_call"] = fc
         # StepFun 等 provider 要求 assistant 消息的 content 字段必须存在
         if dumped.get("content") is None:
             dumped["content"] = ""
@@ -865,13 +870,33 @@ class PCEAgent:
     async def _read_pce_file(self, path: Path) -> str:
         """读取 .pce 目录下的文件内容,文件不存在时返回占位文本。"""
         try:
-            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(path, encoding="utf-8") as f:
                 return await f.read()
         except FileNotFoundError:
             return f"(未找到 {path.name},索引尚未构建)"
         except Exception as e:
             logger.warning(f"读取文件失败: {path}: {e}")
             return f"(读取 {path.name} 失败)"
+
+    @staticmethod
+    def _compact_markdown_block(content: str) -> str:
+        """对静态注入块做格式级紧凑化，不改变语义内容。"""
+        normalized: list[str] = []
+        previous_blank = False
+        for raw in content.splitlines():
+            line = raw.rstrip()
+            blank = not line.strip()
+            if blank:
+                if previous_blank or not normalized:
+                    continue
+                previous_blank = True
+                normalized.append("")
+                continue
+            previous_blank = False
+            normalized.append(line)
+        while normalized and not normalized[-1].strip():
+            normalized.pop()
+        return "\n".join(normalized).strip()
 
     @staticmethod
     def _compose_system_prompt(structure_md: str, annotations_index_md: str, injected: str) -> str:
@@ -912,8 +937,12 @@ class PCEAgent:
         root = memory_root or Path.cwd()
         pce_dir = root / ".pce"
 
-        structure_md = await self._read_pce_file(pce_dir / "structure.md")
-        annotations_index_md = await self._read_pce_file(pce_dir / "annotations" / "index.md")
+        structure_md = self._compact_markdown_block(
+            await self._read_pce_file(pce_dir / "structure.md")
+        )
+        annotations_index_md = self._compact_markdown_block(
+            await self._read_pce_file(pce_dir / "annotations" / "index.md")
+        )
 
         injected = ""
         if self._insight_cache is not None:
@@ -1008,12 +1037,12 @@ class PCEAgent:
         缺失时默认 "stop"。
 
         Raises:
-            asyncio.TimeoutError: 单步超时（由上层 _run_react_loop 处理）
+            TimeoutError: 单步超时（由上层 _run_react_loop 处理）
             LLMCompletionError: 所有候选模型均失败（fallback chain 非空时）
             其他 litellm 异常: fallback chain 为空时原样透传
         """
-        # litellm.Timeout 不是 asyncio.TimeoutError 的子类，统一转换
-        _timeout_types = (asyncio.TimeoutError, litellm_exc.Timeout)
+        # litellm.Timeout 不是内置 TimeoutError 的子类，统一转换
+        _timeout_types = (TimeoutError, litellm_exc.Timeout)
         completion_overrides = get_completion_overrides()
 
         model_chain: list[str] = []
@@ -1034,8 +1063,8 @@ class PCEAgent:
                     ),
                     timeout=60.0,
                 )
-            except litellm_exc.Timeout:
-                raise asyncio.TimeoutError("litellm.Timeout -> asyncio.TimeoutError")
+            except litellm_exc.Timeout as exc:
+                raise TimeoutError("litellm.Timeout -> TimeoutError") from exc
             return response, _extract_finish_reason(response)
 
         # 有 fallback 时：逐个尝试，记录每次失败
@@ -1056,9 +1085,9 @@ class PCEAgent:
                 if idx > 0:
                     logger.info("模型降级成功: %s (第 %d 候选)", model, idx + 1)
                 return response, _extract_finish_reason(response)
-            except _timeout_types:
+            except _timeout_types as exc:
                 # 超时由上层统一处理，不纳入降级逻辑
-                raise asyncio.TimeoutError("timeout in _completion")
+                raise TimeoutError("timeout in _completion") from exc
             except Exception as exc:
                 if not _should_fallback_model(exc):
                     # 非模型级错误（如网络中断、JSON 解析失败等），直接透传
@@ -1221,7 +1250,7 @@ class PCEAgent:
         计数器独立，互不干扰:
           no_tool_retries      — LLM 无 tool_calls（无论 finish_reason）
           length_continuations — finish_reason=length 触发续写
-          timeout_retries      — 每步内独立，asyncio.TimeoutError
+          timeout_retries      — 每步内独立，TimeoutError
         """
         # 构建工具列表：Serena 只读工具 + 虚拟终止工具 + 可选工具
         tools_schema = serena_client.tools_schema + [self._deliver_tool]
@@ -1274,7 +1303,7 @@ class PCEAgent:
                 except LLMCompletionError as e:
                     logger.warning("模型降级链耗尽，终止 ReAct 循环: %s", e)
                     return "__REACT_LLM_EXHAUSTED__", None
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     timeout_retries += 1
                     if timeout_retries <= _MAX_TIMEOUT_RETRIES:
                         logger.warning(f"模型调用超时(第 {timeout_retries} 次),正在重试当前步骤")
