@@ -664,6 +664,7 @@ _SECTION_TITLE_RE = re.compile(r"^##\s+(.+?)\s*$")
 _LOCATION_TOKEN_RE = re.compile(r"`((?:\./)?[A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::(\d+))?`")
 _KEYWORD_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]{2,}")
 _COMMENT_PREFIXES = ("#", "//", "/*", "*", "<!--")
+_IMPORT_PREFIXES = ("from ", "import ")
 _GENERIC_LOCATION_WORDS = {
     "backend",
     "frontend",
@@ -682,6 +683,8 @@ _GENERIC_LOCATION_WORDS = {
     "target",
 }
 _GENERIC_STRATEGY_KEYS = {
+    "api",
+    "app",
     "backend",
     "frontend",
     "modify",
@@ -690,6 +693,8 @@ _GENERIC_STRATEGY_KEYS = {
     "delete",
     "rename",
     "field",
+    "layer",
+    "order",
     "file",
     "target",
     "function",
@@ -725,6 +730,10 @@ def _extract_location_keywords(bullet: str) -> list[str]:
     """从 bullet 文本中提取用于纠偏的关键词。"""
     text = _LOCATION_TOKEN_RE.sub(" ", bullet)
     backticked = re.findall(r"`([^`]+)`", text)
+    lowered = text.lower()
+    is_response_like = (
+        "响应" in text or "返回" in text or "response" in lowered or "return" in lowered
+    )
     keywords: list[str] = []
     seen: set[str] = set()
 
@@ -737,14 +746,28 @@ def _extract_location_keywords(bullet: str) -> list[str]:
 
     for token in backticked:
         for piece in _KEYWORD_TOKEN_RE.findall(token):
+            normalized_piece = piece.strip().strip("`'\"").lower()
+            if (
+                is_response_like
+                and re.fullmatch(r"[a-z_][a-z0-9_]*", normalized_piece)
+                and lowered.count(normalized_piece) < 2
+            ):
+                continue
             add_token(piece)
     for piece in _KEYWORD_TOKEN_RE.findall(text):
         add_token(piece)
 
-    lowered = text.lower()
-    if "接收" in text or "响应" in text or "receive" in lowered or "response" in lowered:
+    if "接收" in text or "receive" in lowered or "consumer" in lowered:
         for hint in ("data.data", "res.json", ".value =", "await fetch", "await res.json"):
             add_token(hint)
+    if is_response_like:
+        for hint in ("jsonresponse(", '"data":', "'data':", "data = {", "return {"):
+            add_token(hint)
+        for token in backticked:
+            normalized = token.strip().strip("`'\"").lower()
+            if re.fullmatch(r"[a-z_][a-z0-9_]*", normalized):
+                add_token(f'"{normalized}":')
+                add_token(f"'{normalized}':")
     if "发送" in text or "传递" in text or "submit" in lowered or "post" in lowered:
         for hint in ("json.stringify", "formdata", "fd.append", "await fetch", "/api/"):
             add_token(hint)
@@ -754,17 +777,52 @@ def _extract_location_keywords(bullet: str) -> list[str]:
     return keywords
 
 
+def _line_looks_like_import(lines: list[str], line_no: int) -> bool:
+    """识别单行导入或多行导入块中的一行。"""
+    if line_no < 1 or line_no > len(lines):
+        return False
+    text = lines[line_no - 1].strip().lower()
+    if text.startswith(_IMPORT_PREFIXES):
+        return True
+    for idx in range(max(1, line_no - 12), line_no):
+        prev = lines[idx - 1].strip().lower()
+        if prev.startswith(_IMPORT_PREFIXES):
+            return True
+        if prev.endswith(" import (") or prev.endswith(" import("):
+            return True
+    return False
+
+
 def _score_line_window(lines: list[str], line_no: int, keywords: list[str]) -> int:
     """对某行附近窗口进行关键词匹配打分。"""
     if line_no < 1 or line_no > len(lines):
         return -1
-    start = max(0, line_no - 2)
-    end = min(len(lines), line_no + 1)
-    window = "\n".join(lines[start:end]).lower()
     exact = lines[line_no - 1].lower()
-    exact_hits = sum(1 for kw in keywords if kw in exact)
-    window_hits = sum(1 for kw in keywords if kw in window)
-    return exact_hits * 2 + window_hits
+    context_lines = []
+    for idx in range(max(1, line_no - 2), min(len(lines), line_no + 1) + 1):
+        if idx == line_no:
+            continue
+        context_lines.append(lines[idx - 1])
+    window = "\n".join(context_lines).lower()
+
+    def keyword_weight(keyword: str) -> int:
+        if keyword.endswith('":') or keyword.endswith("':"):
+            return 4
+        if re.fullmatch(r"[a-z_][a-z0-9_]*", keyword):
+            return 2
+        return 1
+
+    def keyword_present(keyword: str, text: str) -> bool:
+        if re.fullmatch(r"[a-z_][a-z0-9_]*", keyword):
+            return re.search(rf"(?<![a-z0-9_]){re.escape(keyword)}(?![a-z0-9_])", text) is not None
+        return keyword in text
+
+    exact_hits = sum(keyword_weight(kw) for kw in keywords if keyword_present(kw, exact))
+    window_hits = sum(keyword_weight(kw) for kw in keywords if keyword_present(kw, window))
+    penalty = 0
+    if _line_looks_like_import(lines, line_no):
+        penalty -= 3
+    return exact_hits * 2 + window_hits + penalty
 
 
 def _line_looks_unreliable(lines: list[str], line_no: int) -> bool:
@@ -783,6 +841,10 @@ def _find_better_line_in_file(
     """在文件内为某个 bullet 找更可信的行号；找不到则返回 None。"""
     current_score = _score_line_window(lines, claimed_line, keywords)
     current_unreliable = _line_looks_unreliable(lines, claimed_line)
+    has_structural_keywords = any(re.search(r'["\'=:(){}.]', kw) for kw in keywords)
+    should_search_beyond_claimed = (
+        _line_looks_like_import(lines, claimed_line) and has_structural_keywords
+    )
 
     best_line = claimed_line
     best_score = current_score
@@ -796,7 +858,7 @@ def _find_better_line_in_file(
     if best_line != claimed_line and best_score > current_score:
         return best_line
 
-    if not current_unreliable and current_score > 0:
+    if not current_unreliable and current_score > 0 and not should_search_beyond_claimed:
         return claimed_line
 
     search_best_line = claimed_line
@@ -877,6 +939,51 @@ def _post_validate_markdown_locations(
     return "\n".join(rebuilt_sections).strip()
 
 
+def _should_filter_contract_bullet(title: str, line: str, *, target: str) -> bool:
+    """对字段传播类任务做 very light 去歧义，过滤同名本地表单/派生状态。"""
+    lowered_target = target.lower()
+    is_contract_task = (
+        "字段" in target
+        or "返回字段" in target
+        or "请求字段" in target
+        or "response field" in lowered_target
+        or "request field" in lowered_target
+        or "/api/" in target
+    )
+    if not is_contract_task:
+        return False
+    if title not in {"数据契约/返回值消费者", "间接传播链"}:
+        return False
+
+    lowered = line.lower()
+    if "form.value." in lowered or "form." in lowered or "本地表单" in line:
+        return True
+    if "派生状态" in line or "computed" in lowered or "derived" in lowered:
+        return True
+    return False
+
+
+def _post_filter_impact_markdown(content: str, *, target: str) -> str:
+    """对 impact Markdown 做轻量语义去歧义过滤。"""
+    rebuilt_sections: list[str] = []
+    for title, lines in _split_markdown_sections(content):
+        rebuilt_sections.append(f"## {title}")
+        kept = 0
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("- ") and _should_filter_contract_bullet(
+                title, line, target=target
+            ):
+                continue
+            rebuilt_sections.append(line)
+            if stripped.startswith("- "):
+                kept += 1
+        if title in {"数据契约/返回值消费者", "间接传播链"} and kept == 0:
+            rebuilt_sections.append("- （未结构化提供）")
+        rebuilt_sections.append("")
+    return "\n".join(rebuilt_sections).strip()
+
+
 def _build_impact_task_prompt(target: str, change_type: str) -> str:
     """构造 impact 任务提示词，强调先证据、后分层归类。"""
     return "\n".join(
@@ -898,6 +1005,8 @@ def _build_impact_task_prompt(target: str, change_type: str) -> str:
             "- 跨文件关系必须拆成多条，不要用上游文件的位置去承载下游文件的行为。",
             "- 在 deliver 前，应回读或检索你准备写出的每一个 `path:line`；无法复核的条目必须去掉行号。",
             "- 不要把按钮触发、页面入口、宏观流程误写成“直接调用点”，除非那里直接读取了目标符号或目标字段。",
+            "- 对字段传播 / 数据契约类任务，同名的本地表单字段、派生状态、临时变量默认不是主传播链；必须先确认它直接来源于目标字段，才能写入主链路。",
+            "- 若命中 `form.xxx`、局部 state、computed / derived value，仅能在确认其直接承接目标字段后再写入；否则应放入“不确定项”或忽略。",
             "",
             "deliver(answer=...) 的 Markdown 结构:",
             "## 直接调用点",
@@ -962,6 +1071,7 @@ def _build_impact_strategy_prompt(target: str, change_type: str) -> str:
             "- 每条只写一句",
             "- 不要写文件行号",
             "- 不要输出最终分析结论",
+            "- 若任务涉及字段传播或数据契约，请显式提醒区分“远端响应字段/请求字段”与“同名本地表单字段/派生状态”。",
         ]
     )
 
@@ -998,7 +1108,7 @@ def _normalize_impact_strategy(text: str, *, target: str = "") -> str:
                 "- primary_evidence: 先确认直接调用/定义点，再确认字段或返回值消费者",
                 "- secondary_evidence: 补充下游传播链和 UI 消费点",
                 "- tool_guidance: 先按更可靠的证据类型取证，再视结果补另一类工具",
-                "- pitfalls: 不要过早总结，也不要把某一类工具当成唯一来源",
+                "- pitfalls: 不要过早总结，也不要把某一类工具当成唯一来源；同名本地状态不自动等于目标字段",
                 "",
                 "## 首轮证据计划",
                 "1. 先确认目标定义点或字段构造点。",
@@ -1115,6 +1225,203 @@ def _extract_strategy_search_keys(strategy_markdown: str) -> list[str]:
     return keys[:3]
 
 
+_GENERIC_MATCH_TOKENS = {
+    "api",
+    "app",
+    "backend",
+    "body",
+    "component",
+    "config",
+    "const",
+    "data",
+    "default",
+    "field",
+    "file",
+    "form",
+    "frontend",
+    "function",
+    "handler",
+    "json",
+    "line",
+    "module",
+    "path",
+    "post",
+    "put",
+    "query",
+    "request",
+    "response",
+    "result",
+    "return",
+    "route",
+    "state",
+    "temp",
+    "tmp",
+    "update",
+    "value",
+}
+
+_RESPONSE_RECEIVE_MARKERS = (
+    ".json()",
+    "res.json",
+    "response.json",
+    "await fetch",
+    "axios.",
+    ".value = data",
+    ".value=data",
+    "setstate(",
+    "dispatch(",
+)
+_REQUEST_PROPAGATION_MARKERS = (
+    "append(",
+    "formdata",
+    "json.stringify",
+    "body:",
+    "payload",
+    "params",
+    "fetch(",
+    "axios.",
+    ".post(",
+    ".put(",
+    ".patch(",
+)
+_RESPONSE_CONSTRUCT_MARKERS = (
+    "return {",
+    "return{",
+    "jsonresponse",
+    "json_response",
+    "jsonify(",
+    "response(",
+    "payload = {",
+    "payload={",
+)
+_REQUEST_PARSE_MARKERS = (
+    "json.loads(",
+    "json.load(",
+    "request.form",
+    "request.json",
+    "await request.json",
+    "body.get(",
+    ".get(",
+    "deserialize",
+    "parse_",
+)
+_LOCAL_NOISE_MARKERS = (
+    "form.value.",
+    "form.",
+    "computed(",
+    "computed({",
+    "derived",
+    "usememo(",
+    "memo(",
+    "selector(",
+)
+
+
+def _extract_pattern_terms(pattern: str) -> list[str]:
+    """从检索键中提取较稳定的语义 token，用于轻量打分与注释。"""
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        token = value.strip().strip("`'\"").lower()
+        if not token or token in seen or token in _GENERIC_MATCH_TOKENS or len(token) < 3:
+            return
+        seen.add(token)
+        terms.append(token)
+
+    lowered = pattern.strip().strip("`'\"").lower()
+    if lowered:
+        add(lowered)
+    for part in re.split(r"[^a-z0-9_/-]+", lowered):
+        add(part)
+        if "/" in part:
+            for chunk in part.split("/"):
+                add(chunk)
+        if "-" in part:
+            add(part.replace("-", "_"))
+            for chunk in part.split("-"):
+                add(chunk)
+        if "_" in part:
+            for chunk in part.split("_"):
+                add(chunk)
+    return terms[:8]
+
+
+def _has_any_marker(lowered: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in lowered for marker in markers)
+
+
+def _classify_pattern_match(pattern: str, snippet: str) -> tuple[int, str]:
+    """对单条 pattern 命中做 very light 语义分类。"""
+    lowered = snippet.lower()
+    score = 0
+    terms = _extract_pattern_terms(pattern)
+
+    strong_term_hits = 0
+    for term in terms:
+        if term in lowered:
+            score += 1
+            strong_term_hits += 1
+        if f'"{term}"' in lowered or f"'{term}'" in lowered:
+            score += 2
+        if f".{term}" in lowered or f"[{term}]" in lowered:
+            score += 1
+
+    is_local_noise = _has_any_marker(lowered, _LOCAL_NOISE_MARKERS)
+    is_response_receive = _has_any_marker(lowered, _RESPONSE_RECEIVE_MARKERS)
+    is_request_propagation = _has_any_marker(lowered, _REQUEST_PROPAGATION_MARKERS)
+    is_response_construct = _has_any_marker(lowered, _RESPONSE_CONSTRUCT_MARKERS)
+    is_request_parse = _has_any_marker(lowered, _REQUEST_PARSE_MARKERS)
+
+    if is_response_receive:
+        score += 4
+    if is_request_propagation:
+        score += 3
+    if is_response_construct:
+        score += 3
+    if is_request_parse:
+        score += 3
+
+    if is_local_noise and not (
+        is_response_receive or is_request_propagation or is_response_construct or is_request_parse
+    ):
+        score -= 5
+
+    note = ""
+    if is_local_noise and not (
+        is_response_receive or is_request_propagation or is_response_construct or is_request_parse
+    ):
+        note = "（同名本地表单/派生状态候选，默认不视为主传播链）"
+    elif is_response_receive and strong_term_hits:
+        note = "（疑似接收/反序列化点）"
+    elif is_response_construct and strong_term_hits:
+        note = "（疑似响应构造点）"
+    elif is_request_propagation and strong_term_hits:
+        note = "（疑似继续传递点）"
+    elif is_request_parse and strong_term_hits:
+        note = "（疑似请求解析点）"
+    return score, note
+
+
+def _score_pattern_match(pattern: str, snippet: str) -> int:
+    """为 search_for_pattern 的单条命中打分，优先保留更像主传播链的条目。"""
+    score, _ = _classify_pattern_match(pattern, snippet)
+    return score
+
+
+def _pick_best_pattern_match(pattern: str, matches: list[Any]) -> str | None:
+    """从同一文件的多条 pattern 命中中选出最有代表性的一条。"""
+    best_snippet: str | None = None
+    best_score = -(10**9)
+    for raw in matches:
+        snippet = str(raw).strip()
+        score = _score_pattern_match(pattern, snippet)
+        if best_snippet is None or score > best_score:
+            best_snippet = snippet
+            best_score = score
+    return best_snippet
+
+
 def _summarize_search_hits(pattern: str, raw: Any) -> str:
     """将 search_for_pattern 结果压缩为短 Markdown 片段。"""
     if not isinstance(raw, dict) or not raw:
@@ -1127,9 +1434,13 @@ def _summarize_search_hits(pattern: str, raw: Any) -> str:
             break
         if not isinstance(matches, list) or not matches:
             continue
-        snippet = str(matches[0]).strip()
+        best = _pick_best_pattern_match(pattern, matches)
+        if best is None:
+            continue
+        snippet = best.strip()
         snippet = snippet[:160] + "..." if len(snippet) > 160 else snippet
-        lines.append(f"  - `{path}` — {snippet}")
+        _, note = _classify_pattern_match(pattern, snippet)
+        lines.append(f"  - `{path}` — {snippet}{note}")
         shown += 1
     if shown == 0:
         return f"- 搜索 `{pattern}`：未找到直接命中"
@@ -1165,7 +1476,7 @@ def _parse_query_response(content: str, *, project_root: str | Path | None = Non
 
 
 def _parse_impact_response(
-    content: str, *, project_root: str | Path | None = None
+    content: str, *, project_root: str | Path | None = None, target: str = ""
 ) -> ImpactResponse:
     """将 Agent 输出解析为 ImpactResponse。"""
     _FALLBACK_RISKS = {
@@ -1182,9 +1493,8 @@ def _parse_impact_response(
 
     text = str(content).strip() if content else ""
     if _looks_like_markdown_sections(text):
-        return ImpactResponse(
-            markdown=_post_validate_markdown_locations(text, project_root=project_root)
-        )
+        normalized = _post_validate_markdown_locations(text, project_root=project_root)
+        return ImpactResponse(markdown=_post_filter_impact_markdown(normalized, target=target))
 
     return ImpactResponse(markdown=_render_impact_markdown(text))
 
@@ -2333,7 +2643,11 @@ class PCEAgent:
                 trace=trace,
             )
             await self._persist_insights(question=prompt, answer=answer, confidence=confidence)
-            return _parse_impact_response(answer, project_root=serena_client.project_path)
+            return _parse_impact_response(
+                answer,
+                project_root=serena_client.project_path,
+                target=target,
+            )
         finally:
             if trace:
                 await trace.rotate()

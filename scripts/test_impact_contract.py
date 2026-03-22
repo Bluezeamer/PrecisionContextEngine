@@ -22,7 +22,10 @@ from pce.agent import (
     _normalize_impact_strategy,
     _parse_query_response,
     _parse_impact_response,
+    _pick_best_pattern_match,
+    _post_filter_impact_markdown,
     _post_validate_markdown_locations,
+    _score_pattern_match,
     _summarize_search_hits,
 )
 
@@ -53,6 +56,10 @@ def test_prompt_contract() -> None:
         "impact prompt 未要求 deliver 前复核引用定位",
     )
     _assert(
+        "同名的本地表单字段、派生状态、临时变量默认不是主传播链" in prompt,
+        "impact prompt 未约束同名本地状态去歧义",
+    )
+    _assert(
         "不要把目标定义文件的行号误写成调用点的行号" in prompt, "impact prompt 未约束错误行号漂移"
     )
 
@@ -65,6 +72,7 @@ def test_strategy_prompt_contract() -> None:
     _assert("## 策略画像" in prompt, "策略画像 prompt 缺少固定标题")
     _assert("## 首轮证据计划" in prompt, "策略画像 prompt 缺少首轮证据计划结构")
     _assert("## 首轮检索键" in prompt, "策略画像 prompt 缺少首轮检索键结构")
+    _assert("同名本地表单字段/派生状态" in prompt, "策略画像 prompt 未约束字段去歧义")
     _assert(
         "task_profile: symbol-first | dataflow-first | mixed" in prompt,
         "策略画像 prompt 缺少 task_profile 约束",
@@ -140,6 +148,55 @@ def test_summarize_search_hits() -> None:
     _assert("`backend/app.py`" in summary, "搜索摘要缺少后端命中")
 
 
+def test_summarize_search_hits_marks_local_form_candidate() -> None:
+    summary = _summarize_search_hits(
+        "theme_config",
+        {
+            "frontend/src/components/ControlPanel.vue": [
+                "  > 95:    return form.value.theme_config.split(',').map(s => s.trim()).filter(Boolean)"
+            ]
+        },
+    )
+    _assert("同名本地表单/派生状态候选" in summary, "搜索摘要未标注本地表单字段歧义")
+
+
+def test_pattern_match_scoring_prefers_main_chain() -> None:
+    _assert(
+        _score_pattern_match(
+            "theme_config",
+            "  > 578:    fd.append('theme_config', JSON.stringify(themeConfigResult.value.theme_config))",
+        )
+        > _score_pattern_match("theme_config", "  > 68:  theme_config: ''"),
+        "pattern 命中打分未优先主传播链条目",
+    )
+
+
+def test_pick_best_pattern_match_skips_local_default() -> None:
+    best = _pick_best_pattern_match(
+        "theme_config",
+        [
+            "  > 68:  theme_config: ''",
+            "  > 560:  if (!themeConfigResult.value || !themeConfigResult.value.theme_config) {",
+            "  > 578:    fd.append('theme_config', JSON.stringify(themeConfigResult.value.theme_config))",
+        ],
+    )
+    _assert(best is not None and "578" in best, "未优先挑选更像主传播链的 pattern 命中")
+
+
+def test_summarize_search_hits_uses_generic_semantic_notes() -> None:
+    summary = _summarize_search_hits(
+        "theme_config",
+        {
+            "backend/api.py": ['  > 88:    return {"theme_config": theme_config, "ok": True}'],
+            "frontend/src/App.vue": [
+                "  > 144: const data = await res.json(); themeConfigResult.value = data.data"
+            ],
+        },
+    )
+    _assert("疑似响应构造点" in summary, "通用摘要未标注响应构造点")
+    _assert("疑似接收/反序列化点" in summary, "通用摘要未标注接收/反序列化点")
+
+
 def test_fallback_structure() -> None:
     result = _parse_impact_response("__REACT_NO_TOOL_EXHAUSTED__")
     markdown = result.markdown
@@ -148,6 +205,25 @@ def test_fallback_structure() -> None:
     _assert("## 间接传播链" in markdown, "fallback 缺少“间接传播链”标题")
     _assert("## 边界符号" in markdown, "fallback 缺少“边界符号”标题")
     _assert("## 建议修改顺序" in markdown, "fallback 缺少“建议修改顺序”标题")
+
+
+def test_post_filter_removes_local_form_contract_noise() -> None:
+    markdown = "\n".join(
+        [
+            "## 数据契约/返回值消费者",
+            "- `frontend/src/App.vue:529` — 前端接收后端响应",
+            "",
+            "## 间接传播链",
+            "- `frontend/src/components/ControlPanel.vue:94` — 本地表单字段 `form.value.layer_order` 与目标字段同名",
+            "- `frontend/src/App.vue:578` — 前端继续传递点",
+        ]
+    )
+    filtered = _post_filter_impact_markdown(
+        markdown,
+        target="backend/app.py 中 /api/v2/layer-order 返回字段 layer_order",
+    )
+    _assert("form.value.layer_order" not in filtered, "字段传播题中的本地表单噪声未被过滤")
+    _assert("`frontend/src/App.vue:578`" in filtered, "真实传播链条目不应被误删")
 
 
 def test_post_validate_shifts_to_nearby_code_line() -> None:
@@ -232,6 +308,35 @@ def test_post_validate_prefers_response_receive_line() -> None:
         )
 
 
+def test_post_validate_avoids_import_line_for_response_construct() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sample = root / "backend" / "app.py"
+        sample.parent.mkdir(parents=True, exist_ok=True)
+        sample.write_text(
+            "\n".join(
+                [
+                    "from logic import auto_generate_layer_order",
+                    "",
+                    "def handler():",
+                    "    data = {",
+                    '        "layer_order": layer_order,',
+                    "    }",
+                    '    return JSONResponse({"data": data})',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        markdown = "\n".join(
+            [
+                "## 数据契约/返回值消费者",
+                "- `backend/app.py:1` — `layer_order` 返回值被放入响应数据的 `data` 字典中，通过 `JSONResponse` 返回给前端",
+            ]
+        )
+        normalized = _post_validate_markdown_locations(markdown, project_root=root)
+        _assert("`backend/app.py:4`" in normalized, "响应构造点不应被错误吸附到导入行")
+
+
 def test_query_response_uses_location_validation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -274,10 +379,18 @@ def main() -> None:
     test_strategy_prompt_contract()
     test_strategy_normalization_fallback()
     test_strategy_normalization_appends_missing_plan()
+    test_strategy_search_keys_extract()
+    test_derive_strategy_search_keys()
+    test_summarize_search_hits()
+    test_summarize_search_hits_marks_local_form_candidate()
+    test_pattern_match_scoring_prefers_main_chain()
+    test_pick_best_pattern_match_skips_local_default()
     test_fallback_structure()
+    test_post_filter_removes_local_form_contract_noise()
     test_post_validate_shifts_to_nearby_code_line()
     test_post_validate_downgrades_unverifiable_line()
     test_post_validate_prefers_response_receive_line()
+    test_post_validate_avoids_import_line_for_response_construct()
     test_query_response_uses_location_validation()
     print("impact contract tests passed")
 
