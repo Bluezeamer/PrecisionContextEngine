@@ -17,22 +17,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 import json
 import logging
+import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from watchfiles import Change, awatch
 
-from .indexer import CODE_EXTENSIONS, SKIP_DIRS
+from .file_discovery import (
+    HARD_SKIP_DIRS,
+    should_track_deleted_path,
+    should_track_existing_file,
+)
 
 logger = logging.getLogger(__name__)
-
-# 文件监听过滤：只关注代码文件变更
-_WATCH_EXTENSIONS = CODE_EXTENSIONS
 
 
 # ============================================================================
@@ -90,10 +91,17 @@ class StagingArea:
         条目语义：存在于暂存区 = Memory 尚未包含该文件的最新认知。
         增量索引完成后由 acknowledge_after_reindex 移除。
         """
+        if deleted:
+            if not should_track_deleted_path(rel_path):
+                return
+        else:
+            if not should_track_existing_file(self.project_root, rel_path):
+                return
+
         async with self._lock:
             payload = await self._read()
             files: dict[str, Any] = payload.setdefault("files", {})
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(UTC).isoformat()
 
             if deleted:
                 files[rel_path] = {
@@ -180,7 +188,7 @@ class StagingArea:
         async with self._lock:
             payload = await self._read()
             files = payload.get("files", {})
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(UTC).isoformat()
 
             for path in paths:
                 record = files.get(path)
@@ -351,16 +359,9 @@ class FileWatcher:
 
 
 def _watch_filter(change: Change, path: str) -> bool:
-    """watchfiles 过滤器：只监听代码文件，跳过 SKIP_DIRS。"""
+    """watchfiles 过滤器：只过滤内建硬规则目录，其余交给 record_change 判定。"""
     p = Path(path)
-    # 跳过不关注的目录
-    if any(part in SKIP_DIRS for part in p.parts):
-        return False
-    # 删除事件无法检查后缀，放行（record_change 会处理）
-    if change == Change.deleted:
-        return True
-    # 只关注代码文件
-    return p.suffix.lower() in _WATCH_EXTENSIONS
+    return not any(part in HARD_SKIP_DIRS for part in p.parts)
 
 
 async def _hash_file(path: Path) -> str:

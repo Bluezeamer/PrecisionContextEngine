@@ -78,6 +78,17 @@ class ModuleRegistryManager:
                 result.append(item)
         return result
 
+    @classmethod
+    def _merge_historical_paths(
+        cls,
+        *,
+        existing_current: list[str],
+        existing_historical: list[str],
+        new_current: list[str],
+    ) -> list[str]:
+        """合并历史路径，保留删除/迁移前的归属锚点。"""
+        return cls._dedupe_keep_order([*existing_historical, *existing_current, *new_current])
+
     @staticmethod
     def _score_match(
         record: ModuleRecord,
@@ -144,6 +155,11 @@ class ModuleRegistryManager:
             if display_name != record.display_name and display_name not in record.aliases:
                 record.aliases.append(record.display_name)
                 record.display_name = display_name
+            record.historical_file_paths = self._merge_historical_paths(
+                existing_current=record.file_paths,
+                existing_historical=record.historical_file_paths,
+                new_current=normalized_files,
+            )
             record.file_paths = normalized_files
             record.key_symbols = normalized_symbols
             record.updated_at = now
@@ -157,6 +173,7 @@ class ModuleRegistryManager:
             slug=slug,
             display_name=display_name,
             file_paths=normalized_files,
+            historical_file_paths=normalized_files,
             key_symbols=normalized_symbols,
             created_at=now,
             updated_at=now,
@@ -166,3 +183,29 @@ class ModuleRegistryManager:
         registry.records[module_id] = record
         await self.save(registry)
         return record
+
+    async def build_file_owner_maps(
+        self,
+    ) -> tuple[ModuleRegistry, dict[str, ModuleRecord], dict[str, ModuleRecord]]:
+        """返回当前文件映射与历史文件映射。
+
+        规则：
+        - `current_map` 只包含当前 file_paths。
+        - `historical_map` 包含 historical_file_paths 与 current file_paths。
+        - 若同一路径同时存在于当前映射与历史映射，调用方应优先采用当前映射。
+        """
+        registry = await self.load()
+        current_map: dict[str, ModuleRecord] = {}
+        historical_map: dict[str, ModuleRecord] = {}
+
+        for record in registry.records.values():
+            if record.status != "active":
+                continue
+            for file_path in record.file_paths:
+                current_map[file_path] = record
+            for file_path in self._dedupe_keep_order(
+                [*record.historical_file_paths, *record.file_paths]
+            ):
+                historical_map[file_path] = record
+
+        return registry, current_map, historical_map

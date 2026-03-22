@@ -318,6 +318,10 @@ class ModuleRecord(BaseSchema):
     slug: NonEmptyStr = Field(..., description="模块稳定 slug")
     display_name: NonEmptyStr = Field(..., description="模块展示名")
     file_paths: list[NonEmptyStr] = Field(default_factory=list, description="模块覆盖文件")
+    historical_file_paths: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="模块历史覆盖文件（包含已删除或已迁移路径）",
+    )
     key_symbols: list[NonEmptyStr] = Field(default_factory=list, description="模块关键符号")
     created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
     updated_at: UTCDateTime = Field(..., description="最近更新时间（UTC）")

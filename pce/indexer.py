@@ -29,8 +29,17 @@ from typing import Any
 import aiofiles
 import litellm
 
+from ._env import build_litellm_model, get_completion_overrides, get_env_text
+from .file_discovery import (
+    HARD_SKIP_DIRS,
+    SYMBOL_INDEX_EXTENSIONS,
+    filter_trackable_files,
+    is_hard_skipped,
+    should_track_deleted_path,
+    should_track_existing_file,
+    supports_symbol_index,
+)
 from .memory import load_index, save_index
-from .module_registry import ModuleRegistryManager
 from .models import (
     BuildStats,
     FileMeta,
@@ -42,8 +51,8 @@ from .models import (
     SymbolKind,
     SymbolRef,
 )
+from .module_registry import ModuleRegistryManager
 from .serena_client import SerenaClient, SerenaClientError
-from ._env import build_litellm_model, get_completion_overrides, get_env_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,34 +60,8 @@ logger = logging.getLogger(__name__)
 # 常量配置
 # ============================================================================
 
-CODE_EXTENSIONS = frozenset(
-    {
-        ".py",
-        ".ts",
-        ".js",
-        ".tsx",
-        ".jsx",
-        ".go",
-        ".java",
-        ".rs",
-        ".cpp",
-        ".c",
-        ".h",
-    }
-)
-
-SKIP_DIRS = frozenset(
-    {
-        ".git",
-        "node_modules",
-        "dist",
-        "build",
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".pce",
-    }
-)
+CODE_EXTENSIONS = SYMBOL_INDEX_EXTENSIONS
+SKIP_DIRS = HARD_SKIP_DIRS
 
 LANGUAGE_MAP: dict[str, str] = {
     ".py": "python",
@@ -152,12 +135,12 @@ def _normalize_tool_result(value: Any) -> Any:
 
 def _should_skip(path: Path) -> bool:
     """判断路径是否在跳过列表中。"""
-    return any(part in SKIP_DIRS for part in path.parts)
+    return is_hard_skipped(path)
 
 
 def _is_code_file(path: Path) -> bool:
     """判断路径是否为支持的代码文件。"""
-    return path.suffix.lower() in CODE_EXTENSIONS
+    return supports_symbol_index(path)
 
 
 def _infer_language(path: Path) -> str:
@@ -394,6 +377,222 @@ async def _write_structure_md(entries: list[IndexEntry], root_path: Path) -> Non
     path = root_path / ".pce" / "structure.md"
     content = _build_structure_md(entries)
     await _atomic_write_text(path, content)
+
+
+# ============================================================================
+# .pceignore 自动生成
+# ============================================================================
+
+_PCEIGNORE_MAX_DEPTH = 4
+_PCEIGNORE_MAX_ITEMS = 240
+_PCEIGNORE_FALLBACK_DIR_NAMES = {
+    "temp",
+    "tmp",
+    "logs",
+    "log",
+    "artifacts",
+    "exports",
+    "output",
+    "outputs",
+    "coverage",
+    "reports",
+    "screenshots",
+    "snapshots",
+    ".cache",
+    "cache",
+}
+_PCEIGNORE_FALLBACK_FILE_NAMES = {
+    ".ds_store",
+    "thumbs.db",
+}
+
+
+def _read_project_gitignore_excerpt(project_root: Path, *, max_lines: int = 80) -> str:
+    path = project_root / ".gitignore"
+    if not path.exists():
+        return "(项目根无 .gitignore)"
+    try:
+        lines = path.read_text("utf-8").splitlines()
+    except Exception:
+        return "(项目根 .gitignore 读取失败)"
+    kept = list(lines[:max_lines])
+    if len(lines) > max_lines:
+        kept.append(f"... (省略其余 {len(lines) - max_lines} 行)")
+    return "\n".join(kept).strip() or "(项目根 .gitignore 为空)"
+
+
+def _render_path_tree(paths: list[str], *, max_depth: int, max_items: int) -> str:
+    normalized = _dedupe_keep_order(sorted(paths))[:max_items]
+    lines: list[str] = []
+    for raw_path in normalized:
+        path = Path(raw_path)
+        parts = path.parts[:max_depth]
+        prefix = "  " * max(0, len(parts) - 1)
+        label = parts[-1] if parts else raw_path
+        suffix = "/" if len(path.parts) > 1 and len(parts) < len(path.parts) else ""
+        lines.append(f"{prefix}- {label}{suffix}")
+    if len(paths) > max_items:
+        lines.append(f"... (省略其余 {len(paths) - max_items} 项)")
+    return "\n".join(lines)
+
+
+def _collect_pceignore_candidates(payload: Any) -> list[str]:
+    dirs = []
+    files = []
+    if isinstance(payload, dict):
+        raw_dirs = payload.get("dirs") or []
+        raw_files = payload.get("files") or payload.get("items") or []
+        dirs = [str(item) for item in raw_dirs if isinstance(item, (str, Path))]
+        files = [str(item) for item in raw_files if isinstance(item, (str, Path))]
+
+    candidates: list[str] = []
+    for raw_dir in dirs:
+        path = Path(raw_dir)
+        if path.name.lower() in _PCEIGNORE_FALLBACK_DIR_NAMES:
+            candidates.append(f"{path.as_posix().rstrip('/')}/")
+
+    saw_log = False
+    for raw_file in files:
+        path = Path(raw_file)
+        name = path.name.lower()
+        if name in _PCEIGNORE_FALLBACK_FILE_NAMES:
+            candidates.append(path.as_posix())
+        if path.suffix.lower() == ".log":
+            saw_log = True
+    if saw_log:
+        candidates.append("*.log")
+
+    return _dedupe_keep_order(candidates)
+
+
+def _build_pceignore_prompt(project_root: Path, payload: Any) -> str:
+    dirs = []
+    files = []
+    if isinstance(payload, dict):
+        raw_dirs = payload.get("dirs") or []
+        raw_files = payload.get("files") or payload.get("items") or []
+        dirs = [str(item) for item in raw_dirs if isinstance(item, (str, Path))]
+        files = [str(item) for item in raw_files if isinstance(item, (str, Path))]
+
+    tree = _render_path_tree(
+        [*dirs, *files],
+        max_depth=_PCEIGNORE_MAX_DEPTH,
+        max_items=_PCEIGNORE_MAX_ITEMS,
+    )
+    gitignore_excerpt = _read_project_gitignore_excerpt(project_root)
+    candidates = _collect_pceignore_candidates(payload)
+    candidate_lines = [f"- {item}" for item in candidates] if candidates else ["(无候选规则)"]
+
+    return "\n".join(
+        [
+            "请为 PCE 生成一个补充性的 `.pce/pceignore` 黑名单。",
+            "目标：减少明显无价值、无关、冗余或高噪声文件进入索引/认知系统，但必须非常保守。",
+            "",
+            "已知约束：",
+            "- 项目根 `.gitignore` 已优先生效；你生成的是补充规则，不是替代规则。",
+            "- PCE 内建规则已跳过 `.git`、`.pce`、`.serena`、`node_modules`、`dist`、`build`、`__pycache__`、虚拟环境目录。",
+            "- 不要忽略显然属于源码、配置、脚本、测试、迁移、文档设计稿中的关键说明文件，除非它们明显是生成产物或纯噪声。",
+            "- 不要为了特定技术栈做假设；要使用尽量通用、保守的黑名单模式。",
+            "- 优先输出目录模式或明确的产物文件模式，不要大面积使用扩展名通配导致误伤源码。",
+            "",
+            "你应该优先考虑忽略这些类别，但只有在目录树中确实出现时才输出：",
+            "- 大型生成产物目录、缓存目录、导出目录、临时目录",
+            "- 二进制资源、截图、打包产物、日志、锁文件（仅当你判断它们对代码理解价值很低）",
+            "- 明显的本地私有配置或密钥类文件",
+            "",
+            "项目根 .gitignore 摘要：",
+            gitignore_excerpt,
+            "",
+            "目录树摘要：",
+            tree or "(空)",
+            "",
+            "允许选择的候选规则（只能从这里选，不能自创）：",
+            *candidate_lines,
+            "",
+            "输出要求：",
+            "- 只输出 gitignore 风格的模式，每行一条",
+            "- 只能输出候选规则中的原文，不得改写、泛化或新增规则",
+            "- 不要输出 Markdown、代码块、解释或编号",
+            "- 如果没有明确需要补充忽略的模式，则输出空字符串",
+        ]
+    )
+
+
+def _parse_pceignore_patterns(raw: str) -> list[str]:
+    content = _strip_markdown_fence(raw)
+    patterns: list[str] = []
+    for line in content.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("```"):
+            continue
+        text = re.sub(r"^(?:[-*]\s+|\d+\.\s+)", "", text).strip()
+        if not text or " " in text and not any(ch in text for ch in ("*", "/", ".", "?", "!")):
+            continue
+        if text.startswith("#"):
+            continue
+        patterns.append(text)
+    return _dedupe_keep_order(patterns)
+
+
+def _build_fallback_pceignore_patterns(payload: Any) -> list[str]:
+    """在 LLM 不可用时，做极保守的补充黑名单推断。"""
+    return _collect_pceignore_candidates(payload)
+
+
+def _filter_safe_pceignore_patterns(patterns: list[str], payload: Any) -> list[str]:
+    candidates = set(_collect_pceignore_candidates(payload))
+    return [pattern for pattern in patterns if pattern in candidates]
+
+
+async def _ensure_generated_pceignore(
+    project_root: Path,
+    serena_client: SerenaClient,
+    *,
+    model: str | None = None,
+) -> None:
+    path = project_root / ".pce" / "pceignore"
+    if path.exists():
+        return
+
+    try:
+        raw = await serena_client.list_dir(".", recursive=True, skip_ignored_files=True)
+    except SerenaClientError as e:
+        logger.warning("生成 .pce/pceignore 失败（目录扫描失败，已忽略）: %s", e)
+        return
+
+    payload = _normalize_tool_result(raw)
+    prompt = _build_pceignore_prompt(project_root, payload)
+    content = await _llm_complete_text(
+        prompt,
+        system_prompt=(
+            "你是一个非常保守的代码索引黑名单生成器。"
+            "你的职责是补充 gitignore 风格的排除模式，只排除明显的噪声或无价值路径，"
+            "绝不能误伤潜在源码或关键工程文件。"
+        ),
+        model=model,
+        failure_log=".pce/pceignore 生成失败",
+    )
+    patterns = _filter_safe_pceignore_patterns(
+        _parse_pceignore_patterns(content) if content else [],
+        payload,
+    )
+    if not patterns:
+        patterns = _build_fallback_pceignore_patterns(payload)
+    if not patterns:
+        return
+
+    final = "\n".join(
+        [
+            "# Auto-generated by PCE",
+            "# Conservative supplemental ignore rules for indexing",
+            *patterns,
+            "",
+        ]
+    )
+    await _atomic_write_text(path, final)
+    logger.info("已生成 .pce/pceignore: %d 条规则", len(patterns))
 
 
 # ============================================================================
@@ -730,6 +929,16 @@ def _render_index_md(header: str, sections: list[dict[str, Any]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+async def _cleanup_stale_module_docs(modules_dir: Path, section_slugs: set[str]) -> None:
+    """删除未被当前 index sections 引用的模块文档。"""
+    if not modules_dir.exists():
+        return
+    expected = {f"{slug}.md" for slug in section_slugs}
+    for stale in modules_dir.glob("*.md"):
+        if stale.name not in expected:
+            await asyncio.to_thread(stale.unlink, missing_ok=True)
+
+
 def _parse_index_md(index_content: str) -> dict[str, list[str]]:
     """返回模块 slug -> 文件路径列表的映射（供增量更新反查）。"""
     _, sections = _split_index_md(index_content)
@@ -782,6 +991,16 @@ def _fallback_slug_from_file(file_path: str) -> str:
     return stem or "unnamed-module"
 
 
+_SHELL_FILENAMES = {
+    "__init__.py",
+    "main.py",
+    "app.py",
+    "models.py",
+    "config.py",
+    "settings.py",
+}
+
+
 def _build_temporary_section(file_path: str) -> dict[str, Any]:
     """为无法自动归属的新增文件创建临时模块章节。"""
     stem = Path(file_path).stem.replace(".", "-")
@@ -799,10 +1018,228 @@ def _build_temporary_section(file_path: str) -> dict[str, Any]:
     }
 
 
+async def _load_sections_from_existing_module_docs(root_path: Path) -> list[dict[str, Any]]:
+    """从已有 modules/*.md 中恢复章节信息。
+
+    用途：
+    - 当 LLM 生成的 index.md 漏掉部分现有模块时，避免直接退化为粗粒度 fallback 模块
+    - 将已经存在的细粒度认知文档重新纳入 section 体系，后续再由 registry 稳定化
+    """
+    modules_dir = _annotation_modules_dir(root_path)
+    if not modules_dir.exists():
+        return []
+
+    sections: list[dict[str, Any]] = []
+    for module_path in sorted(modules_dir.glob("*.md")):
+        try:
+            raw = module_path.read_text("utf-8")
+        except Exception:
+            logger.warning(f"读取已有模块文档失败，跳过恢复: {module_path}")
+            continue
+        section = _parse_existing_module_doc_to_section(raw, module_path.stem)
+        if section is not None:
+            sections.append(section)
+    return sections
+
+
+def _parse_existing_module_doc_to_section(raw: str, slug: str) -> dict[str, Any] | None:
+    lines = raw.splitlines()
+    title = ""
+    file_paths: list[str] = []
+    in_cover_files = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("# ") and not title:
+            title = stripped[2:].strip()
+            continue
+        if stripped.startswith("## "):
+            heading = stripped[3:].strip()
+            in_cover_files = heading == "覆盖文件"
+            continue
+        if in_cover_files and stripped.startswith("- "):
+            payload = stripped[2:].strip()
+            if payload:
+                file_paths.append(payload)
+
+    file_paths = _dedupe_keep_order(file_paths)
+    if not title or not file_paths:
+        return None
+
+    return {
+        "name": title,
+        "slug": slug,
+        "file_paths": file_paths,
+        "body_lines": [
+            f"文件：{', '.join(file_paths)}",
+            f"详细认知：.pce/annotations/modules/{slug}.md",
+        ],
+    }
+
+
+def _is_shell_like_file(file_path: str) -> bool:
+    return Path(file_path).name in _SHELL_FILENAMES
+
+
+def _fallback_group_key_for_file(file_path: str) -> str:
+    path = Path(file_path)
+    parent = path.parent.as_posix()
+    if _is_shell_like_file(file_path):
+        return f"shell::{parent if parent not in {'', '.'} else '__root__'}"
+    return parent if parent not in {"", "."} else path.stem
+
+
+def _fallback_display_name_from_group(group_key: str) -> str:
+    if group_key.startswith("shell::"):
+        raw = group_key.split("::", 1)[1]
+        if raw == "__root__":
+            return "补充归类 项目入口与共享模型"
+        return f"补充归类 包级壳层 {raw}"
+    label = group_key.replace("/", " / ")
+    return f"补充归类 {label}"
+
+
+def _build_fallback_section(file_paths: list[str]) -> dict[str, Any]:
+    """为当前未归属的现存文件创建稳定 fallback 模块章节。"""
+    normalized = _dedupe_keep_order(file_paths)
+    group_key = _fallback_group_key_for_file(normalized[0]) if normalized else "misc"
+    module_name = _fallback_display_name_from_group(group_key)
+    slug = ModuleRegistryManager.normalize_slug(module_name, file_paths=normalized)
+    return {
+        "name": module_name,
+        "slug": slug,
+        "file_paths": normalized,
+        "body_lines": [
+            f"文件：{', '.join(normalized)}",
+            "职责：该章节由索引阶段的 fallback 归类逻辑维护，用于承接尚未被主认知导航稳定吸纳的现存文件，避免这些文件长期游离于模块体系之外。",
+            f"详细认知：.pce/annotations/modules/{slug}.md",
+        ],
+    }
+
+
+def _is_fallback_section(section: dict[str, Any]) -> bool:
+    name = str(section.get("name") or "")
+    return name.startswith("补充归类 ")
+
+
+def _append_fallback_sections_for_unassigned_entries(
+    sections: list[dict[str, Any]],
+    entries_map: dict[str, IndexEntry],
+) -> list[dict[str, Any]]:
+    """为当前未命中任何章节的现存文件追加稳定 fallback 模块。
+
+    设计目的：
+    - 避免文件已经进入 index / baseline，但长期没有 module registry 归属
+    - 让后续 deleted path 也能通过当前模块覆盖获得更稳定的历史映射
+    """
+    assigned = {
+        file_path
+        for section in sections
+        for file_path in _dedupe_keep_order(section.get("file_paths", []))
+        if file_path in entries_map
+    }
+    unassigned = sorted(path for path in entries_map if path not in assigned)
+    if not unassigned:
+        return sections
+
+    grouped: dict[str, list[str]] = {}
+    for file_path in unassigned:
+        grouped.setdefault(_fallback_group_key_for_file(file_path), []).append(file_path)
+
+    augmented = list(sections)
+    sections_by_slug = {section["slug"]: section for section in augmented}
+    for file_paths in grouped.values():
+        fallback = _build_fallback_section(file_paths)
+        existing = sections_by_slug.get(fallback["slug"])
+        if existing is not None:
+            _update_section_file_list(
+                existing,
+                existing.get("file_paths", []) + fallback["file_paths"],
+            )
+            continue
+        augmented.append(fallback)
+        sections_by_slug[fallback["slug"]] = fallback
+    return augmented
+
+
+def _merge_missing_sections(
+    base_sections: list[dict[str, Any]],
+    extra_sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """将缺失 section 合并进来，并优先让细粒度现有模块拆分 fallback 覆盖。"""
+    merged = list(base_sections)
+    known_slugs = {section["slug"] for section in merged}
+
+    def _covered_paths(*, include_fallback: bool) -> set[str]:
+        return {
+            file_path
+            for section in merged
+            if include_fallback or not _is_fallback_section(section)
+            for file_path in section.get("file_paths", [])
+        }
+
+    for section in extra_sections:
+        if section["slug"] in known_slugs:
+            continue
+        extra_files = _dedupe_keep_order(section.get("file_paths", []))
+        covered_without_fallback = _covered_paths(include_fallback=False)
+        if not any(path not in covered_without_fallback for path in extra_files):
+            continue
+
+        for existing in merged:
+            if not _is_fallback_section(existing):
+                continue
+            overlap = [
+                path
+                for path in existing.get("file_paths", [])
+                if path in extra_files
+            ]
+            if not overlap:
+                continue
+            remaining = [
+                path
+                for path in existing.get("file_paths", [])
+                if path not in set(extra_files)
+            ]
+            _update_section_file_list(existing, remaining)
+
+        merged.append(section)
+        known_slugs.add(section["slug"])
+    return [section for section in merged if section.get("file_paths")]
+
+
+def _dedupe_sections_by_slug(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 slug 去重，优先保留正式 section，并合并文件列表。"""
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    for section in sections:
+        slug = section["slug"]
+        if slug not in merged:
+            merged[slug] = section
+            order.append(slug)
+            continue
+
+        current = merged[slug]
+        prefer = current
+        fallback = section
+        if _is_fallback_section(current) and not _is_fallback_section(section):
+            prefer = section
+            fallback = current
+
+        _update_section_file_list(
+            prefer,
+            prefer.get("file_paths", []) + fallback.get("file_paths", []),
+        )
+        merged[slug] = prefer
+
+    return [merged[slug] for slug in order]
+
+
 def _prepare_module_specs(
     sections: list[dict[str, Any]],
-    entries_map: dict[str, "IndexEntry"],
-) -> tuple[list[dict[str, Any]], list[tuple[str, str, list["IndexEntry"]]]]:
+    entries_map: dict[str, IndexEntry],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[IndexEntry]]]]:
     """过滤章节中实际存在的文件，返回有效章节列表和模块生成规格。"""
     valid_sections: list[dict[str, Any]] = []
     module_specs: list[tuple[str, str, list[IndexEntry]]] = []
@@ -956,6 +1393,12 @@ async def _write_annotations(
 
     entries_map = {str(e.file_meta.path): e for e in entries}
     header, sections = _split_index_md(index_content)
+    sections = _dedupe_sections_by_slug(sections)
+    sections = _merge_missing_sections(
+        sections,
+        await _load_sections_from_existing_module_docs(root_path),
+    )
+    sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
     sections = await _stabilize_sections_with_registry(
         sections,
         root_path=root_path,
@@ -970,15 +1413,12 @@ async def _write_annotations(
         valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
 
     await _write_module_files(module_specs, modules_dir, model)
-
-    # 删除本次不再使用的旧 module 文件
-    expected = {f"{slug}.md" for _, slug, _ in module_specs}
-    if modules_dir.exists():
-        for stale in modules_dir.glob("*.md"):
-            if stale.name not in expected:
-                await asyncio.to_thread(stale.unlink, missing_ok=True)
-
-    await _atomic_write_text(index_path, _render_index_md(header, valid_sections))
+    rendered_index = _render_index_md(header, valid_sections)
+    await _atomic_write_text(index_path, rendered_index)
+    await _cleanup_stale_module_docs(
+        modules_dir,
+        {section["slug"] for section in valid_sections},
+    )
     logger.info(
         f"认知导航写入完成: {len(valid_sections)} 个模块章节, {len(module_specs)} 个模块文档"
     )
@@ -1016,7 +1456,16 @@ async def _update_annotations_incremental(
         return
 
     entries_map = {str(e.file_meta.path): e for e in entries}
-    ownership = _parse_index_md(index_content)
+    sections = _dedupe_sections_by_slug(sections)
+    sections = _merge_missing_sections(
+        sections,
+        await _load_sections_from_existing_module_docs(root_path),
+    )
+    ownership = {
+        section["slug"]: _dedupe_keep_order(section["file_paths"])
+        for section in sections
+        if section["file_paths"]
+    }
     reverse_map: dict[str, str] = {
         file_path: slug
         for slug, file_paths in ownership.items()
@@ -1055,6 +1504,9 @@ async def _update_annotations_incremental(
             affected_slugs.add(temp_section["slug"])
             logger.warning(f"新增文件归属判断失败，已追加临时章节: {file_path}")
 
+    sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
+    sections_by_slug = {section["slug"]: section for section in sections}
+
     if not affected_slugs:
         logger.info("认知导航无受影响模块，跳过 annotations 增量更新")
         return
@@ -1084,13 +1536,12 @@ async def _update_annotations_incremental(
     final_sections, module_specs = _prepare_module_specs(final_sections, entries_map)
 
     await _write_module_files(module_specs, modules_dir, model)
-
-    for slug in removed_slugs:
-        module_path = modules_dir / f"{slug}.md"
-        if module_path.exists():
-            await asyncio.to_thread(module_path.unlink, missing_ok=True)
-
-    await _atomic_write_text(index_path, _render_index_md(header, final_sections))
+    rendered_index = _render_index_md(header, final_sections)
+    await _atomic_write_text(index_path, rendered_index)
+    await _cleanup_stale_module_docs(
+        modules_dir,
+        {section["slug"] for section in final_sections},
+    )
     logger.info(
         f"认知导航增量更新完成: {len(module_specs)} 个模块重建, {len(removed_slugs)} 个模块移除"
     )
@@ -1102,7 +1553,7 @@ async def _update_annotations_incremental(
 
 
 async def _scan_directory(serena_client: SerenaClient) -> list[str]:
-    """递归扫描项目目录,返回源代码文件路径列表。"""
+    """递归扫描项目目录,返回应纳入 PCE 的文本文件列表。"""
     try:
         raw = await serena_client.list_dir(".", recursive=True, skip_ignored_files=True)
     except SerenaClientError as e:
@@ -1111,16 +1562,10 @@ async def _scan_directory(serena_client: SerenaClient) -> list[str]:
 
     payload = _normalize_tool_result(raw)
     files = _extract_file_list(payload)
+    results = filter_trackable_files(serena_client.project_path, files)
 
-    results: list[str] = []
-    for item in files:
-        path = Path(item)
-        if _should_skip(path) or not _is_code_file(path):
-            continue
-        results.append(path.as_posix())
-
-    logger.info(f"扫描完成: 发现 {len(results)} 个源代码文件")
-    return sorted(set(results))
+    logger.info(f"扫描完成: 发现 {len(results)} 个可跟踪文本文件")
+    return results
 
 
 async def _resolve_name_path(
@@ -1163,40 +1608,39 @@ async def _index_file(file_path: str, serena_client: SerenaClient) -> IndexEntry
         logger.warning(f"文件不存在,跳过: {file_path}")
         return None
 
-    # 获取符号概览
-    try:
-        overview_raw = await serena_client.get_symbols_overview(file_path, depth=1)
-    except SerenaClientError as e:
-        logger.warning(f"获取符号概览失败: {file_path}: {e}")
-        return None
-
-    overview = _normalize_tool_result(overview_raw)
     symbols: list[SymbolRef] = []
-    for sym_dict in _flatten_symbols(overview):
-        sym = _symbol_from_dict(sym_dict, file_path)
-        if sym is not None:
-            symbols.append(sym)
-
-    # 对高层符号建立引用索引
     edges: list[ReferenceEdge] = []
-    for symbol in symbols:
-        if symbol.kind not in HIGH_LEVEL_KINDS:
-            continue
-
-        name_path = await _resolve_name_path(serena_client, symbol, file_path)
-        if not name_path:
-            continue
-
+    if supports_symbol_index(file_path):
         try:
-            refs_raw = await serena_client.find_referencing_symbols(
-                name_path=name_path, relative_path=file_path
-            )
-        except SerenaClientError:
-            continue
+            overview_raw = await serena_client.get_symbols_overview(file_path, depth=1)
+        except SerenaClientError as e:
+            logger.info(f"符号概览不可用，降级为空符号索引: {file_path}: {e}")
+        else:
+            overview = _normalize_tool_result(overview_raw)
+            for sym_dict in _flatten_symbols(overview):
+                sym = _symbol_from_dict(sym_dict, file_path)
+                if sym is not None:
+                    symbols.append(sym)
 
-        refs_payload = _normalize_tool_result(refs_raw)
-        for ref in _flatten_references(refs_payload):
-            edges.append(_edge_from_reference(symbol, ref))
+            # 对高层符号建立引用索引
+            for symbol in symbols:
+                if symbol.kind not in HIGH_LEVEL_KINDS:
+                    continue
+
+                name_path = await _resolve_name_path(serena_client, symbol, file_path)
+                if not name_path:
+                    continue
+
+                try:
+                    refs_raw = await serena_client.find_referencing_symbols(
+                        name_path=name_path, relative_path=file_path
+                    )
+                except SerenaClientError:
+                    continue
+
+                refs_payload = _normalize_tool_result(refs_raw)
+                for ref in _flatten_references(refs_payload):
+                    edges.append(_edge_from_reference(symbol, ref))
 
     # 收集文件统计信息
     try:
@@ -1254,6 +1698,11 @@ async def build_index(
     start_time = time.monotonic()
 
     logger.info(f"开始构建索引: {root_path}")
+
+    try:
+        await _ensure_generated_pceignore(root_path, serena_client, model=model)
+    except Exception as e:
+        logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
 
     # 扫描文件列表
     files = await _scan_directory(serena_client)
@@ -1359,6 +1808,11 @@ async def build_index_incremental(
     memory_root_path = Path(memory_root).resolve() if memory_root else root_path
     start_time = time.monotonic()
 
+    try:
+        await _ensure_generated_pceignore(root_path, serena_client, model=model)
+    except Exception as e:
+        logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
+
     # 尝试加载已有索引
     existing = await load_index(root_path=memory_root_path)
     if existing is None:
@@ -1371,11 +1825,12 @@ async def build_index_incremental(
             model=model,
         )
 
-    # 过滤有效的代码文件
+    # ignore-first：增量时只过滤掉被忽略/非文本的现存文件；
+    # 删除文件只排除内建硬规则目录，避免遗留旧 entry / baseline。
     effective_changes = [
-        f for f in changed_files if _is_code_file(Path(f)) and not _should_skip(Path(f))
+        f for f in changed_files if should_track_existing_file(root_path, f)
     ]
-    deleted = set(deleted_files or [])
+    deleted = {path for path in (deleted_files or []) if should_track_deleted_path(path)}
 
     if not effective_changes and not deleted:
         logger.info("无有效变更，跳过增量更新")
