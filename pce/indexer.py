@@ -7,8 +7,7 @@
 
 构建流程:
   list_dir 扫描目录
-    → 并发 get_symbols_overview 建立符号清单
-    → find_referencing_symbols 建立引用图
+    → 并发 get_symbols_overview 建立文件/符号快照
     → LLM 生成认知导航与模块认知文档(可降级)
     → 写入 .pce/annotations/
 """
@@ -49,8 +48,6 @@ from .models import (
     IndexSnapshot,
     ModuleRegistry,
     ProjectMeta,
-    ReferenceEdge,
-    ReferenceRelation,
     SymbolKind,
     SymbolRef,
 )
@@ -79,16 +76,6 @@ LANGUAGE_MAP: dict[str, str] = {
     ".c": "c",
     ".h": "c",
 }
-
-# 只对这些符号类型构建引用索引(避免过多 LLM 调用)
-HIGH_LEVEL_KINDS = frozenset(
-    {
-        SymbolKind.CLASS,
-        SymbolKind.FUNCTION,
-        SymbolKind.METHOD,
-        SymbolKind.MODULE,
-    }
-)
 
 DEFAULT_CONCURRENCY = 10
 
@@ -227,18 +214,6 @@ def _flatten_symbols(payload: Any) -> list[dict[str, Any]]:
     return result
 
 
-def _flatten_references(payload: Any) -> list[dict[str, Any]]:
-    """从 find_referencing_symbols 响应中提取所有引用 dict。"""
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        result: list[dict[str, Any]] = []
-        for v in payload.values():
-            result.extend(_flatten_references(v))
-        return result
-    return []
-
-
 def _map_symbol_kind(raw: Any) -> SymbolKind:
     """将 Serena 的 kind 字段映射到 SymbolKind 枚举。"""
     if raw is None:
@@ -290,32 +265,6 @@ def _symbol_from_dict(payload: dict[str, Any], file_path: str) -> SymbolRef | No
     except Exception as e:
         logger.debug(f"构建 SymbolRef 失败: {name}: {e}")
         return None
-
-
-def _edge_from_reference(target: SymbolRef, ref: dict[str, Any]) -> ReferenceEdge:
-    """从引用字典构建 ReferenceEdge 对象。"""
-    ref_path = ref.get("relative_path") or ""
-    location = ref.get("body_location") or {}
-    line_start = location.get("start_line")
-
-    # 构建证据字符串
-    parts: list[str] = []
-    if ref_path:
-        parts.append(ref_path)
-        if isinstance(line_start, int) and line_start > 0:
-            parts.append(f":{line_start}")
-    snippet = ref.get("content_around_reference") or ref.get("snippet") or ""
-    if snippet:
-        parts.append(f" {snippet[:80]}")  # 截断过长的片段
-
-    evidence = "".join(parts) or target.name
-
-    return ReferenceEdge(
-        from_symbol_id=target.symbol_id,
-        to_symbol_id=str(uuid.uuid4()),
-        relation=ReferenceRelation.USES,
-        evidence=evidence,
-    )
 
 
 # ============================================================================
@@ -2706,29 +2655,6 @@ async def _scan_directory(serena_client: SerenaClient) -> list[str]:
     return results
 
 
-async def _resolve_name_path(
-    serena_client: SerenaClient, symbol: SymbolRef, file_path: str
-) -> str | None:
-    """解析符号的 name_path(Serena 格式,如 MyClass/my_method)。"""
-    try:
-        raw = await serena_client.find_symbol(
-            symbol.name,
-            relative_path=file_path,
-            include_body=False,
-            depth=0,
-            substring_matching=False,
-        )
-    except SerenaClientError:
-        return None
-
-    payload = _normalize_tool_result(raw)
-    for item in _flatten_symbols(payload):
-        name_path = item.get("name_path") or item.get("namePath")
-        if name_path:
-            return str(name_path)
-    return None
-
-
 async def _index_file(file_path: str, serena_client: SerenaClient) -> IndexEntry | None:
     """索引单个文件,返回 IndexEntry。
 
@@ -2747,7 +2673,6 @@ async def _index_file(file_path: str, serena_client: SerenaClient) -> IndexEntry
         return None
 
     symbols: list[SymbolRef] = []
-    edges: list[ReferenceEdge] = []
     if supports_symbol_index(file_path):
         try:
             overview_raw = await serena_client.get_symbols_overview(file_path, depth=1)
@@ -2759,26 +2684,6 @@ async def _index_file(file_path: str, serena_client: SerenaClient) -> IndexEntry
                 sym = _symbol_from_dict(sym_dict, file_path)
                 if sym is not None:
                     symbols.append(sym)
-
-            # 对高层符号建立引用索引
-            for symbol in symbols:
-                if symbol.kind not in HIGH_LEVEL_KINDS:
-                    continue
-
-                name_path = await _resolve_name_path(serena_client, symbol, file_path)
-                if not name_path:
-                    continue
-
-                try:
-                    refs_raw = await serena_client.find_referencing_symbols(
-                        name_path=name_path, relative_path=file_path
-                    )
-                except SerenaClientError:
-                    continue
-
-                refs_payload = _normalize_tool_result(refs_raw)
-                for ref in _flatten_references(refs_payload):
-                    edges.append(_edge_from_reference(symbol, ref))
 
     # 收集文件统计信息
     try:
@@ -2799,7 +2704,7 @@ async def _index_file(file_path: str, serena_client: SerenaClient) -> IndexEntry
         ),
         symbols=symbols,
         imports=[],
-        edges=edges,
+        edges=[],
     )
 
 
@@ -2922,7 +2827,7 @@ async def build_index(
     logger.info(
         f"索引构建完成: {len(entries)} 个文件, "
         f"{build_stats.total_symbols} 个符号, "
-        f"{build_stats.total_edges} 条引用边, "
+        f"{build_stats.total_edges} 条预构建引用边, "
         f"耗时 {build_stats.duration_ms}ms"
     )
 
