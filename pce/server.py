@@ -52,9 +52,22 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
-def _make_tool_description(summary: str, trigger: str, replaces: str) -> str:
-    """拼装工具描述,遵循"明确替代关系、说明调用时机"的设计原则。"""
-    return f"{summary}\n" f"触发时机: {trigger}\n" f"替代操作: {replaces}"
+def _make_tool_description(
+    *,
+    purpose: str,
+    use_when: str,
+    best_practice: str,
+    avoid_when: str | None = None,
+) -> str:
+    """拼装面向 Agent 的工具描述。"""
+    parts = [
+        f"用途: {purpose}",
+        f"适用时机: {use_when}",
+        f"最佳实践: {best_practice}",
+    ]
+    if avoid_when:
+        parts.append(f"避免误用: {avoid_when}")
+    return "\n".join(parts)
 
 
 def _text_response(content: Any) -> list[TextContent]:
@@ -146,15 +159,16 @@ def _build_tools(
         Tool(
             name="pce_init",
             description=_make_tool_description(
-                summary="初始化 PCE 与目标项目的绑定，启动 Serena 并构建代码索引。",
-                trigger=(
-                    "会话开始后首次使用前调用一次。"
-                    "调用成功前，pce_query / pce_impact / pce_sync 及写工具均不可用。"
+                purpose="绑定目标项目，启动 Serena，并准备后续 query / impact / sync 所需的索引与运行时状态。",
+                use_when=(
+                    "会话开始后、首次使用 PCE 时调用一次。"
+                    "在它成功之前，不应调用 pce_query、pce_impact、pce_sync 或写工具。"
                 ),
-                replaces=(
-                    "替代通过环境变量传入项目路径的启动方式；"
-                    "将项目绑定延迟到会话运行时显式完成，支持全局安装、零配置部署。"
+                best_practice=(
+                    "每个会话先调用一次并等待成功；同一会话内通常无需重复调用。"
+                    "只有在需要切换项目或初始化失败后重试时，才再次处理初始化。"
                 ),
+                avoid_when="不要把它当作查询工具使用；它负责建立上下文，不负责返回代码结论。",
             ),
             inputSchema={
                 "type": "object",
@@ -170,9 +184,13 @@ def _build_tools(
         Tool(
             name="pce_status",
             description=_make_tool_description(
-                summary="返回当前项目的 PCE 状态：初始化阶段、索引统计、暂存区信息。",
-                trigger="诊断或调试时调用；也可在 pce_init 前后确认服务状态。",
-                replaces="替代手动检查 .pce/ 目录文件与日志。",
+                purpose="返回当前服务与项目的状态信息，例如初始化阶段、索引统计、暂存区与 warning。",
+                use_when="需要确认 PCE 是否已初始化、索引是否可用、或调试当前状态时使用。",
+                best_practice=(
+                    "把它当作诊断与确认工具使用。"
+                    "当 query / impact 表现异常、或需要判断是否应先 init / sync 时，先查看 status。"
+                ),
+                avoid_when="不要把它当作代码理解工具使用；它不负责定位入口、传播链或影响边界。",
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
@@ -183,20 +201,18 @@ def _build_tools(
         Tool(
             name="pce_query",
             description=_make_tool_description(
-                summary=(
-                    "用于“先定位、后判断”的问题。"
-                    "适合：定位入口/定义点/主调用链、确认模块职责、缩小候选文件范围。"
-                    "不适合：在目标已经明确时要求它穷尽所有传播链或直接代替 impact。"
-                    "若希望上层 Agent 直接继续工作，可在 query 中要求返回 file:line 或 {file, line_range, name_path}。"
+                purpose=(
+                    "回答代码库中的定位与理解问题，例如入口、定义点、主调用链、模块职责、候选文件范围。"
                 ),
-                trigger=(
-                    "当你还不知道“应该改哪里 / 看哪里 / 从哪里入手”时调用。"
-                    "若问题涉及多个候选文件、多个可能符号、多个可能入口，先用 pce_query 收敛目标；"
-                    "一旦目标已明确，再转 pce_impact。"
+                use_when=(
+                    "当目标位置尚不明确，或你还需要先确定应该看哪个文件、符号、模块或主链路时使用。"
                 ),
-                replaces=(
-                    "替代手工 ls + cat + grep 的术前定位链。"
-                    "它的目标是把上层 Agent 快速送到目标附近，而不是一次性给出完整影响边界。"
+                best_practice=(
+                    "把问题写成需要收敛目标范围的自然语言请求，例如“入口在哪”“主处理链经过哪些文件”。"
+                    "若你希望直接继续工作，可在 query 中要求返回 file:line、name_path 或相关文件列表。"
+                ),
+                avoid_when=(
+                    "当 target 已明确且任务变成“改它会影响哪里”时，不要继续用 query 穷举传播链；应转用 pce_impact。"
                 ),
             ),
             inputSchema={
@@ -213,20 +229,18 @@ def _build_tools(
         Tool(
             name="pce_impact",
             description=_make_tool_description(
-                summary=(
-                    "用于“目标已知”的影响边界分析。"
-                    "适合：改函数签名、改字段、改接口契约、改某个已知文件/符号。"
-                    "输出重点是直接调用点、直接消费者、主要传播链与修改顺序；"
-                    "结果应视为高价值边界参考，而不是绝对穷尽。"
+                purpose=(
+                    "围绕已知 target 分析影响边界，重点输出直接调用点、直接消费者、主要传播链、风险与建议修改顺序。"
                 ),
-                trigger=(
-                    "当你已经明确要改哪个符号、字段、接口或文件时调用。"
-                    "若 target 仍然模糊、还在多个候选之间摇摆，先用 pce_query；"
-                    "不要拿 pce_impact 代替“找目标”这一步。"
+                use_when=(
+                    "当你已经明确要改哪个符号、字段、接口契约或文件，并希望先了解它的主要影响面时使用。"
                 ),
-                replaces=(
-                    "替代手工追踪引用链与边改边试错。"
-                    "它的目标是先给出足够可靠的高价值边界，再由上层 Agent 结合实际修改做必要复核。"
+                best_practice=(
+                    "尽量提供明确的 target；若已知符号所在文件，也一起提供 file 以加速定位。"
+                    "将结果视为高价值边界参考，并在实际修改前对关键点做必要复核。"
+                ),
+                avoid_when=(
+                    "如果 target 仍然模糊、还在多个候选之间摇摆，不要用 impact 代替定位步骤；应先使用 pce_query 收敛目标。"
                 ),
             ),
             inputSchema={
@@ -252,9 +266,13 @@ def _build_tools(
         Tool(
             name="pce_sync",
             description=_make_tool_description(
-                summary="通知 PCE 代码库已发生变更，触发 Serena 重连并重建 PCE 索引。后续 pce_query/pce_impact 将看到最新代码。",
-                trigger="上层 Agent 完成一批代码修改后调用，确保 PCE 索引与代码库同步。",
-                replaces="替代手动重启 PCE 服务或等待索引自动失效。",
+                purpose="在代码库发生修改后，同步 Serena 与 PCE 的索引状态，使后续 query / impact 基于最新代码工作。",
+                use_when="完成一批代码修改、文件删除、重命名或结构调整后使用。",
+                best_practice=(
+                    "把它作为批量同步步骤使用。"
+                    "通常在完成一轮修改后再调用一次，而不是每改一小处就立刻同步。"
+                ),
+                avoid_when="不要把它当作查询工具使用；它负责刷新状态，不负责解释代码含义。",
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
