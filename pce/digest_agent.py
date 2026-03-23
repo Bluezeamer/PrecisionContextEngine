@@ -1162,25 +1162,47 @@ async def run_digest(
 
     失败时抛出异常，由调用方捕获并记录 warning；不影响 init/sync 主流程。
     """
+    digest_start = time.monotonic()
     # 先 sweep（标记 hash 过时的 insight），cleanup 在 digest 完成后执行
+    sweep_start = time.monotonic()
     try:
         await insight_cache.sweep_stale()
     except Exception as e:
         logger.warning("Digest 前 sweep_stale 失败（已忽略）: %s", e)
+    finally:
+        logger.info("Digest 阶段耗时: sweep_stale=%.2fs", time.monotonic() - sweep_start)
 
+    planner_start = time.monotonic()
     planner = DigestPlanner(project_root=project_root, insight_cache=insight_cache)
     task_list = await planner.build(dirty_state)
+    logger.info(
+        "Digest 阶段耗时: planner_build=%.2fs (tasks=%d)",
+        time.monotonic() - planner_start,
+        len(task_list.items),
+    )
 
     if not task_list.items:
         logger.info("Digest 跳过：当前无可执行的模块级 delta")
+        seed_start = time.monotonic()
         await _seed_initial_file_baselines_if_missing(project_root=project_root)
+        logger.info(
+            "Digest 阶段耗时: seed_initial_baselines=%.2fs",
+            time.monotonic() - seed_start,
+        )
         # 仍然执行 cleanup 清除已 stale 的条目
+        cleanup_start = time.monotonic()
         try:
             removed = await insight_cache.cleanup_stale()
             if removed:
                 logger.info("Digest cleanup_stale: 删除 %d 条", removed)
         except Exception as e:
             logger.warning("Digest cleanup_stale 失败（已忽略）: %s", e)
+        finally:
+            logger.info(
+                "Digest 阶段耗时: cleanup_stale=%.2fs",
+                time.monotonic() - cleanup_start,
+            )
+        logger.info("Digest 总耗时: %.2fs", time.monotonic() - digest_start)
         return {
             "executed": False,
             "summary": "",
@@ -1191,6 +1213,7 @@ async def run_digest(
         }
 
     task_list_path = project_root.resolve() / _DIGEST_TASKS_REL
+    run_tasks_start = time.monotonic()
     try:
         result = await _run_module_tasks(
             task_list=task_list,
@@ -1200,25 +1223,53 @@ async def run_digest(
             model=model,
             provider=provider,
         )
+        logger.info(
+            "Digest 阶段耗时: run_module_tasks=%.2fs",
+            time.monotonic() - run_tasks_start,
+        )
     finally:
         # 无论成功失败，都尝试清理临时任务文件和 stale insight（各自独立兜底，不覆盖原始异常）
+        task_file_cleanup_start = time.monotonic()
         try:
             await task_list.delete(task_list_path)
         except Exception as e:
             logger.warning("Digest 清理任务文件失败（已忽略）: %s", e)
+        finally:
+            logger.info(
+                "Digest 阶段耗时: cleanup_task_file=%.2fs",
+                time.monotonic() - task_file_cleanup_start,
+            )
+        cleanup_start = time.monotonic()
         try:
             removed = await insight_cache.cleanup_stale()
             if removed:
                 logger.info("Digest cleanup_stale: 删除 %d 条", removed)
         except Exception as e:
             logger.warning("Digest cleanup_stale 失败（已忽略）: %s", e)
+        finally:
+            logger.info(
+                "Digest 阶段耗时: cleanup_stale=%.2fs",
+                time.monotonic() - cleanup_start,
+            )
 
+    baseline_start = time.monotonic()
     await _advance_file_baselines(project_root=project_root, task_list=task_list)
     await _seed_initial_file_baselines_if_missing(project_root=project_root)
+    logger.info(
+        "Digest 阶段耗时: advance_and_seed_baselines=%.2fs",
+        time.monotonic() - baseline_start,
+    )
 
     # 只删除已被内化（done）的 insight；skipped 说明缺乏证据暂缓处理，保留供后续重试
+    delete_insights_start = time.monotonic()
     consumed_ids = _collect_consumed_insight_ids(task_list)
     deleted_count = await insight_cache.delete_by_ids(consumed_ids)
+    logger.info(
+        "Digest 阶段耗时: delete_consumed_insights=%.2fs (deleted=%d)",
+        time.monotonic() - delete_insights_start,
+        deleted_count,
+    )
+    logger.info("Digest 总耗时: %.2fs", time.monotonic() - digest_start)
 
     return {
         "executed": True,

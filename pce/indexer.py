@@ -2837,13 +2837,22 @@ async def build_index(
 
     logger.info(f"开始构建索引: {root_path}")
 
+    pceignore_start = time.monotonic()
     try:
         await _ensure_generated_pceignore(root_path, serena_client, model=model)
     except Exception as e:
         logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
+    finally:
+        logger.info("索引阶段耗时: pceignore=%.2fs", time.monotonic() - pceignore_start)
 
     # 扫描文件列表
+    scan_start = time.monotonic()
     files = await _scan_directory(serena_client)
+    logger.info(
+        "索引阶段耗时: scan_directory=%.2fs (files=%d)",
+        time.monotonic() - scan_start,
+        len(files),
+    )
     if not files:
         logger.warning("未发现任何源代码文件")
 
@@ -2855,7 +2864,12 @@ async def build_index(
             return await _index_file(file_path, serena_client)
 
     # return_exceptions=True 确保单文件异常不会中断整体构建
+    file_index_start = time.monotonic()
     results = await asyncio.gather(*[_run_with_semaphore(f) for f in files], return_exceptions=True)
+    logger.info(
+        "索引阶段耗时: file_indexing=%.2fs",
+        time.monotonic() - file_index_start,
+    )
 
     entries: list[IndexEntry] = []
     failed_files: list[str] = []
@@ -2898,7 +2912,12 @@ async def build_index(
     )
 
     # 写入 Memory
+    save_index_start = time.monotonic()
     await save_index(snapshot, root_path=memory_root_path)
+    logger.info(
+        "索引阶段耗时: save_index=%.2fs",
+        time.monotonic() - save_index_start,
+    )
 
     logger.info(
         f"索引构建完成: {len(entries)} 个文件, "
@@ -2908,11 +2927,18 @@ async def build_index(
     )
 
     # 渐进式认知导航(可降级)
+    annotations_start = time.monotonic()
     try:
         await _write_annotations(entries, project_meta, memory_root_path, model=model)
     except Exception as e:
         logger.warning(f"写入项目认知导航失败(已降级): {e}")
+    finally:
+        logger.info(
+            "索引阶段耗时: write_annotations=%.2fs",
+            time.monotonic() - annotations_start,
+        )
 
+    structure_start = time.monotonic()
     try:
         await _write_structure_md(
             entries,
@@ -2922,6 +2948,11 @@ async def build_index(
         )
     except Exception as e:
         logger.warning(f"写入 structure.md 失败(已降级): {e}")
+    finally:
+        logger.info(
+            "索引阶段耗时: write_structure=%.2fs",
+            time.monotonic() - structure_start,
+        )
 
     return snapshot
 

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -404,6 +405,7 @@ class PCEContext:
         warnings: list[str] = []
         self._bootstrap_warnings = []
         self._last_init_error = None
+        bootstrap_start = time.monotonic()
         # 注意：不在此处 clear event，handle_init 在切换到 initializing 时已 clear。
 
         # FileWatcher 在路径校验通过后立即启动，避免初始化期间遗漏文件变更
@@ -424,14 +426,20 @@ class PCEContext:
             self.agent = PCEAgent(insight_cache=self.insight_cache)
 
             async with self._sync_lock:
+                serena_connect_start = time.monotonic()
                 async with SerenaClient.create(
                     project_path,
                     timeout_seconds=serena_timeout,
                 ) as serena_client:
+                    logger.info(
+                        "Bootstrap 阶段耗时: serena_connect=%.2fs",
+                        time.monotonic() - serena_connect_start,
+                    )
                     self._edit_tools_schema = serena_client.edit_tools_schema
 
                     # 显式校验 Serena 项目激活：启动时激活失败会被静默吞掉，
                     # 再调一次可捕获失败并记录 warning，而不是直接报错
+                    activate_start = time.monotonic()
                     try:
                         result = await serena_client.call(
                             "activate_project",
@@ -445,10 +453,23 @@ class PCEContext:
                         )
                         warnings.append(warning)
                         logger.warning(warning)
+                    finally:
+                        logger.info(
+                            "Bootstrap 阶段耗时: activate_project=%.2fs",
+                            time.monotonic() - activate_start,
+                        )
 
+                    index_refresh_start = time.monotonic()
                     digest_dirty = await self._run_index_refresh(serena_client)
+                    logger.info(
+                        "Bootstrap 阶段耗时: index_refresh=%.2fs (changed=%d deleted=%d)",
+                        time.monotonic() - index_refresh_start,
+                        len(digest_dirty.changed),
+                        len(digest_dirty.deleted),
+                    )
 
                     # 认知整合：将积累的 insight 和 dirty_files 内化到 annotation
+                    digest_start = time.monotonic()
                     try:
                         digest_result = await run_digest(
                             project_root=project_path,
@@ -468,6 +489,11 @@ class PCEContext:
                         warning = f"Bootstrap Digest 失败（不影响初始化）: {e}"
                         warnings.append(warning)
                         logger.warning(warning)
+                    finally:
+                        logger.info(
+                            "Bootstrap 阶段耗时: digest=%.2fs",
+                            time.monotonic() - digest_start,
+                        )
 
             self._init_state = "initialized"
             self._bootstrap_warnings = list(warnings)
@@ -475,6 +501,10 @@ class PCEContext:
             logger.info(
                 "Bootstrap 完成%s",
                 f"（{len(warnings)} 条 warning）" if warnings else "（无 warning）",
+            )
+            logger.info(
+                "Bootstrap 总耗时: %.2fs",
+                time.monotonic() - bootstrap_start,
             )
 
             snapshot = await load_index(root_path=project_path)
