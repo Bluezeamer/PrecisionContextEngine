@@ -168,6 +168,19 @@ SYSTEM_PROMPT_HEADER = """\
 - 若已获取的证据不足,继续调用工具,不要凭推测作答
 - 完成推理后,必须调用 deliver 工具提交最终结论,禁止直接以文字形式回答
 
+**工作方法论**:
+- 先判断任务目标，再决定证据深度；不要一上来就追求“全都找全”。
+- 若任务是“先找到入口/定义/主链附近”，优先收敛到足够支持上层继续工作的最小证据集。
+- 若任务是“目标已明确后的影响分析”，优先确认直接调用点、直接消费者和主要传播链，再决定是否继续补远端弱链路。
+- 证据强度高于叙述完整度；宁可少写，也不要为了填满某个 section 去补推断。
+- 直接证据（直接调用、直接解构、直接传参、直接响应构造）优先于弱证据（UI 展示、派生统计、附属导出、按钮状态）。
+- 若只能确认到文件层，就写 `path`；不要为了“看起来完整”去猜测 `path:line`。
+
+**query / impact 边界**:
+- query 的目标是把上层 Agent 快速送到目标附近：入口、定义点、主调用链、关键文件、关键符号。
+- impact 的目标是围绕已知 target 给出高价值影响边界：直接调用点、直接消费者、主要传播链、风险与修改顺序。
+- 不要把 query 做成穷尽式传播链分析；也不要在 impact 中替代“找目标”这一步。
+
 **spawn_agent 使用策略**:
 spawn_agent 将一个"可独立求解"的子问题委托给子 Agent 推理，子 Agent 拥有独立上下文，
 完成后将核心结论以 tool result 形式返回。它不是默认路径，而是隔离复杂子任务的手段。
@@ -244,6 +257,7 @@ impact 任务默认 Markdown 结构:
 - `直接调用点` 只写直接调用、直接解析、直接构造、直接字段消费的位置；按钮触发、页面跳转、后续流程归入“间接传播链”
 - `数据契约/返回值消费者` 只写返回值、响应字段、表单字段、序列化/反序列化等直接契约面
 - 不要用上游文件的位置去承载下游文件的行为；如果要描述前端接收，就必须列前端文件自己的定位
+- 如果某个 section 证据不足，可以少写；不要机械地把每个 section 都填满
 - 若某项无法确认,写入“不确定项”,不要编造\
 """
 
@@ -754,6 +768,10 @@ def _extract_location_keywords(bullet: str) -> list[str]:
             ):
                 continue
             add_token(piece)
+        if is_response_like:
+            for quoted_key in re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*:', token):
+                add_token(f'"{quoted_key}":')
+                add_token(f"'{quoted_key}':")
     for piece in _KEYWORD_TOKEN_RE.findall(text):
         add_token(piece)
 
@@ -874,6 +892,21 @@ def _find_better_line_in_file(
     return None if current_unreliable or current_score <= 0 else claimed_line
 
 
+def _find_best_line_by_keywords(lines: list[str], keywords: list[str]) -> int | None:
+    """在没有明确行号时，仅凭关键词为 bare path 选择最可信的行号。"""
+    if not keywords:
+        return None
+
+    best_line: int | None = None
+    best_score = 0
+    for idx in range(1, len(lines) + 1):
+        score = _score_line_window(lines, idx, keywords)
+        if score > best_score:
+            best_score = score
+            best_line = idx
+    return best_line if best_score > 0 else None
+
+
 def _normalize_location_token(
     file_token: str,
     line_token: str | None,
@@ -889,8 +922,6 @@ def _normalize_location_token(
     abs_path = project_root / file_path
     if not abs_path.exists() or not abs_path.is_file():
         return f"`{file_path}`"
-    if not line_token:
-        return f"`{file_path}`"
 
     try:
         lines = abs_path.read_text(encoding="utf-8").splitlines()
@@ -902,11 +933,15 @@ def _normalize_location_token(
     except Exception:
         return f"`{file_path}`"
 
+    keywords = _extract_location_keywords(bullet)
+    if not line_token:
+        inferred_line = _find_best_line_by_keywords(lines, keywords)
+        return f"`{file_path}:{inferred_line}`" if inferred_line is not None else f"`{file_path}`"
+
     claimed_line = _norm_line(line_token)
     if claimed_line is None:
         return f"`{file_path}`"
 
-    keywords = _extract_location_keywords(bullet)
     better_line = _find_better_line_in_file(lines, claimed_line, keywords)
     if better_line is None:
         return f"`{file_path}`"
@@ -963,24 +998,140 @@ def _should_filter_contract_bullet(title: str, line: str, *, target: str) -> boo
     return False
 
 
+def _looks_like_direct_consumer_bullet(line: str) -> bool:
+    """判断 bullet 是否更像直接消费者/直接契约面。"""
+    lowered = line.lower()
+    semantic_markers = (
+        "直接消费",
+        "直接接收",
+        "接收返回值",
+        "接收响应",
+        "解构返回值",
+        "承接返回值",
+        "直接赋值",
+        "直接存入",
+        "作为参数",
+        "作为输入",
+        "传递给下游",
+        "传入下游",
+        "解析为",
+        "序列化边界",
+        "反序列化边界",
+        "构造请求",
+        "构造响应",
+        "写入请求",
+        "写入响应",
+        "直接消费者",
+        "direct consumer",
+        "receive response",
+        "receive return value",
+        "deserialize",
+        "serialize",
+        "request construction",
+        "response construction",
+    )
+    return any(marker in lowered for marker in semantic_markers)
+
+
+def _looks_like_weak_indirect_bullet(line: str) -> bool:
+    """判断 bullet 是否更像弱传播链/派生展示链。"""
+    lowered = line.lower()
+    semantic_markers = (
+        "用于展示",
+        "用于显示",
+        "用于渲染",
+        "用于预览",
+        "用于下载",
+        "用于导出",
+        "用于统计",
+        "用于提示",
+        "用于界面",
+        "用于按钮状态",
+        "用于样式状态",
+        "派生字段",
+        "派生信息",
+        "附属信息",
+        "元信息",
+        "弱传播链",
+        "indirect display",
+        "used for display",
+        "used for rendering",
+        "used for preview",
+        "used for export",
+        "used for statistics",
+        "metadata",
+        "derived info",
+    )
+    return any(marker in lowered for marker in semantic_markers)
+
+
+def _sanitize_risk_line(line: str) -> str:
+    """风险段落只保留自然语言，不保留精确行号。"""
+    line = re.sub(
+        r"`((?:\./)?[A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+):(\d+)`",
+        lambda m: f"`{m.group(1)}`",
+        line,
+    )
+    line = re.sub(r"((?:\./)?[A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+):(\d+)", r"\1", line)
+    return line
+
+
 def _post_filter_impact_markdown(content: str, *, target: str) -> str:
     """对 impact Markdown 做轻量语义去歧义过滤。"""
-    rebuilt_sections: list[str] = []
-    for title, lines in _split_markdown_sections(content):
-        rebuilt_sections.append(f"## {title}")
-        kept = 0
+    sections = _split_markdown_sections(content)
+    contract_lines: list[str] = []
+    indirect_lines: list[str] = []
+    passthrough_sections: list[tuple[str, list[str]]] = []
+
+    for title, lines in sections:
+        if title not in {"数据契约/返回值消费者", "间接传播链"}:
+            if title == "风险":
+                cleaned = [
+                    _sanitize_risk_line(line) if line.lstrip().startswith("- ") else line
+                    for line in lines
+                ]
+                passthrough_sections.append((title, cleaned))
+            else:
+                passthrough_sections.append((title, list(lines)))
+            continue
+
+        passthrough_sections.append((title, []))
+
         for line in lines:
             stripped = line.lstrip()
-            if stripped.startswith("- ") and _should_filter_contract_bullet(
-                title, line, target=target
-            ):
+            if not stripped.startswith("- "):
                 continue
-            rebuilt_sections.append(line)
-            if stripped.startswith("- "):
-                kept += 1
-        if title in {"数据契约/返回值消费者", "间接传播链"} and kept == 0:
-            rebuilt_sections.append("- （未结构化提供）")
+            if _should_filter_contract_bullet(title, line, target=target):
+                continue
+            if title == "数据契约/返回值消费者" and _looks_like_weak_indirect_bullet(line):
+                indirect_lines.append(line)
+                continue
+            if title == "间接传播链" and _looks_like_direct_consumer_bullet(line):
+                contract_lines.append(line)
+                continue
+            if title == "数据契约/返回值消费者":
+                contract_lines.append(line)
+            else:
+                indirect_lines.append(line)
+
+    rebuilt_sections: list[str] = []
+    for title, lines in passthrough_sections:
+        rebuilt_sections.append(f"## {title}")
+        if title == "数据契约/返回值消费者":
+            lines = contract_lines or ["- （未结构化提供）"]
+        elif title == "间接传播链":
+            lines = indirect_lines or ["- （未结构化提供）"]
+        rebuilt_sections.extend(lines)
         rebuilt_sections.append("")
+
+    seen_titles = {title for title, _ in passthrough_sections}
+    if "数据契约/返回值消费者" not in seen_titles:
+        rebuilt_sections.extend(
+            ["## 数据契约/返回值消费者", *(contract_lines or ["- （未结构化提供）"]), ""]
+        )
+    if "间接传播链" not in seen_titles:
+        rebuilt_sections.extend(["## 间接传播链", *(indirect_lines or ["- （未结构化提供）"]), ""])
+
     return "\n".join(rebuilt_sections).strip()
 
 
@@ -991,11 +1142,19 @@ def _build_impact_task_prompt(target: str, change_type: str) -> str:
             f"请分析对 `{target}` 进行 `{change_type}` 变更的影响边界。",
             "",
             "任务要求:",
-            "1. 必须先使用 Serena 工具定位目标定义、所有直接引用点及关键边界符号。",
-            "2. 必须把结果拆分为：直接调用点、数据契约/返回值消费者、间接传播链。",
-            "3. 最终必须调用 deliver(answer=..., confidence=...)；"
+            "1. 这是一个“目标已知后的影响分析”任务，不是重新找目标的任务。",
+            "2. 必须先使用 Serena 工具定位目标定义、直接引用点及关键边界符号。",
+            "3. 必须把结果拆分为：直接调用点、数据契约/返回值消费者、间接传播链。",
+            "4. 先写强证据，再补弱证据；如果弱证据不足，可少写，不要为了填满 section 去补推断。",
+            "5. 最终必须调用 deliver(answer=..., confidence=...)；"
             "其中 answer 必须是结构化 Markdown 文本，不得输出 JSON、代码块或额外协议包装。",
-            "4. 只返回已被工具证实的信息；无法确认的内容写入“不确定项”，不要编造。",
+            "6. 只返回已被工具证实的信息；无法确认的内容写入“不确定项”，不要编造。",
+            "",
+            "优先级方法:",
+            "- 优先确认：直接调用、直接解构、直接传参、直接响应构造、直接请求解析。",
+            "- 其次确认：前端接收点、前端继续传递点、后端下游关键函数。",
+            "- 最后才考虑：UI 展示、派生统计、导出链路、按钮状态等弱传播链。",
+            "- 如果某条关系只是“可能相关”但证据不够强，应放入“不确定项”或忽略，而不是写进主链。",
             "",
             "证据约束:",
             "- 只有被工具直接确认过的定位才能写成 `path:line`。",
@@ -1036,6 +1195,7 @@ def _build_impact_task_prompt(target: str, change_type: str) -> str:
             "- `间接传播链` 再记录 UI 消费点、后续流程和更远的传播链。",
             "- `边界符号` 只保留关键定义点。",
             "- `风险` 区块只放自然语言总结，不要嵌套结构化对象。",
+            "- 如果某个 section 证据不足，允许只写一两条高价值条目；不要把“可能有关”的弱链路硬塞进去。",
         ]
     )
 
@@ -1225,98 +1385,6 @@ def _extract_strategy_search_keys(strategy_markdown: str) -> list[str]:
     return keys[:3]
 
 
-_GENERIC_MATCH_TOKENS = {
-    "api",
-    "app",
-    "backend",
-    "body",
-    "component",
-    "config",
-    "const",
-    "data",
-    "default",
-    "field",
-    "file",
-    "form",
-    "frontend",
-    "function",
-    "handler",
-    "json",
-    "line",
-    "module",
-    "path",
-    "post",
-    "put",
-    "query",
-    "request",
-    "response",
-    "result",
-    "return",
-    "route",
-    "state",
-    "temp",
-    "tmp",
-    "update",
-    "value",
-}
-
-_RESPONSE_RECEIVE_MARKERS = (
-    ".json()",
-    "res.json",
-    "response.json",
-    "await fetch",
-    "axios.",
-    ".value = data",
-    ".value=data",
-    "setstate(",
-    "dispatch(",
-)
-_REQUEST_PROPAGATION_MARKERS = (
-    "append(",
-    "formdata",
-    "json.stringify",
-    "body:",
-    "payload",
-    "params",
-    "fetch(",
-    "axios.",
-    ".post(",
-    ".put(",
-    ".patch(",
-)
-_RESPONSE_CONSTRUCT_MARKERS = (
-    "return {",
-    "return{",
-    "jsonresponse",
-    "json_response",
-    "jsonify(",
-    "response(",
-    "payload = {",
-    "payload={",
-)
-_REQUEST_PARSE_MARKERS = (
-    "json.loads(",
-    "json.load(",
-    "request.form",
-    "request.json",
-    "await request.json",
-    "body.get(",
-    ".get(",
-    "deserialize",
-    "parse_",
-)
-_LOCAL_NOISE_MARKERS = (
-    "form.value.",
-    "form.",
-    "computed(",
-    "computed({",
-    "derived",
-    "usememo(",
-    "memo(",
-    "selector(",
-)
-
-
 def _extract_pattern_terms(pattern: str) -> list[str]:
     """从检索键中提取较稳定的语义 token，用于轻量打分与注释。"""
     terms: list[str] = []
@@ -1324,7 +1392,7 @@ def _extract_pattern_terms(pattern: str) -> list[str]:
 
     def add(value: str) -> None:
         token = value.strip().strip("`'\"").lower()
-        if not token or token in seen or token in _GENERIC_MATCH_TOKENS or len(token) < 3:
+        if not token or token in seen or len(token) < 3:
             return
         seen.add(token)
         terms.append(token)
@@ -1347,60 +1415,88 @@ def _extract_pattern_terms(pattern: str) -> list[str]:
     return terms[:8]
 
 
-def _has_any_marker(lowered: str, markers: tuple[str, ...]) -> bool:
-    return any(marker in lowered for marker in markers)
+def _has_token_with_boundaries(text: str, token: str) -> bool:
+    return re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", text) is not None
+
+
+def _count_token_hits(text: str, token: str) -> int:
+    return len(re.findall(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", text))
+
+
+def _looks_like_object_key(snippet: str, token: str) -> bool:
+    return re.search(rf'["\']{re.escape(token)}["\']\s*:', snippet) is not None
+
+
+def _looks_like_assignment_flow(snippet: str, token: str) -> bool:
+    if "=" not in snippet:
+        return False
+    return _has_token_with_boundaries(snippet, token)
+
+
+def _looks_like_call_argument_flow(snippet: str, token: str) -> bool:
+    return re.search(rf"\([^)]*{re.escape(token)}[^)]*\)", snippet) is not None
+
+
+def _looks_like_local_default(snippet: str, token: str) -> bool:
+    return (
+        re.search(
+            rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])\s*[:=]\s*(?:['\"\[\{{]?\s*[\]}}'\"0-9a-z_-]*\s*)$",
+            snippet,
+        )
+        is not None
+    )
+
+
+def _looks_like_member_access(snippet: str, token: str) -> bool:
+    return re.search(rf"(?:\.|\[)\s*['\"]?{re.escape(token)}['\"]?\s*(?:\]|$)", snippet) is not None
+
+
+def _classify_semantic_relation(pattern: str, snippet: str) -> tuple[int, str]:
+    """基于结构关系而非技术栈 token 的 very light 语义判断。"""
+    lowered = snippet.lower()
+    terms = _extract_pattern_terms(pattern)
+    if not terms:
+        return 0, ""
+
+    score = 0
+    evidence_tags: list[str] = []
+
+    for term in terms:
+        if _has_token_with_boundaries(lowered, term):
+            score += 2
+        hits = _count_token_hits(lowered, term)
+        if hits > 1:
+            score += 1
+        if _looks_like_object_key(lowered, term):
+            score += 4
+            evidence_tags.append("structured-key")
+        if _looks_like_assignment_flow(lowered, term):
+            score += 2
+            evidence_tags.append("assignment-flow")
+        if _looks_like_call_argument_flow(lowered, term):
+            score += 2
+            evidence_tags.append("call-argument")
+        if _looks_like_member_access(lowered, term):
+            score += 1
+        if _looks_like_local_default(lowered, term):
+            score -= 4
+            evidence_tags.append("local-default")
+
+    note = ""
+    if "local-default" in evidence_tags and score <= 1:
+        note = "（疑似局部默认值/弱关联点）"
+    elif "structured-key" in evidence_tags:
+        note = "（疑似结构化键位/契约点）"
+    elif "call-argument" in evidence_tags:
+        note = "（疑似参数传递点）"
+    elif "assignment-flow" in evidence_tags:
+        note = "（疑似值承接点）"
+    return score, note
 
 
 def _classify_pattern_match(pattern: str, snippet: str) -> tuple[int, str]:
     """对单条 pattern 命中做 very light 语义分类。"""
-    lowered = snippet.lower()
-    score = 0
-    terms = _extract_pattern_terms(pattern)
-
-    strong_term_hits = 0
-    for term in terms:
-        if term in lowered:
-            score += 1
-            strong_term_hits += 1
-        if f'"{term}"' in lowered or f"'{term}'" in lowered:
-            score += 2
-        if f".{term}" in lowered or f"[{term}]" in lowered:
-            score += 1
-
-    is_local_noise = _has_any_marker(lowered, _LOCAL_NOISE_MARKERS)
-    is_response_receive = _has_any_marker(lowered, _RESPONSE_RECEIVE_MARKERS)
-    is_request_propagation = _has_any_marker(lowered, _REQUEST_PROPAGATION_MARKERS)
-    is_response_construct = _has_any_marker(lowered, _RESPONSE_CONSTRUCT_MARKERS)
-    is_request_parse = _has_any_marker(lowered, _REQUEST_PARSE_MARKERS)
-
-    if is_response_receive:
-        score += 4
-    if is_request_propagation:
-        score += 3
-    if is_response_construct:
-        score += 3
-    if is_request_parse:
-        score += 3
-
-    if is_local_noise and not (
-        is_response_receive or is_request_propagation or is_response_construct or is_request_parse
-    ):
-        score -= 5
-
-    note = ""
-    if is_local_noise and not (
-        is_response_receive or is_request_propagation or is_response_construct or is_request_parse
-    ):
-        note = "（同名本地表单/派生状态候选，默认不视为主传播链）"
-    elif is_response_receive and strong_term_hits:
-        note = "（疑似接收/反序列化点）"
-    elif is_response_construct and strong_term_hits:
-        note = "（疑似响应构造点）"
-    elif is_request_propagation and strong_term_hits:
-        note = "（疑似继续传递点）"
-    elif is_request_parse and strong_term_hits:
-        note = "（疑似请求解析点）"
-    return score, note
+    return _classify_semantic_relation(pattern, snippet)
 
 
 def _score_pattern_match(pattern: str, snippet: str) -> int:

@@ -54,11 +54,7 @@ logger = logging.getLogger(__name__)
 
 def _make_tool_description(summary: str, trigger: str, replaces: str) -> str:
     """拼装工具描述,遵循"明确替代关系、说明调用时机"的设计原则。"""
-    return (
-        f"{summary}\n"
-        f"触发时机: {trigger}\n"
-        f"替代操作: {replaces}"
-    )
+    return f"{summary}\n" f"触发时机: {trigger}\n" f"替代操作: {replaces}"
 
 
 def _text_response(content: Any) -> list[TextContent]:
@@ -73,11 +69,13 @@ def _markdown_response(content: str) -> list[TextContent]:
 
 def _error_response(error_code: str, message: str) -> list[TextContent]:
     """统一错误响应格式。"""
-    return _text_response({
-        "success": False,
-        "error_code": error_code,
-        "error_message": message,
-    })
+    return _text_response(
+        {
+            "success": False,
+            "error_code": error_code,
+            "error_message": message,
+        }
+    )
 
 
 def _structured_tool_result(content: dict[str, Any], *, is_error: bool = False) -> CallToolResult:
@@ -107,7 +105,6 @@ def _get_serena_timeout() -> int:
 # ============================================================================
 # 工具注册
 # ============================================================================
-
 
 
 def _extract_affected_path(tool_name: str, arguments: dict[str, Any]) -> str | None:
@@ -187,21 +184,19 @@ def _build_tools(
             name="pce_query",
             description=_make_tool_description(
                 summary=(
-                    "以自然语言提问,PCE 返回经过多步推理的结构化答案。"
-                    "最佳实践: 先把问题收敛到「定位定义点 / 梳理调用关系 / 确认模块职责」之一;"
-                    "如需直接落地修改,在 query 中明确要求返回 {file, line_range, name_path} 或 file:line,"
-                    "让上层 Agent 无需二次检索。"
-                    "示例: '认证逻辑的入口在哪里？请返回 {file, line_range, name_path} 列表';"
-                    "'PCEAgent.impact 的 JSON 解析逻辑在哪？请给出 file:line 和相关函数'。"
+                    "用于“先定位、后判断”的问题。"
+                    "适合：定位入口/定义点/主调用链、确认模块职责、缩小候选文件范围。"
+                    "不适合：在目标已经明确时要求它穷尽所有传播链或直接代替 impact。"
+                    "若希望上层 Agent 直接继续工作，可在 query 中要求返回 file:line 或 {file, line_range, name_path}。"
                 ),
                 trigger=(
-                    "需要理解模块职责、查找函数/类定义、理解调用关系,"
-                    "或在动手修改前先做「术前定位」时调用。"
-                    "若问题涉及多个候选文件或符号,先用 pce_query 缩小范围,再进入 pce_impact。"
+                    "当你还不知道“应该改哪里 / 看哪里 / 从哪里入手”时调用。"
+                    "若问题涉及多个候选文件、多个可能符号、多个可能入口，先用 pce_query 收敛目标；"
+                    "一旦目标已明确，再转 pce_impact。"
                 ),
                 replaces=(
-                    "替代传统 ls + cat + grep 的多步探索链;"
-                    "PCE 在独立上下文内完成全部检索与推理,不消耗也不污染上层 Agent 的对话上下文。"
+                    "替代手工 ls + cat + grep 的术前定位链。"
+                    "它的目标是把上层 Agent 快速送到目标附近，而不是一次性给出完整影响边界。"
                 ),
             ),
             inputSchema={
@@ -219,23 +214,19 @@ def _build_tools(
             name="pce_impact",
             description=_make_tool_description(
                 summary=(
-                    "给定修改目标,返回完整影响边界:所有直接引用点(含 file/line/snippet)、"
-                    "边界符号列表与建议修改顺序。"
-                    "最佳实践: 修改符号、接口、字段或文件前调用;明确 change_type,"
-                    "必要时补充 file 缩小歧义。可在 target 中追加输出要求。"
-                    "示例: target='build_index_incremental', change_type='change_signature', "
-                    "file='pce/indexer.py';"
-                    "target='SymbolRef 请返回每处引用点的行号、snippet 和建议修改顺序', "
-                    "change_type='change_signature', file='pce/models.py'。"
+                    "用于“目标已知”的影响边界分析。"
+                    "适合：改函数签名、改字段、改接口契约、改某个已知文件/符号。"
+                    "输出重点是直接调用点、直接消费者、主要传播链与修改顺序；"
+                    "结果应视为高价值边界参考，而不是绝对穷尽。"
                 ),
                 trigger=(
-                    "上层 Agent 准备修改某个符号、重命名接口、调整签名、删除字段或替换实现前调用,"
-                    "先拿到完整影响边界与精确修改位置。"
-                    "若目标本身尚未定位清楚,应先调用 pce_query 再做 impact。"
+                    "当你已经明确要改哪个符号、字段、接口或文件时调用。"
+                    "若 target 仍然模糊、还在多个候选之间摇摆，先用 pce_query；"
+                    "不要拿 pce_impact 代替“找目标”这一步。"
                 ),
                 replaces=(
-                    "替代手动追踪引用链(Cmd+Shift+F / grep -r)与反复 build 试错;"
-                    "多步检索与推理在 PCE 独立上下文完成,结果以结构化形式一次性交付给上层 Agent。"
+                    "替代手工追踪引用链与边改边试错。"
+                    "它的目标是先给出足够可靠的高价值边界，再由上层 Agent 结合实际修改做必要复核。"
                 ),
             ),
             inputSchema={
@@ -284,9 +275,9 @@ class PCEContext:
     def __init__(self) -> None:
         # 项目绑定状态
         self._bound_path: Path | None = None
-        self._init_state: Literal[
-            "uninitialized", "initializing", "initialized", "failed"
-        ] = "uninitialized"
+        self._init_state: Literal["uninitialized", "initializing", "initialized", "failed"] = (
+            "uninitialized"
+        )
         self._last_init_error: str | None = None
 
         # 运行时组件（pce_init 后才创建）
@@ -344,11 +335,7 @@ class PCEContext:
             logger.info("PCE 索引不存在，开始全量构建...")
             dirty = await self.staging.list_pending_reindex()
             all_paths = dirty.changed + dirty.deleted
-            hash_snapshot = (
-                await self.staging.snapshot_hashes(all_paths)
-                if all_paths
-                else None
-            )
+            hash_snapshot = await self.staging.snapshot_hashes(all_paths) if all_paths else None
             await build_index(
                 project_path=self.project_path,
                 serena_client=serena_client,
@@ -356,7 +343,8 @@ class PCEContext:
             )
             if all_paths:
                 await self.staging.acknowledge_after_reindex(
-                    all_paths, expected_hashes=hash_snapshot,
+                    all_paths,
+                    expected_hashes=hash_snapshot,
                 )
             logger.info("PCE 索引全量构建完成")
             return dirty
@@ -376,9 +364,7 @@ class PCEContext:
                 changed_files=dirty.changed,
                 deleted_files=dirty.deleted,
             )
-            await self.staging.acknowledge_after_reindex(
-                all_paths, expected_hashes=hash_snapshot
-            )
+            await self.staging.acknowledge_after_reindex(all_paths, expected_hashes=hash_snapshot)
             logger.info("增量索引更新完成")
 
         return dirty
@@ -525,9 +511,7 @@ class PCEContext:
         async with self._init_lock:
             # 路径冲突检查：只允许同路径操作
             if self._bound_path is not None and self._bound_path != resolved:
-                raise SerenaClientError(
-                    f"already bound to {self._bound_path}, restart to switch"
-                )
+                raise SerenaClientError(f"already bound to {self._bound_path}, restart to switch")
 
             if self._init_state == "initialized":
                 # 已完成：幂等快速返回
@@ -548,9 +532,7 @@ class PCEContext:
 
             else:
                 # "uninitialized" 或 "failed"：执行初始化
-                init_mode = (
-                    "retry_after_failure" if self._init_state == "failed" else "full_build"
-                )
+                init_mode = "retry_after_failure" if self._init_state == "failed" else "full_build"
                 self._bound_path = resolved
                 self._init_state = "initializing"
                 self._bootstrap_event.clear()
@@ -677,9 +659,7 @@ class PCEContext:
                 "session_acknowledged": 0,
             }
         )
-        insight_stats = (
-            await self.insight_cache.stats() if self.insight_cache is not None else None
-        )
+        insight_stats = await self.insight_cache.stats() if self.insight_cache is not None else None
         return {
             **status,
             "initialized": self._init_state == "initialized",
@@ -695,9 +675,7 @@ class PCEContext:
             ),
         }
 
-    async def handle_edit(
-        self, tool_name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def handle_edit(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """处理写工具请求，直接透传给 Serena（不经过 PCE Agent 推理）。
 
         写操作成功后，自动将受影响文件记录到暂存区。
@@ -750,7 +728,8 @@ class PCEContext:
                         deleted_files=dirty.deleted,
                     )
                     await self.staging.acknowledge_after_reindex(
-                        all_paths, expected_hashes=hash_snapshot,
+                        all_paths,
+                        expected_hashes=hash_snapshot,
                     )
                     message = "Serena 已重连，PCE 索引增量更新完成"
                 else:
@@ -770,9 +749,7 @@ class PCEContext:
                         insight_cache=self.insight_cache,
                         dirty_state=dirty,
                     )
-                    digest_warnings = [
-                        f"Digest: {w}" for w in digest_result.get("warnings", [])
-                    ]
+                    digest_warnings = [f"Digest: {w}" for w in digest_result.get("warnings", [])]
                     logger.info(
                         "pce_sync Digest 完成: resolved=%d pending=%d deleted_insights=%d",
                         digest_result.get("resolved_tasks", 0),
@@ -891,7 +868,7 @@ async def serve() -> None:
 
             # 写工具透传：pce_{serena_tool_name} → serena_client.call(serena_tool_name, args)
             if name.startswith("pce_"):
-                serena_tool = name[len("pce_"):]
+                serena_tool = name[len("pce_") :]
                 if serena_tool in EDIT_TOOL_NAMES:
                     result = await ctx.handle_edit(serena_tool, arguments)
                     return _text_response(result)

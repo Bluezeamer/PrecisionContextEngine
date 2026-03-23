@@ -148,7 +148,7 @@ def test_summarize_search_hits() -> None:
     _assert("`backend/app.py`" in summary, "搜索摘要缺少后端命中")
 
 
-def test_summarize_search_hits_marks_local_form_candidate() -> None:
+def test_summarize_search_hits_marks_generic_structural_relation() -> None:
     summary = _summarize_search_hits(
         "theme_config",
         {
@@ -157,7 +157,7 @@ def test_summarize_search_hits_marks_local_form_candidate() -> None:
             ]
         },
     )
-    _assert("同名本地表单/派生状态候选" in summary, "搜索摘要未标注本地表单字段歧义")
+    _assert("疑似值承接点" in summary, "搜索摘要未标注通用结构关系")
 
 
 def test_pattern_match_scoring_prefers_main_chain() -> None:
@@ -337,6 +337,118 @@ def test_post_validate_avoids_import_line_for_response_construct() -> None:
         _assert("`backend/app.py:4`" in normalized, "响应构造点不应被错误吸附到导入行")
 
 
+def test_post_validate_upgrades_bare_path_when_keywords_are_strong() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sample = root / "backend" / "app.py"
+        sample.parent.mkdir(parents=True, exist_ok=True)
+        sample.write_text(
+            "\n".join(
+                [
+                    "def handler():",
+                    "    is_valid, errors = validate_layer_order(layer_order, material_objs, required_pairs)",
+                    "    vis_str = visualize_layer_order(layer_order, material_objs)",
+                    "    segments = get_layer_segments(layer_order)",
+                    "    data = {",
+                    '        "layer_order": layer_order,',
+                    "    }",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        markdown = "\n".join(
+            [
+                "## 数据契约/返回值消费者",
+                '- `backend/app.py` — API 响应构造 `"layer_order": layer_order`',
+            ]
+        )
+        normalized = _post_validate_markdown_locations(markdown, project_root=root)
+        _assert("`backend/app.py:6`" in normalized, "bare path 未提升到更可信的响应构造行")
+
+
+def test_post_validate_keeps_bare_path_when_keywords_are_too_weak() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sample = root / "backend" / "app.py"
+        sample.parent.mkdir(parents=True, exist_ok=True)
+        sample.write_text(
+            "\n".join(
+                [
+                    "def handler():",
+                    "    return 'ok'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        markdown = "\n".join(
+            [
+                "## 间接传播链",
+                "- `backend/app.py` — 后端逻辑继续向下游传播",
+            ]
+        )
+        normalized = _post_validate_markdown_locations(markdown, project_root=root)
+        _assert("`backend/app.py`" in normalized, "弱证据 bare path 不应被强行提升行号")
+        _assert("`backend/app.py:`" not in normalized, "弱证据 bare path 不应生成伪精确行号")
+
+
+def test_post_filter_demotes_weak_consumers_to_indirect_chain() -> None:
+    markdown = "\n".join(
+        [
+            "## 数据契约/返回值消费者",
+            "- `backend/app.py:647` — 使用返回的 gray_map 用于预览展示",
+            "- `backend/app.py:614` — 接收 (height_map, gray_map) 二元组返回值",
+            "",
+            "## 间接传播链",
+            "- `frontend/src/ResultViewer.vue` — UI 展示高度图预览",
+        ]
+    )
+    filtered = _post_filter_impact_markdown(
+        markdown,
+        target="compute_height_and_grayscale",
+    )
+    contract_section = filtered.split("## 数据契约/返回值消费者", 1)[1].split("## 间接传播链", 1)[0]
+    indirect_section = filtered.split("## 间接传播链", 1)[1]
+    _assert("`backend/app.py:614`" in contract_section, "直接消费者不应被降级")
+    _assert("`backend/app.py:647`" not in contract_section, "弱消费者应从主消费者区块降级")
+    _assert("`backend/app.py:647`" in indirect_section, "弱消费者应被放入间接传播链")
+
+
+def test_post_filter_promotes_strong_consumers_from_indirect_chain() -> None:
+    markdown = "\n".join(
+        [
+            "## 数据契约/返回值消费者",
+            "- （未结构化提供）",
+            "",
+            "## 间接传播链",
+            "- `frontend/src/App.vue:529` — 前端接收响应赋值 layerOrderResult.value = data.data",
+        ]
+    )
+    filtered = _post_filter_impact_markdown(
+        markdown,
+        target="backend/app.py 中 /api/v2/layer-order 返回字段 layer_order",
+    )
+    contract_section = filtered.split("## 数据契约/返回值消费者", 1)[1].split("## 间接传播链", 1)[0]
+    indirect_section = filtered.split("## 间接传播链", 1)[1]
+    _assert("`frontend/src/App.vue:529`" in contract_section, "强消费者应提升到主消费者区块")
+    _assert(
+        "`frontend/src/App.vue:529`" not in indirect_section, "提升后的强消费者不应留在间接传播链"
+    )
+
+
+def test_post_filter_strips_precise_locations_from_risk_section() -> None:
+    markdown = "\n".join(
+        [
+            "## 风险",
+            "- 函数签名变更会导致 backend/app.py:51 中的调用点失效",
+            "- `backend/app.py:614` 这一调用点若未同步修改会报错",
+        ]
+    )
+    filtered = _post_filter_impact_markdown(markdown, target="compute_height_and_grayscale")
+    _assert("backend/app.py:51" not in filtered, "风险区块不应保留未校验的精确行号")
+    _assert("`backend/app.py:614`" not in filtered, "风险区块不应保留 backticked 精确行号")
+    _assert("backend/app.py" in filtered, "风险区块应保留文件级语义")
+
+
 def test_query_response_uses_location_validation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -382,7 +494,7 @@ def main() -> None:
     test_strategy_search_keys_extract()
     test_derive_strategy_search_keys()
     test_summarize_search_hits()
-    test_summarize_search_hits_marks_local_form_candidate()
+    test_summarize_search_hits_marks_generic_structural_relation()
     test_pattern_match_scoring_prefers_main_chain()
     test_pick_best_pattern_match_skips_local_default()
     test_fallback_structure()
@@ -391,6 +503,11 @@ def main() -> None:
     test_post_validate_downgrades_unverifiable_line()
     test_post_validate_prefers_response_receive_line()
     test_post_validate_avoids_import_line_for_response_construct()
+    test_post_validate_upgrades_bare_path_when_keywords_are_strong()
+    test_post_validate_keeps_bare_path_when_keywords_are_too_weak()
+    test_post_filter_demotes_weak_consumers_to_indirect_chain()
+    test_post_filter_promotes_strong_consumers_from_indirect_chain()
+    test_post_filter_strips_precise_locations_from_risk_section()
     test_query_response_uses_location_validation()
     print("impact contract tests passed")
 
