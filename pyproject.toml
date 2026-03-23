@@ -3,6 +3,7 @@ name = "pce"
 version = "0.1.0"
 description = "Precision Context Engine - A stateful reasoning middleware for code understanding"
 authors = [{name = "bluezeamer"}]
+license = {text = "GPL-3.0-or-later"}
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [

@@ -1,192 +1,90 @@
-# PCE (Precision Context Engine)
+# PCE — Precision Context Engine
 
-> 有状态推理中间层，为代码理解提供上下文压缩和影响边界分析
+一个为 AI 编程 Agent 设计的有状态代码理解中间件。
 
-## 项目定位
+PCE 位于你的 Agent（Claude Code、Codex 等）与代码库之间，负责处理入口定位、调用链追踪和变更影响分析这些繁琐工作——让 Agent 把上下文窗口留给真正的推理和编码，而不是反复搜索。
 
-PCE 是一个代码库分析MCP工具，通过对serena的封装以及agent机制，实现基于语义的代码库分析和相关代码片段的精确定位和修改范围影响边界的分析，同时通过以下设计提升代码理解效率：
+底层基于 [Serena](https://github.com/rosalab/serena) 的结构化分析能力，上层增加了 ReAct Agent 循环、增量索引和模块级认知缓存。
 
-1. **上下文压缩** — 将代码库背景理解的 token 开销降低
-2. **影响边界分析** — 在修改前给出完整的符号引用链，消除 build 试错循环
-3. **知识积累** — 建立项目索引 + InsightCache 跨会话认知缓存，随使用加深对项目的理解
+## 它做什么
+
+PCE 通过 MCP 协议暴露一组工具：
+
+| 工具         | 用途                                           |
+| ------------ | ---------------------------------------------- |
+| `pce_init`   | 绑定目标项目，启动 Serena，构建代码索引        |
+| `pce_query`  | 定位入口、追踪调用链、厘清模块职责             |
+| `pce_impact` | 对已知变更目标分析影响边界（签名、字段、接口） |
+| `pce_sync`   | 代码修改后重建索引                             |
+| `pce_status` | 查看初始化状态、索引统计、告警信息             |
+
+典型工作流：
+
+```
+pce_init(project_path=...)      # 绑定项目
+  → pce_query(...)              # 我要找的东西在哪？
+  → pce_impact(...)             # 改了它会影响什么？
+  → Agent 修改代码
+  → pce_sync()                  # 同步索引
+```
+
+目标还不明确时用 `pce_query`；目标已知、需要了解波及面时用 `pce_impact`。
 
 ## 快速开始
 
-### 环境要求
-
-- [uv](https://docs.astral.sh/uv/) 包管理器（用于 `uvx` 命令）
-
-### 安装
-
-PCE 通过 `uvx` 按需运行，无需克隆仓库或手动安装依赖：
+### 安装依赖
 
 ```bash
-# 验证是否可运行（可选）
-uvx --from git+https://github.com/Bluezeamer/PrecisionContextEngine pce serve
+uv sync --all-extras
+```
 
-# 在目标项目目录下创建 .env 文件
-cat > .env <<'EOF'
+### 配置环境
+
+```bash
+cp .env.example .env
+```
+
+最小配置：
+
+```env
 PCE_PROVIDER=openrouter
 PCE_MODEL=openai/gpt-4o-mini
 PCE_API_KEY=sk-or-...
-EOF
 ```
 
-> **说明**：Serena（PCE 的代码分析后端）和 PCE 本身均通过 `uvx` 自动获取与缓存，首次运行时会自动下载，后续复用缓存。
-> 项目索引在 Agent 调用 `pce_init` 工具后自动构建，无需手动操作。
-> 通过 Claude Code 使用时，MCP 配置会自动启动 PCE，通常无需手动在终端执行上面的命令。
+PCE 使用 [LiteLLM](https://github.com/BerriAI/litellm) 作为 LLM 调用层，支持 OpenAI、Anthropic、OpenRouter、本地端点等所有 LiteLLM 兼容的 provider。
 
-### 配置 Claude Code
+### 环境变量参考
 
-在 Claude Code 的 MCP 配置中添加：
+#### LLM 配置（核心）
 
-```json
-{
-  "mcpServers": {
-    "pce": {
-      "command": "uvx",
-      "args": ["--from", "git+<repository-url>", "pce", "serve"],
-      "env": {
-        "PCE_PROVIDER": "openrouter",
-        "PCE_MODEL": "openai/gpt-4o-mini",
-        "PCE_API_KEY": "sk-or-..."
-      }
-    }
-  }
-}
-```
+| 变量                  |  必填  | 默认值 | 说明                                                                         |
+| --------------------- | :----: | ------ | ---------------------------------------------------------------------------- |
+| `PCE_PROVIDER`        | **是** | —      | LiteLLM provider 名称，如 `openrouter`、`openai`、`anthropic`                |
+| `PCE_MODEL`           | **是** | —      | 该 provider 下的模型名。OpenRouter 下模型名可含斜杠，如 `openai/gpt-4o-mini` |
+| `PCE_API_KEY`         |   是   | —      | 统一传给 LiteLLM 的 API Key                                                  |
+| `PCE_BASE_URL`        |   否   | —      | 自定义 API 端点，用于第三方中转或本地部署（如 vLLM、LocalAI）                |
+| `PCE_API_BASE`        |   否   | —      | `PCE_BASE_URL` 的兼容别名，效果相同                                          |
+| `PCE_MODEL_FALLBACKS` |   否   | —      | 同 provider 下的模型降级链，逗号分隔，如 `gpt-4o-mini,gpt-4.1-mini`          |
 
-> 也可以不在 MCP config 中设置 `env`，将 `PCE_PROVIDER` / `PCE_MODEL` / `PCE_API_KEY` 等写入目标项目根目录的 `.env` 文件，PCE 在 `pce_init` 时自动加载（优先级低于 MCP env）。
+#### 运行配置（可选）
 
-### 在 Claude Code 中使用
+| 变量                 | 默认值       | 说明                                                                           |
+| -------------------- | ------------ | ------------------------------------------------------------------------------ |
+| `PCE_PROJECT_PATH`   | 当前工作目录 | 目标项目根路径（绝对路径）。MCP 模式下通常不需要设置，通过 `pce_init` 传入即可 |
+| `PCE_CONTEXT_WINDOW` | `256000`     | Agent 上下文窗口大小（token）。影响动态注入块的软上限（= 窗口 / 10）           |
+| `PCE_SERENA_TIMEOUT` | `180`        | Serena MCP 启动 / 初始化超时，单位秒                                           |
+| `PCE_LOG_LEVEL`      | `INFO`       | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`                               |
+| `PCE_TRACE_DIR`      | —            | 设置后启用 JSONL Trace 输出，将 Agent 推理过程写入该目录                       |
 
-每个会话开始时，**首先调用 `pce_init` 绑定目标项目**（仅需调用一次）：
+#### 网络与环境（可选）
 
-```
-> 使用 pce_init(project_path="/path/to/your/project") 初始化项目
-```
+| 变量               | 说明                                                                               |
+| ------------------ | ---------------------------------------------------------------------------------- |
+| `UV_DEFAULT_INDEX` | uv 依赖下载源，网络受限时可切换镜像，如 `https://pypi.tuna.tsinghua.edu.cn/simple` |
+| `NO_PROXY`         | 代理绕过列表                                                                       |
 
-初始化完成后，即可使用其余工具：
-
-```
-> 使用 pce_query 查询: "认证逻辑的入口在哪里?"
-> 使用 pce_impact 分析修改影响: target="UserSession", change_type="modify"
-> 使用 pce_status 查看当前索引状态和 warnings
-```
-
-> 若未调用 `pce_init`，`pce_query` / `pce_impact` / `pce_sync` 及写工具均不可用；`pce_status` 可在初始化前后随时调用。
-
-## MCP 工具
-
-### `pce_init`
-绑定目标项目并触发初始化。**每个会话开始时首先调用一次**，传入目标项目的绝对路径。
-
-- 内部流程：路径校验 → 状态机检查 → Serena 连接（`uvx` 拉起）→ `activate_project` 校验 → 全量/增量索引构建
-- 同一路径重复调用可直接复用（幂等）；若已绑定其他路径则返回错误，需重启服务切换项目
-
-### `pce_query`
-自然语言查询代码库。PCE 内部通过 ReAct 循环驱动 Serena 工具检索代码结构，返回经过推理的**结构化 Markdown** 结果（默认包含结论、关键证据、相关符号、相关文件、不确定项）。
-
-### `pce_impact`
-变更影响分析。返回**结构化 Markdown** 结果（默认包含直接影响点、边界符号、风险、不确定项、建议修改顺序）。
-
-### `pce_status`
-查询 PCE 当前状态，包括索引信息、bootstrap 状态、warnings、InsightCache 统计。
-
-### `pce_sync`
-通知 PCE 代码库已发生大量变更。触发 Serena 重连 + 索引重建 + InsightCache 过期清理。适用于上层 Agent 完成一批修改后的批量沉淀。
-
-> 日常小改动无需调用 `pce_sync` — PCE 的 FileWatcher 会实时追踪变更，查询时自动注入脏文件上下文。
-
-### 写工具（透传）
-PCE 还会透传 Serena 的符号编辑工具（加 `pce_` 前缀）：`pce_replace_symbol_body`、`pce_insert_after_symbol`、`pce_insert_before_symbol`、`pce_rename_symbol`。
-
-## 技术架构
-
-```
-上层 Agent (Claude Code 等)
-    ↓ MCP (pce_init / pce_query / pce_impact / pce_status / pce_sync)
-PCE MCP Server
-    ├─ PCEAgent (ReAct 循环，时间预算制)
-    │   ├─ SubAgent spawn (深度限制 depth≤1)
-    │   └─ InsightCache (跨会话认知缓存)
-    ├─ Bootstrap（pce_init 驱动：路径校验 → Serena 连接 → activate_project → 索引构建）
-    ├─ FileWatcher + StagingArea (实时文件变更追踪)
-    └─ SerenaClient (MCP stdio 通信，uvx 按需拉起)
-        ↓ MCP
-Serena MCP Server (LSP + 文件系统)
-```
-
-### 核心模块
-
-```
-pce/
-├── agent.py               ReAct Agent（模型降级路由 + SubAgent spawn）
-├── agent_runtime/
-│   ├── contracts.py       SpawnRequest/Result/schema/常量
-│   └── spawner.py         invoke_spawn() 执行器
-├── insight_cache.py       持久化认知缓存（跨会话知识积累）
-├── serena_client.py       Serena MCP 客户端
-├── tool_provider.py       ToolProvider Protocol
-├── mock_tool_provider.py  离线 Mock（含 spawn_agent mock 规则）
-├── models.py              Pydantic 数据模型
-├── indexer.py             代码索引构建（全量/增量）
-├── staging.py             文件变更暂存区 + FileWatcher
-├── memory.py              Memory 读写管理
-├── server.py              MCP Server 入口（bootstrap + 工具路由）
-└── cli.py                 CLI 入口
-```
-
-## 环境变量
-
-> 推荐通过 MCP config 的 `env` 段设置，避免明文写入磁盘文件。
-> 也支持系统环境变量或项目根目录的 `.env` 文件（优先级：MCP env > 系统 env > `.env`）。
-
-| 变量 | 用途 | 默认值 |
-|------|------|--------|
-| `PCE_PROVIDER` | LiteLLM provider（**必填**，如 `openrouter` / `openai` / `anthropic`） | — |
-| `PCE_MODEL` | 该 provider 下的模型名（**必填**） | — |
-| `PCE_MODEL_FALLBACKS` | 同 provider 下的降级模型名列表（逗号分隔，可选） | 空（不降级） |
-| `PCE_API_KEY` | litellm 通用 API Key（覆盖供应商默认 key） | — |
-| `PCE_BASE_URL` | 自定义 Base URL（可选，常用于第三方中转或兼容端点） | — |
-| `PCE_API_BASE` | `PCE_BASE_URL` 的兼容别名 | — |
-| `PCE_SERENA_TIMEOUT` | Serena 连接/工具调用超时（秒） | `180` |
-| `PCE_CONTEXT_WINDOW` | 上下文窗口大小（token） | `256000` |
-| `PCE_LOG_LEVEL` | 日志级别 | `INFO` |
-
-### 模型降级路由
-
-当主模型遇到限流（429）、鉴权失败（401/403）或模型不存在（404）时，PCE 会自动切换到 `PCE_MODEL_FALLBACKS` 中的下一个候选模型。这里的 fallback 只写“模型名”部分，provider / base URL / API key 沿用主模型配置。litellm 自身已有单模型重试机制，PCE 只做模型级切换。
-
-```bash
-# OpenRouter 示例：在同一 provider=openrouter 下切换模型
-PCE_PROVIDER=openrouter
-PCE_MODEL=openai/gpt-4o-mini
-PCE_MODEL_FALLBACKS=anthropic/claude-3.5-haiku,google/gemini-2.0-flash-001
-```
-
-### 供应商配置示例
-
-PCE 底层使用 litellm，支持所有主流供应商。推荐在 MCP config 的 `env` 段配置：
-
-```json
-{
-  "mcpServers": {
-    "pce": {
-      "command": "uvx",
-      "args": ["--from", "git+<repository-url>", "pce", "serve"],
-      "env": {
-        "PCE_PROVIDER": "openai",
-        "PCE_MODEL": "gpt-4o-mini",
-        "PCE_API_KEY": "sk-...",
-        "PCE_BASE_URL": "https://api.openai.com/v1"
-      }
-    }
-  }
-}
-```
-
-常用供应商写法：
+#### 常见接入方式示例
 
 ```bash
 # OpenRouter
@@ -199,21 +97,16 @@ PCE_PROVIDER=openai
 PCE_MODEL=gpt-4o-mini
 PCE_API_KEY=sk-...
 
-# Anthropic Claude
+# Anthropic 直连
 PCE_PROVIDER=anthropic
 PCE_MODEL=claude-3-haiku-20240307
 PCE_API_KEY=sk-ant-...
 
-# OpenAI 兼容自建端点（如 vLLM / LocalAI）
+# OpenAI 兼容端点（vLLM / LocalAI / 第三方中转）
 PCE_PROVIDER=openai
 PCE_MODEL=your-model-name
 PCE_API_KEY=your-key
 PCE_BASE_URL=http://localhost:8000/v1
-
-# OpenRouter 下选择其他上游模型（模型名本身可带斜杠）
-PCE_PROVIDER=openrouter
-PCE_MODEL=anthropic/claude-sonnet-4
-PCE_API_KEY=sk-or-...
 
 # Anthropic 协议兼容中转
 PCE_PROVIDER=anthropic
@@ -222,39 +115,226 @@ PCE_API_KEY=your-key
 PCE_BASE_URL=https://your-anthropic-proxy.example.com
 ```
 
-## 开发
+完整示例见 [.env.example](./.env.example)。
 
-### 安装开发依赖
+### 启动
+
+```bash
+uv run pce serve
+```
+
+PCE 以 stdio MCP server 方式运行，目标项目通过 `pce_init` 在运行时绑定。
+
+## MCP 接入
+
+在你的 Agent MCP 配置中添加（以 Claude Code 为例）：
+
+```json
+{
+  "mcpServers": {
+    "pce": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Bluezeamer/PrecisionContextEngine",
+        "pce",
+        "serve"
+      ],
+      "env": {
+        "PCE_PROVIDER": "openrouter",
+        "PCE_MODEL": "openai/gpt-4o-mini",
+        "PCE_API_KEY": "sk-or-..."
+      }
+    }
+  }
+}
+```
+
+## 设计思路
+
+- **双工具分治。** `query` 负责定位，`impact` 负责边界分析。拆开而非合成一个大而全的黑箱，让每个工具的契约可测试、可预期。
+- **Markdown 优先输出。** 结果是结构化 Markdown——人可以直接阅读，Agent 可以直接引用或追问，不依赖脆弱的 JSON schema。
+- **增量认知。** 模块级 digest、baseline、annotation 在调用间持久化，Agent 不需要每次会话都从零重新理解项目。
+- **Ignore-first 文件发现。** 先尊重项目 `.gitignore`，再叠加 PCE 自身排除规则。不会意外索引 `node_modules` 或 `.venv`。
+
+## 项目结构
+
+```
+pce/
+├── agent.py                 ReAct Agent（query & impact 循环）
+├── server.py                MCP 工具注册与路由
+├── indexer.py               全量 / 增量索引构建
+├── digest_agent.py          模块级 digest 生成
+├── digest_delta_builder.py  增量 digest 更新
+├── insight_cache.py         跨调用认知缓存
+├── module_registry.py       模块 identity 追踪
+├── serena_client.py         Serena MCP 客户端适配
+├── memory.py                .pce/ 目录布局与持久化
+├── staging.py               脏文件追踪 & 文件监听
+└── file_discovery.py        Ignore-aware 文件发现
+```
+
+## 开发与测试
+
+```bash
+# 格式检查
+uv run --with black python -m black --check pce scripts
+
+# 鲁棒性测试
+uv run python scripts/test_react_robustness.py
+
+# impact 契约测试
+uv run python scripts/test_impact_contract.py
+```
+
+## 当前状态
+
+PCE 处于早期活跃开发阶段。`query` 已经可以稳定用于日常代码导航；`impact` 能提供有价值的影响边界参考，但长尾边界仍在持续收敛。
+
+现阶段它最适合作为编程 Agent 的理解加速层——而不是一个保证穷尽的静态分析器。
+
+## 环境要求
+
+- Python 3.11 – 3.12
+- [uv](https://github.com/astral-sh/uv) 包管理工具
+
+## 许可证
+
+[GPL-3.0](./LICENSE)
+
+---
+
+<details>
+<summary>English</summary>
+
+# PCE — Precision Context Engine
+
+A stateful code-understanding middleware for AI coding agents.
+
+PCE sits between your agent (Claude Code, Codex, etc.) and the codebase. It handles entry-point location, call-chain tracing, and change-impact analysis — so the agent can spend its context window on reasoning and coding rather than repeated searches.
+
+Built on [Serena](https://github.com/rosalab/serena) for structural analysis, with an added ReAct agent layer, incremental indexing, and module-level cognitive caching.
+
+## What it does
+
+PCE exposes a small set of MCP tools:
+
+| Tool         | Purpose                                                                         |
+| ------------ | ------------------------------------------------------------------------------- |
+| `pce_init`   | Bind to a project, start Serena, build the code index                           |
+| `pce_query`  | Locate entry points, trace call chains, clarify module responsibilities         |
+| `pce_impact` | Analyze the blast radius of a known change target (signature, field, interface) |
+| `pce_sync`   | Re-index after code modifications                                               |
+| `pce_status` | Check initialization state, index stats, warnings                               |
+
+Typical workflow:
+
+```
+pce_init(project_path=...)      # bind to the project
+  → pce_query(...)              # where is the thing I need?
+  → pce_impact(...)             # what breaks if I change it?
+  → agent edits code
+  → pce_sync()                  # update the index
+```
+
+Use `pce_query` when you don't yet know where to look. Use `pce_impact` when the target is clear and you need its dependency surface.
+
+## Getting started
+
+### Install
 
 ```bash
 uv sync --all-extras
 ```
 
-### 代码风格
+### Configure
 
 ```bash
-uv run black pce
-uv run ruff check pce
-uv run mypy pce
+cp .env.example .env
 ```
 
-### 运行测试
+Minimal setup:
+
+```env
+PCE_PROVIDER=openrouter
+PCE_MODEL=openai/gpt-4o-mini
+PCE_API_KEY=sk-or-...
+```
+
+PCE uses [LiteLLM](https://github.com/BerriAI/litellm) under the hood — any provider it supports (OpenAI, Anthropic, OpenRouter, local endpoints, etc.) works out of the box.
+
+### Environment variables
+
+#### LLM configuration (required)
+
+| Variable              |  Required   | Default | Description                                                                                  |
+| --------------------- | :---------: | ------- | -------------------------------------------------------------------------------------------- |
+| `PCE_PROVIDER`        |   **Yes**   | —       | LiteLLM provider name, e.g. `openrouter`, `openai`, `anthropic`                              |
+| `PCE_MODEL`           |   **Yes**   | —       | Model name under the provider. May contain slashes for OpenRouter, e.g. `openai/gpt-4o-mini` |
+| `PCE_API_KEY`         | Recommended | —       | API key passed to LiteLLM                                                                    |
+| `PCE_BASE_URL`        |     No      | —       | Custom API endpoint for proxies or local deployments (vLLM, LocalAI, etc.)                   |
+| `PCE_API_BASE`        |     No      | —       | Legacy alias for `PCE_BASE_URL`                                                              |
+| `PCE_MODEL_FALLBACKS` |     No      | —       | Comma-separated fallback models under the same provider                                      |
+
+#### Runtime configuration (optional)
+
+| Variable             | Default  | Description                                                                                  |
+| -------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `PCE_PROJECT_PATH`   | cwd      | Target project root (absolute path). Usually not needed in MCP mode — use `pce_init` instead |
+| `PCE_CONTEXT_WINDOW` | `256000` | Agent context window size in tokens. Dynamic injection soft limit = window / 10              |
+| `PCE_SERENA_TIMEOUT` | `180`    | Serena MCP startup timeout in seconds                                                        |
+| `PCE_LOG_LEVEL`      | `INFO`   | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR`                                            |
+| `PCE_TRACE_DIR`      | —        | When set, writes JSONL traces of agent reasoning to this directory                           |
+
+See [.env.example](./.env.example) for full examples including various provider setups.
+
+### Run
 
 ```bash
-# 单元测试（43 个场景，含 ReAct 循环健壮性 + spawn 路径 + fallback markers）
-uv run python scripts/test_react_robustness.py
-
-# 端到端集成测试（需要真实 Serena + LLM API Key）
-uv run python scripts/test_e2e.py
+uv run pce serve
 ```
 
-## 文档
+PCE runs as a stdio-based MCP server. The target project is bound at runtime via `pce_init`.
 
-- [设计文档](docs/PCE_design.md)
-- [SubAgent 架构设计](docs/design_subagent_architecture.md)
-- [实施计划](docs/implementation_plan.md)
-- [开发进度](docs/progress.md)
+## MCP integration
+
+Add to your agent's MCP config (e.g. Claude Code `settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "pce": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Bluezeamer/PrecisionContextEngine",
+        "pce",
+        "serve"
+      ],
+      "env": {
+        "PCE_PROVIDER": "openrouter",
+        "PCE_MODEL": "openai/gpt-4o-mini",
+        "PCE_API_KEY": "sk-or-..."
+      }
+    }
+  }
+}
+```
+
+## Design choices
+
+- **Two-tool split.** `query` locates, `impact` analyzes boundaries. Separate contracts instead of a monolithic black box.
+- **Markdown-first output.** Structured Markdown — human-readable, agent-quotable, no fragile JSON schemas.
+- **Incremental cognition.** Module-level digests, baselines, and annotations persist across calls.
+- **Ignore-first file discovery.** Respects `.gitignore` before applying PCE's own exclusions.
+
+## Requirements
+
+- Python 3.11 – 3.12
+- [uv](https://github.com/astral-sh/uv)
 
 ## License
 
-MIT
+[GPL-3.0](./LICENSE)
+
+</details>
