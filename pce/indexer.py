@@ -31,6 +31,7 @@ import aiofiles
 import litellm
 
 from ._env import build_litellm_model, get_completion_overrides, get_env_text
+# annotation_tree 不再直接使用，树生成逻辑已内联到本文件
 from .file_discovery import (
     HARD_SKIP_DIRS,
     SYMBOL_INDEX_EXTENSIONS,
@@ -81,6 +82,7 @@ DEFAULT_CONCURRENCY = 10
 
 ANNOTATIONS_DIR = "annotations"
 ANNOTATIONS_INDEX_FILE = "index.md"
+ANNOTATIONS_AREAS_DIR = "areas"
 ANNOTATIONS_MODULES_DIR = "modules"
 
 
@@ -1172,14 +1174,29 @@ async def _ensure_generated_pceignore(
 # ============================================================================
 
 
+def _annotation_root_dir(root_path: Path) -> Path:
+    """返回 .pce/annotations/ 目录路径。"""
+    return root_path / ".pce" / ANNOTATIONS_DIR
+
+
+def _annotation_areas_dir(root_path: Path) -> Path:
+    """返回 .pce/annotations/areas/ 目录路径。"""
+    return _annotation_root_dir(root_path) / ANNOTATIONS_AREAS_DIR
+
+
 def _annotation_index_path(root_path: Path) -> Path:
     """返回 .pce/annotations/index.md 路径。"""
-    return root_path / ".pce" / ANNOTATIONS_DIR / ANNOTATIONS_INDEX_FILE
+    return _annotation_root_dir(root_path) / ANNOTATIONS_INDEX_FILE
 
 
 def _annotation_modules_dir(root_path: Path) -> Path:
     """返回 .pce/annotations/modules/ 目录路径。"""
-    return root_path / ".pce" / ANNOTATIONS_DIR / ANNOTATIONS_MODULES_DIR
+    return _annotation_root_dir(root_path) / ANNOTATIONS_MODULES_DIR
+
+
+def _annotation_area_module_path(root_path: Path, area_slug: str, module_slug: str) -> Path:
+    """返回 .pce/annotations/areas/{area}/modules/{module}.md 路径。"""
+    return _annotation_areas_dir(root_path) / area_slug / "modules" / f"{module_slug}.md"
 
 
 def _module_slug(module_name: str) -> str:
@@ -1930,6 +1947,59 @@ async def _cleanup_stale_module_docs(modules_dir: Path, section_slugs: set[str])
             await asyncio.to_thread(stale.unlink, missing_ok=True)
 
 
+async def _cleanup_stale_annotation_docs(
+    root_path: Path,
+    expected_files: set[Path],
+) -> None:
+    """根据期望文件集合清理 annotations 下的过期文档。
+
+    兼容新布局（areas/*.md + navigation_tree.json）和旧布局残留。
+    expected_files 中的路径均为相对于 .pce/annotations/ 的路径。
+    """
+    annotation_root = _annotation_root_dir(root_path)
+    if not annotation_root.exists():
+        return
+
+    expected_posix = {p.as_posix() for p in expected_files}
+
+    # 收集所有候选文件（含新布局和旧布局残留）
+    candidates: list[Path] = []
+    for pattern in (
+        "index.md",
+        "navigation_tree.json",
+        "modules/*.md",
+        "areas/*.md",
+        "areas/*/README.md",
+        "areas/*/modules/*.md",
+    ):
+        candidates.extend(annotation_root.glob(pattern))
+
+    for stale in candidates:
+        rel = stale.relative_to(annotation_root).as_posix()
+        if rel not in expected_posix:
+            await asyncio.to_thread(stale.unlink, missing_ok=True)
+
+    # 清理空的 areas 子目录（仅限 areas/ 下，不触碰其它目录）
+    areas_dir = _annotation_areas_dir(root_path)
+    if areas_dir.exists():
+        for area_subdir in sorted(areas_dir.iterdir(), reverse=True):
+            if not area_subdir.is_dir():
+                continue
+            # 先清理空的 modules/ 子目录
+            modules_subdir = area_subdir / "modules"
+            if modules_subdir.is_dir() and not any(modules_subdir.iterdir()):
+                try:
+                    await asyncio.to_thread(modules_subdir.rmdir)
+                except OSError:
+                    pass
+            # 再清理空的 area 目录
+            if not any(area_subdir.iterdir()):
+                try:
+                    await asyncio.to_thread(area_subdir.rmdir)
+                except OSError:
+                    pass
+
+
 def _parse_index_md(index_content: str) -> dict[str, list[str]]:
     """返回模块 slug -> 文件路径列表的映射（供增量更新反查）。"""
     _, sections = _split_index_md(index_content)
@@ -2010,26 +2080,48 @@ def _build_temporary_section(file_path: str) -> dict[str, Any]:
 
 
 async def _load_sections_from_existing_module_docs(root_path: Path) -> list[dict[str, Any]]:
-    """从已有 modules/*.md 中恢复章节信息。
+    """从已有模块文档中恢复章节信息，兼容 flat/tree 两种布局。
 
     用途：
     - 当 LLM 生成的 index.md 漏掉部分现有模块时，避免直接退化为粗粒度 fallback 模块
     - 将已经存在的细粒度认知文档重新纳入 section 体系，后续再由 registry 稳定化
-    """
-    modules_dir = _annotation_modules_dir(root_path)
-    if not modules_dir.exists():
-        return []
 
+    优先级：tree 布局（areas/*/modules/*.md）> flat 布局（modules/*.md），
+    同 stem 的文档一旦在 tree 中命中就不再回退读取 flat 版本。
+    """
+    seen_stems: set[str] = set()
+    seen_slugs: set[str] = set()
     sections: list[dict[str, Any]] = []
-    for module_path in sorted(modules_dir.glob("*.md")):
-        try:
-            raw = module_path.read_text("utf-8")
-        except Exception:
-            logger.warning(f"读取已有模块文档失败，跳过恢复: {module_path}")
-            continue
-        section = _parse_existing_module_doc_to_section(raw, module_path.stem)
-        if section is not None:
-            sections.append(section)
+
+    # 分组扫描，显式保证 tree-first
+    scan_groups: list[list[Path]] = []
+
+    # tree 布局优先：areas/*/modules/*.md
+    areas_dir = _annotation_areas_dir(root_path)
+    if areas_dir.exists():
+        scan_groups.append(sorted(areas_dir.glob("*/modules/*.md")))
+
+    # flat 布局兜底：modules/*.md
+    modules_dir = _annotation_modules_dir(root_path)
+    if modules_dir.exists():
+        scan_groups.append(sorted(modules_dir.glob("*.md")))
+
+    for group in scan_groups:
+        for module_path in group:
+            # stem 早期去重：tree 命中后跳过 flat 同名文档
+            stem = module_path.stem
+            if stem in seen_stems:
+                continue
+            try:
+                raw = module_path.read_text("utf-8")
+            except Exception:
+                logger.warning(f"读取已有模块文档失败，跳过恢复: {module_path}")
+                continue
+            section = _parse_existing_module_doc_to_section(raw, stem)
+            if section is not None and section["slug"] not in seen_slugs:
+                seen_stems.add(stem)
+                seen_slugs.add(section["slug"])
+                sections.append(section)
     return sections
 
 
@@ -2340,6 +2432,554 @@ def _extract_module_key_symbols(module_entries: list[IndexEntry]) -> list[str]:
     return _dedupe_keep_order(symbols)
 
 
+# ============================================================================
+# 树状导航生成（facts 构建 / 生成 / 校验 / 修复 / fallback / 渲染）
+# ============================================================================
+
+
+import hashlib
+
+from .models import AreaRecord, NavigationTree
+
+NAVIGATION_TREE_FILE = "navigation_tree.json"
+NAVIGATION_FALLBACK_AREA_SLUG = "fallback"
+NAVIGATION_FALLBACK_AREA_NAME = "未分类（Fallback）"
+
+
+def _extract_section_summary(section: dict[str, Any]) -> str:
+    """从扁平 section 中提取一段适合导航树展示的摘要。"""
+    for line in section.get("body_lines", []):
+        match = re.match(r"^职责[:：]\s*(.+)$", line.strip())
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    for line in section.get("body_lines", []):
+        stripped = line.strip()
+        if not stripped or re.match(r"^(文件|详细认知)[:：]\s*", stripped):
+            continue
+        return stripped
+    return ""
+
+
+def _compute_source_digest(sections: list[dict[str, Any]]) -> str:
+    """基于稳定 slug 与文件签名计算导航源指纹（纯 Python 侧计算）。"""
+    payload = [
+        {
+            "slug": section["slug"],
+            "files": sorted(_dedupe_keep_order(section.get("file_paths", []))),
+        }
+        for section in sorted(sections, key=lambda s: s["slug"])
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_navigation_facts(
+    sections: list[dict[str, Any]],
+    entries_map: dict[str, IndexEntry],
+    root_path: Path,
+) -> dict[str, Any]:
+    """构建三层导航生成所需的受控事实包（有固定预算）。"""
+    # 项目级 facts
+    top_dir_entries: dict[str, list[IndexEntry]] = defaultdict(list)
+    language_counter: Counter[str] = Counter()
+    for entry in entries_map.values():
+        parts = Path(entry.file_meta.path).parts
+        top_dir = f"{parts[0]}/" if len(parts) > 1 else "./"
+        top_dir_entries[top_dir].append(entry)
+        language_counter[entry.file_meta.language] += 1
+
+    # 顶层目录摘要（限宽度 8）
+    top_level_dirs = [
+        {
+            "path": directory,
+            "file_count": len(items),
+            "languages": _format_language_summary(items, max_items=3),
+            "representatives": _select_representative_paths(items, max_items=3),
+        }
+        for directory, items in sorted(
+            top_dir_entries.items(), key=lambda x: (-len(x[1]), x[0])
+        )[:8]
+    ]
+
+    # 模块级 facts（预算受控）
+    module_facts: list[dict[str, Any]] = []
+    for section in sorted(sections, key=lambda s: s["slug"]):
+        file_paths = [
+            p for p in _dedupe_keep_order(section.get("file_paths", []))
+            if p in entries_map
+        ]
+        module_entries = [entries_map[p] for p in file_paths]
+        summary = _extract_section_summary(section)
+        if len(summary) > 150:
+            summary = summary[:147].rstrip() + "..."
+        module_facts.append({
+            "slug": section["slug"],
+            "display_name": section["name"],
+            "representative_files": file_paths[:5],
+            "key_symbols": _extract_module_key_symbols(module_entries)[:6],
+            "summary": summary,
+        })
+
+    primary_language = (
+        language_counter.most_common(1)[0][0] if language_counter else "unknown"
+    )
+    # 区域候选 hints（弱提示，可置空不影响主流程）
+    area_hints = _select_core_areas(top_dir_entries)
+
+    return {
+        "project": {
+            "name": root_path.name,
+            "file_count": len(entries_map),
+            "primary_language": primary_language,
+            "top_level_dirs": top_level_dirs,
+        },
+        "modules": module_facts,
+        "area_hints": area_hints,
+        "source_digest": _compute_source_digest(sections),
+    }
+
+
+def _validate_navigation_tree(
+    tree: NavigationTree, active_slugs: set[str]
+) -> list[str]:
+    """校验导航树结构完整性，返回错误列表（空列表表示通过）。"""
+    errors: list[str] = []
+    area_slug_seen: set[str] = set()
+    mounted: dict[str, str] = {}
+    fallback_areas = [a for a in tree.areas if a.is_fallback]
+
+    if not 2 <= len(tree.areas) <= 8:
+        errors.append(f"area 数量必须在 2-8 之间，当前为 {len(tree.areas)}")
+
+    for area in tree.areas:
+        if area.slug in area_slug_seen:
+            errors.append(f"区域 slug 重复: {area.slug}")
+        area_slug_seen.add(area.slug)
+
+        if not area.is_fallback and not area.module_slugs:
+            errors.append(f"非 fallback 区域不能为空: {area.slug}")
+
+        for ms in area.module_slugs:
+            if ms not in active_slugs:
+                errors.append(f"区域 {area.slug} 引用了不存在模块: {ms}")
+                continue
+            prev = mounted.get(ms)
+            if prev is not None and prev != area.slug:
+                errors.append(
+                    f"模块重复挂载: {ms} 同时出现在 {prev} / {area.slug}"
+                )
+                continue
+            mounted[ms] = area.slug
+
+    if len(fallback_areas) != 1:
+        errors.append(
+            f"fallback 区域必须恰好 1 个，当前为 {len(fallback_areas)}"
+        )
+    elif fallback_areas[0].slug != tree.fallback_area_slug:
+        errors.append(
+            f"fallback_area_slug ({tree.fallback_area_slug}) "
+            f"与 fallback 记录 ({fallback_areas[0].slug}) 不一致"
+        )
+
+    missing = sorted(active_slugs - set(mounted))
+    if missing:
+        errors.append("存在未覆盖模块: " + ", ".join(missing[:12]))
+
+    return errors
+
+
+def _repair_navigation_tree(
+    tree: NavigationTree, active_slugs: set[str]
+) -> NavigationTree:
+    """自动修复导航树中的常见结构问题。"""
+    active = set(active_slugs)
+    used_modules: set[str] = set()
+    used_area_slugs: set[str] = set()
+    repaired_areas: list[AreaRecord] = []
+    fallback_modules: list[str] = []
+    fallback_order: list[str] = []
+    fallback_prefixes: list[str] = []
+    fallback_summary = ""
+
+    def _uniq_slug(base: str) -> str:
+        slug = base or "area"
+        if slug not in used_area_slugs:
+            used_area_slugs.add(slug)
+            return slug
+        idx = 2
+        while f"{slug}-{idx}" in used_area_slugs:
+            idx += 1
+        uniq = f"{slug}-{idx}"
+        used_area_slugs.add(uniq)
+        return uniq
+
+    for area in tree.areas:
+        mods = [
+            s for s in _dedupe_keep_order(area.module_slugs)
+            if s in active and s not in used_modules
+        ]
+        for s in mods:
+            used_modules.add(s)
+
+        order = [
+            s for s in _dedupe_keep_order(area.recommended_order)
+            if s in set(mods)
+        ]
+        for s in mods:
+            if s not in order:
+                order.append(s)
+
+        if area.is_fallback:
+            fallback_modules.extend(mods)
+            fallback_order.extend(order)
+            fallback_prefixes.extend(area.source_prefixes)
+            fallback_summary = fallback_summary or area.summary
+            continue
+
+        if not mods:
+            continue
+
+        repaired_areas.append(area.model_copy(update={
+            "slug": _uniq_slug(area.slug),
+            "module_slugs": mods,
+            "recommended_order": order,
+        }))
+
+    # 缺失模块塞入 fallback
+    missing = [s for s in sorted(active) if s not in used_modules]
+    fallback_modules = _dedupe_keep_order([*fallback_modules, *missing])
+    fallback_order = _dedupe_keep_order([*fallback_order, *fallback_modules])
+
+    # area 数量上限 7（+1 fallback = 8）
+    if len(repaired_areas) > 7:
+        for overflow in repaired_areas[7:]:
+            fallback_modules.extend(overflow.module_slugs)
+            fallback_order.extend(overflow.recommended_order)
+        repaired_areas = repaired_areas[:7]
+        fallback_modules = _dedupe_keep_order(fallback_modules)
+        fallback_order = _dedupe_keep_order(
+            [*fallback_order, *fallback_modules]
+        )
+
+    fb_slug = tree.fallback_area_slug or NAVIGATION_FALLBACK_AREA_SLUG
+    if fb_slug in used_area_slugs:
+        fb_slug = _uniq_slug(NAVIGATION_FALLBACK_AREA_SLUG)
+    else:
+        used_area_slugs.add(fb_slug)
+
+    fb_area = AreaRecord(
+        slug=fb_slug,
+        display_name=NAVIGATION_FALLBACK_AREA_NAME,
+        summary=fallback_summary or "承接暂时无法稳定归入主区域的模块。",
+        module_slugs=fallback_modules,
+        recommended_order=fallback_order,
+        source_prefixes=_dedupe_keep_order(fallback_prefixes),
+        is_fallback=True,
+    )
+
+    proj_summary = (tree.project_summary or "").strip()
+    if not proj_summary:
+        proj_summary = (
+            f"项目当前共 {len(active)} 个模块，已整理为区域化导航入口。"
+        )
+
+    return tree.model_copy(update={
+        "generated_at": datetime.now(UTC),
+        "project_summary": proj_summary,
+        "fallback_area_slug": fb_area.slug,
+        "areas": [*repaired_areas, fb_area],
+    })
+
+
+def _build_fallback_navigation_tree(
+    sections: list[dict[str, Any]],
+    active_slugs: set[str],
+) -> NavigationTree:
+    """按目录前缀分组构建确定性 fallback 导航树。"""
+    active = set(active_slugs)
+    groups: dict[str, list[str]] = defaultdict(list)
+
+    for section in sections:
+        slug = section["slug"]
+        if slug not in active:
+            continue
+        file_paths = _dedupe_keep_order(section.get("file_paths", []))
+        if not file_paths:
+            groups["./"].append(slug)
+            continue
+        head = (
+            Path(file_paths[0]).parts[0]
+            if len(Path(file_paths[0]).parts) > 1
+            else "./"
+        )
+        groups[head].append(slug)
+
+    ranked = sorted(groups.items(), key=lambda x: (-len(x[1]), x[0]))
+
+    areas: list[AreaRecord] = []
+    used: set[str] = set()
+    used_area_slugs: set[str] = set()
+
+    def _uniq_area_slug(base: str) -> str:
+        slug = base or "area"
+        if slug not in used_area_slugs:
+            used_area_slugs.add(slug)
+            return slug
+        idx = 2
+        while f"{slug}-{idx}" in used_area_slugs:
+            idx += 1
+        uniq = f"{slug}-{idx}"
+        used_area_slugs.add(uniq)
+        return uniq
+
+    for prefix, slugs in ranked[:7]:
+        ordered = _dedupe_keep_order(slugs)
+        used.update(ordered)
+        name = (
+            "项目根目录"
+            if prefix == "./"
+            else prefix.rstrip("/").replace("-", " ").replace("_", " ").title()
+        )
+        raw_slug = name.lower().replace(" ", "-").replace("/", "-").strip("-")
+        area_slug = _uniq_area_slug(raw_slug)
+        areas.append(AreaRecord(
+            slug=area_slug,
+            display_name=name,
+            summary=f"主要覆盖 `{prefix}` 前缀下的模块。",
+            module_slugs=ordered,
+            recommended_order=ordered,
+            source_prefixes=[prefix],
+            is_fallback=False,
+        ))
+
+    missing = [s for s in sorted(active) if s not in used]
+    fb_area = AreaRecord(
+        slug=NAVIGATION_FALLBACK_AREA_SLUG,
+        display_name=NAVIGATION_FALLBACK_AREA_NAME,
+        summary="承接零散目录或当前无法稳定分组的模块。",
+        module_slugs=missing,
+        recommended_order=missing,
+        source_prefixes=[],
+        is_fallback=True,
+    )
+
+    # 至少需要 1 个非 fallback area
+    if not areas:
+        seed = sorted(active)[:min(len(active), 8)]
+        areas.append(AreaRecord(
+            slug="core",
+            display_name="核心模块",
+            summary="目录分群信号不足时的确定性主区域。",
+            module_slugs=seed,
+            recommended_order=seed,
+            source_prefixes=[],
+            is_fallback=False,
+        ))
+        fb_area = fb_area.model_copy(update={
+            "module_slugs": [s for s in sorted(active) if s not in set(seed)],
+            "recommended_order": [
+                s for s in sorted(active) if s not in set(seed)
+            ],
+        })
+
+    return NavigationTree(
+        generated_at=datetime.now(UTC),
+        project_summary=(
+            f"项目当前共 {len(active)} 个模块，"
+            "已按目录前缀生成确定性区域入口。"
+        ),
+        fallback_area_slug=fb_area.slug,
+        source_digest=_compute_source_digest(sections),
+        areas=[*areas, fb_area],
+    )
+
+
+async def _generate_navigation_tree(
+    facts: dict[str, Any],
+    active_slugs: set[str],
+    model: str | None,
+) -> NavigationTree | None:
+    """一次 LLM 调用生成导航树 JSON；失败时给一次修订机会。"""
+    system_prompt = (
+        "你是 PCE 认知导航规划器。基于给定 facts 输出 JSON，不得输出解释文字。\n"
+        "区域是介于'项目整体'和'具体模块'之间的中层认知单元。\n"
+        "区域划分优先依据职责边界，其次才参考目录邻近性。\n"
+        "区域名称应反映功能职责，不要用目录路径做名称。\n"
+        "fallback 区域仅收纳无法可靠分类的模块，不应成为最大区域。"
+    )
+
+    attempt_prompt = "\n".join([
+        "请基于以下受控 facts 生成三层导航树 JSON。",
+        "输出字段: version, project_summary, fallback_area_slug, source_digest, areas。",
+        "areas[*] 字段: slug, display_name, summary, module_slugs, "
+        "recommended_order, source_prefixes, is_fallback。",
+        "生成 2-8 个区域，其中恰好 1 个 is_fallback=true。",
+        "每个模块恰好出现在一个区域中，完整覆盖所有模块。",
+        "",
+        json.dumps(facts, ensure_ascii=False, indent=2),
+    ])
+
+    content = await _llm_complete_text(
+        attempt_prompt,
+        system_prompt=system_prompt,
+        model=model,
+        failure_log="导航树生成失败",
+    )
+    if not content:
+        return None
+
+    def _try_parse(raw: str) -> tuple[NavigationTree | None, list[str]]:
+        """尝试解析 LLM 输出为 NavigationTree，返回 (tree, errors)。"""
+        try:
+            payload = json.loads(raw)
+            payload["source_digest"] = str(facts["source_digest"])
+            payload["generated_at"] = datetime.now(UTC).isoformat()
+            tree = NavigationTree.model_validate(payload)
+            tree = _repair_navigation_tree(tree, active_slugs)
+            errs = _validate_navigation_tree(tree, active_slugs)
+            return (tree if not errs else None), errs
+        except Exception as e:
+            return None, [f"JSON / schema 校验失败: {e}"]
+
+    # 第一次尝试解析
+    tree, feedback = _try_parse(content)
+    if tree is not None:
+        return tree
+
+    # 给一次修订机会
+    content = await _llm_complete_text(
+        "\n".join([
+            "请根据以下校验错误修订导航树 JSON，只输出修订后的完整 JSON：",
+            *feedback,
+            "",
+            json.dumps(facts, ensure_ascii=False, indent=2),
+        ]),
+        system_prompt=system_prompt,
+        model=model,
+        failure_log="导航树修订失败",
+    )
+    if not content:
+        return None
+
+    # 解析修订结果
+    tree, _ = _try_parse(content)
+    return tree
+
+
+def _render_hierarchical_index_md(
+    tree: NavigationTree,
+    sections_by_slug: dict[str, dict[str, Any]],
+) -> str:
+    """渲染项目级 index.md — 只承载项目概览与区域入口，不展开模块细节。"""
+    total_modules = sum(len(a.module_slugs) for a in tree.areas)
+    lines = [
+        "# 项目认知导航",
+        "",
+        "## 项目概览",
+        tree.project_summary or "当前暂无项目级摘要。",
+        "",
+        f"- 区域数：{len(tree.areas)}",
+        f"- 模块数：{total_modules}",
+        "",
+        "## 区域入口",
+    ]
+    for area in tree.areas:
+        previews = [
+            sections_by_slug.get(s, {}).get("name", s)
+            for s in area.module_slugs[:3]
+        ]
+        preview_text = (
+            f"；示例模块：{'、'.join(previews)}" if previews else ""
+        )
+        summary = area.summary or "暂无区域摘要。"
+        lines.append(
+            f"- [{area.display_name}](areas/{area.slug}.md)：{summary}"
+            f"（{len(area.module_slugs)} 个模块{preview_text}）"
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_area_md(
+    area: AreaRecord,
+    sections_by_slug: dict[str, dict[str, Any]],
+) -> str:
+    """渲染区域文档 areas/{slug}.md — 只引用模块级文档，不复述模块正文。"""
+    lines = [
+        f"# {area.display_name}",
+        "",
+        "## 区域说明",
+        area.summary or "当前暂无区域说明。",
+        "",
+        "## 模块列表",
+    ]
+    if area.module_slugs:
+        for slug in area.module_slugs:
+            section = sections_by_slug.get(slug, {})
+            name = section.get("name", slug)
+            summary = _extract_section_summary(section) or "暂无模块摘要。"
+            lines.append(
+                f"- [{name}](../modules/{slug}.md) (`{slug}`)：{summary}"
+            )
+    else:
+        lines.append("- 当前无挂载模块。")
+
+    lines.extend(["", "## 推荐阅读顺序"])
+    ordered = area.recommended_order or area.module_slugs
+    if ordered:
+        for idx, slug in enumerate(ordered, start=1):
+            name = sections_by_slug.get(slug, {}).get("name", slug)
+            lines.append(f"{idx}. [{name}](../modules/{slug}.md)")
+    else:
+        lines.append("1. 当前无推荐顺序。")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+async def _cleanup_stale_area_docs(
+    areas_dir: Path, valid_slugs: set[str]
+) -> None:
+    """清理不再被引用的区域文档。"""
+    if not areas_dir.exists():
+        return
+    expected = {f"{slug}.md" for slug in valid_slugs}
+    for child in areas_dir.iterdir():
+        if child.is_file() and child.suffix == ".md" and child.name not in expected:
+            await asyncio.to_thread(child.unlink, missing_ok=True)
+
+
+def _navigation_tree_path(root_path: Path) -> Path:
+    """返回 .pce/annotations/navigation_tree.json 路径。"""
+    return _annotation_root_dir(root_path) / NAVIGATION_TREE_FILE
+
+
+def _annotation_areas_dir(root_path: Path) -> Path:
+    """返回 .pce/annotations/areas/ 目录路径。"""
+    return _annotation_root_dir(root_path) / ANNOTATIONS_AREAS_DIR
+
+
+async def _persist_navigation_area_cache(
+    root_path: Path, tree: NavigationTree
+) -> None:
+    """将 area_slug 写回 module registry 的缓存字段。"""
+    manager = ModuleRegistryManager(root_path)
+    registry = await manager.load()
+    module_area_map = {
+        ms: area.slug
+        for area in tree.areas
+        for ms in area.module_slugs
+    }
+    changed = False
+    for record in registry.records.values():
+        if record.status != "active":
+            continue
+        next_area = module_area_map.get(record.slug)
+        if record.area_slug != next_area:
+            record.area_slug = next_area
+            changed = True
+    if changed:
+        await manager.save(registry)
+
+
 async def _stabilize_sections_with_registry(
     sections: list[dict[str, Any]],
     *,
@@ -2429,8 +3069,14 @@ async def _write_module_files(
     module_specs: list[tuple[str, str, list[IndexEntry]]],
     modules_dir: Path,
     model: str | None,
+    *,
+    module_doc_paths: dict[str, Path] | None = None,
 ) -> None:
-    """并发生成并写入 modules/*.md，失败时使用回退内容。"""
+    """并发生成并写入模块认知文档，失败时使用回退内容。
+
+    当 module_doc_paths 不为 None 时，优先使用其中指定的路径写入（tree 布局）；
+    未在映射中的 slug 仍按 modules_dir/{slug}.md 写入（flat 降级）。
+    """
     results = await asyncio.gather(
         *[_generate_module_annotation(name, entries, model=model) for name, _, entries in module_specs],
         return_exceptions=True,
@@ -2443,7 +3089,12 @@ async def _write_module_files(
             content = result
         if not content:
             content = _build_fallback_module_md(module_name, module_entries)
-        await _atomic_write_text(modules_dir / f"{slug}.md", content.rstrip() + "\n")
+        target = (
+            module_doc_paths[slug]
+            if module_doc_paths is not None and slug in module_doc_paths
+            else modules_dir / f"{slug}.md"
+        )
+        await _atomic_write_text(target, content.rstrip() + "\n")
 
 
 async def _write_annotations(
@@ -2452,24 +3103,33 @@ async def _write_annotations(
     root_path: Path,
     model: str | None = None,
 ) -> None:
-    """全量生成并写入 annotations/index.md 与 modules/*.md。"""
+    """全量生成并写入三层树状认知导航。"""
     index_path = _annotation_index_path(root_path)
+    areas_dir = _annotation_areas_dir(root_path)
     modules_dir = _annotation_modules_dir(root_path)
 
     if not entries:
-        await _atomic_write_text(index_path, "# 项目认知导航\n")
-        if modules_dir.exists():
-            for stale in modules_dir.glob("*.md"):
-                await asyncio.to_thread(stale.unlink, missing_ok=True)
+        await _atomic_write_text(
+            index_path, "# 项目认知导航\n\n当前暂无可导航模块。\n"
+        )
+        await _cleanup_stale_area_docs(areas_dir, set())
+        # 删除残留的 navigation_tree.json
+        tree_path = _navigation_tree_path(root_path)
+        if tree_path.exists():
+            await asyncio.to_thread(tree_path.unlink, missing_ok=True)
+        await _cleanup_stale_annotation_docs(
+            root_path, {Path(ANNOTATIONS_INDEX_FILE)}
+        )
         return
 
+    # ── 阶段 1：模块发现与稳定化（保留原有逻辑不动）──
     index_content = await _generate_index_md(entries, project_meta, model=model)
     if not index_content:
         logger.warning("认知导航 index.md 不可用，使用索引级回退模板")
         index_content = _build_fallback_index_md(entries)
 
     entries_map = {str(e.file_meta.path): e for e in entries}
-    header, sections = _split_index_md(index_content)
+    _, sections = _split_index_md(index_content)
     sections = _dedupe_sections_by_slug(sections)
     sections = _merge_missing_sections(
         sections,
@@ -2482,7 +3142,9 @@ async def _write_annotations(
         model=model,
     )
     sections = _dedupe_semantic_sections(sections)
-    sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
+    sections = _append_fallback_sections_for_unassigned_entries(
+        sections, entries_map
+    )
     sections = await _stabilize_sections_with_registry(
         sections,
         root_path=root_path,
@@ -2493,18 +3155,82 @@ async def _write_annotations(
     if not valid_sections:
         logger.warning("认知导航解析为空，回退到结构化模板")
         index_content = _build_fallback_index_md(entries)
-        header, sections = _split_index_md(index_content)
-        valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
+        _, sections = _split_index_md(index_content)
+        valid_sections, module_specs = _prepare_module_specs(
+            sections, entries_map
+        )
 
-    await _write_module_files(module_specs, modules_dir, model)
-    rendered_index = _render_index_md(header, valid_sections)
-    await _atomic_write_text(index_path, rendered_index)
-    await _cleanup_stale_module_docs(
-        modules_dir,
-        {section["slug"] for section in valid_sections},
+    # ── 阶段 2：树状导航生成 ──
+    sections_by_slug = {s["slug"]: s for s in valid_sections}
+    active_slugs = {slug for _, slug, _ in module_specs}
+    facts = _build_navigation_facts(valid_sections, entries_map, root_path)
+
+    tree = await _generate_navigation_tree(facts, active_slugs, model=model)
+    if tree is None:
+        logger.warning("导航树生成失败，回退到确定性 fallback 方案")
+        tree = _build_fallback_navigation_tree(valid_sections, active_slugs)
+
+    tree = _repair_navigation_tree(
+        tree.model_copy(
+            update={"source_digest": str(facts["source_digest"])}
+        ),
+        active_slugs,
     )
+    tree_errors = _validate_navigation_tree(tree, active_slugs)
+    if tree_errors:
+        logger.warning(
+            "导航树校验失败，改用目录前缀 fallback: %s",
+            " | ".join(tree_errors),
+        )
+        tree = _build_fallback_navigation_tree(valid_sections, active_slugs)
+        tree = _repair_navigation_tree(tree, active_slugs)
+
+    # 写入模块正文（路径不变，仍是 modules/*.md）
+    await _write_module_files(module_specs, modules_dir, model)
+
+    # 渲染并持久化层级导航文档
+    await _atomic_write_text(
+        index_path,
+        _render_hierarchical_index_md(tree, sections_by_slug),
+    )
+    await _atomic_write_text(
+        _navigation_tree_path(root_path),
+        json.dumps(
+            tree.model_dump(mode="json"), ensure_ascii=False, indent=2
+        )
+        + "\n",
+    )
+    areas_dir.mkdir(parents=True, exist_ok=True)
+    for area in tree.areas:
+        await _atomic_write_text(
+            areas_dir / f"{area.slug}.md",
+            _render_area_md(area, sections_by_slug),
+        )
+
+    # 缓存 area_slug 到 registry
+    await _persist_navigation_area_cache(root_path, tree)
+
+    # 清理过期文件
+    valid_area_slugs = {a.slug for a in tree.areas}
+    await _cleanup_stale_area_docs(areas_dir, valid_area_slugs)
+
+    expected_files: set[Path] = {
+        Path(ANNOTATIONS_INDEX_FILE),
+        Path(NAVIGATION_TREE_FILE),
+    }
+    expected_files.update(
+        Path(ANNOTATIONS_MODULES_DIR) / f"{slug}.md"
+        for _, slug, _ in module_specs
+    )
+    expected_files.update(
+        Path(ANNOTATIONS_AREAS_DIR) / f"{a.slug}.md" for a in tree.areas
+    )
+    await _cleanup_stale_annotation_docs(root_path, expected_files)
+
     logger.info(
-        f"认知导航写入完成: {len(valid_sections)} 个模块章节, {len(module_specs)} 个模块文档"
+        "树状认知导航写入完成: %d 个区域, %d 个模块文档",
+        len(tree.areas),
+        len(module_specs),
     )
 
 
@@ -2517,120 +3243,175 @@ async def _update_annotations_incremental(
     deleted_files: list[str],
     model: str | None = None,
 ) -> None:
-    """增量更新受影响模块的认知文档与 index.md。"""
+    """增量更新树状导航。
+
+    两档策略：
+    - 小改动（ownership 完整 + 受影响模块 ≤3）：局部重写模块文档 + 重渲染导航入口
+    - 其余情况：降级为全量 _write_annotations()
+    """
     index_path = _annotation_index_path(root_path)
+    areas_dir = _annotation_areas_dir(root_path)
     modules_dir = _annotation_modules_dir(root_path)
-
-    try:
-        async with aiofiles.open(index_path, encoding="utf-8") as f:
-            index_content = await f.read()
-    except FileNotFoundError:
-        logger.info("未找到认知导航 index.md，降级为全量认知文档重建")
-        await _write_annotations(entries, project_meta, root_path, model=model)
-        return
-    except Exception as e:
-        logger.warning(f"读取认知导航失败，降级为全量认知文档重建: {e}")
-        await _write_annotations(entries, project_meta, root_path, model=model)
-        return
-
-    header, sections = _split_index_md(index_content)
-    if not sections:
-        logger.warning("认知导航解析结果为空，降级为全量认知文档重建")
-        await _write_annotations(entries, project_meta, root_path, model=model)
-        return
-
     entries_map = {str(e.file_meta.path): e for e in entries}
-    sections = _dedupe_sections_by_slug(sections)
-    sections = _merge_missing_sections(
-        sections,
-        await _load_sections_from_existing_module_docs(root_path),
-    )
-    ownership = {
-        section["slug"]: _dedupe_keep_order(section["file_paths"])
-        for section in sections
-        if section["file_paths"]
-    }
-    reverse_map: dict[str, str] = {
-        file_path: slug
-        for slug, file_paths in ownership.items()
-        for file_path in file_paths
-    }
-    sections_by_slug = {section["slug"]: section for section in sections}
-    affected_slugs: set[str] = set()
 
-    # 已知文件的变更/删除 → 标记所属模块为受影响
-    for file_path in (*changed_files, *deleted_files):
-        slug = reverse_map.get(file_path)
-        if slug:
-            affected_slugs.add(slug)
-
-    # 新增文件（不在任何已知模块中）→ 先尝试归属到既有模块，剩余项交给二阶段补归属
-    for file_path in changed_files:
-        if file_path in reverse_map:
-            continue
-        entry = entries_map.get(file_path)
-        if entry is None:
-            continue
-
-        current_index_content = _render_index_md(header, sections)
-        assigned_slug = await _classify_new_entry_module(
-            entry, current_index_content, set(sections_by_slug.keys()), model=model
+    # 读取现有 navigation_tree.json
+    tree_path = _navigation_tree_path(root_path)
+    try:
+        raw_tree = await asyncio.to_thread(tree_path.read_text, "utf-8")
+        tree = NavigationTree.model_validate(json.loads(raw_tree))
+    except Exception:
+        logger.info(
+            "未找到可用 navigation_tree.json，降级为全量认知文档重建"
         )
-        if assigned_slug and assigned_slug in sections_by_slug:
-            section = sections_by_slug[assigned_slug]
-            _update_section_file_list(section, section["file_paths"] + [file_path])
-            affected_slugs.add(assigned_slug)
-            logger.info(f"新增文件已归属既有模块: {file_path} -> {assigned_slug}")
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
 
-    sections, supplemental_slugs, _ = await _supplement_unassigned_entries_with_llm(
-        sections,
-        entries_map,
-        root_path=root_path,
-        model=model,
+    # 从 module_registry 确定 ownership（不再从 index.md 反查）
+    manager = ModuleRegistryManager(root_path)
+    registry, current_map, historical_map = (
+        await manager.build_file_owner_maps()
     )
-    sections = _dedupe_semantic_sections(sections)
-    affected_slugs.update(supplemental_slugs)
 
-    sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
-    sections_by_slug = {section["slug"]: section for section in sections}
+    affected_slugs: set[str] = set()
+    force_full = False
+
+    for fp in changed_files:
+        owner = current_map.get(fp)
+        if owner is None:
+            force_full = True
+            break
+        affected_slugs.add(owner.slug)
+
+    if not force_full:
+        for fp in deleted_files:
+            owner = current_map.get(fp) or historical_map.get(fp)
+            if owner is None:
+                force_full = True
+                break
+            affected_slugs.add(owner.slug)
+
+    if force_full:
+        logger.info("增量 ownership 不完整，降级为全量认知文档重建")
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
 
     if not affected_slugs:
         logger.info("认知导航无受影响模块，跳过 annotations 增量更新")
         return
 
-    # 重新生成受影响模块；无文件的模块移除
-    final_sections: list[dict[str, Any]] = []
-    removed_slugs: set[str] = set()
+    # 变更范围过大时降级为全量重建
+    if len(affected_slugs) > 3:
+        logger.info(
+            "受影响模块数 %d 超出局部重渲染阈值，降级为全量认知文档重建",
+            len(affected_slugs),
+        )
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
 
-    for section in sections:
-        slug = section["slug"]
-        if slug not in affected_slugs:
-            final_sections.append(section)
-            continue
-        file_paths = [p for p in _dedupe_keep_order(section["file_paths"]) if p in entries_map]
+    # 局部更新路径：重写受影响模块文档 + 重渲染导航入口
+    recovered_sections = {
+        s["slug"]: s
+        for s in await _load_sections_from_existing_module_docs(root_path)
+    }
+    active_records = [
+        r for r in registry.records.values() if r.status == "active"
+    ]
+    sections: list[dict[str, Any]] = []
+    for record in active_records:
+        file_paths = [
+            p for p in _dedupe_keep_order(record.file_paths)
+            if p in entries_map
+        ]
         if not file_paths:
-            removed_slugs.add(slug)
-            logger.info(f"模块已无文件，移除认知章节: {section['name']}")
             continue
+        section = recovered_sections.get(record.slug) or {
+            "name": record.display_name,
+            "slug": record.slug,
+            "file_paths": [],
+            "body_lines": [
+                f"详细认知：.pce/annotations/modules/{record.slug}.md",
+            ],
+        }
+        section["name"] = record.display_name
         _update_section_file_list(section, file_paths)
-        final_sections.append(section)
+        _update_section_module_link(section, slug=record.slug)
+        sections.append(section)
 
-    final_sections = await _stabilize_sections_with_registry(
-        final_sections,
-        root_path=root_path,
-        entries_map=entries_map,
-    )
-    final_sections, module_specs = _prepare_module_specs(final_sections, entries_map)
+    sections = _dedupe_sections_by_slug(sections)
+    valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
+    specs_by_slug = {
+        slug: (name, slug, me) for name, slug, me in module_specs
+    }
 
-    await _write_module_files(module_specs, modules_dir, model)
-    rendered_index = _render_index_md(header, final_sections)
-    await _atomic_write_text(index_path, rendered_index)
-    await _cleanup_stale_module_docs(
-        modules_dir,
-        {section["slug"] for section in final_sections},
+    # 只重写受影响的模块文档
+    affected_specs = [
+        specs_by_slug[slug]
+        for slug in sorted(affected_slugs)
+        if slug in specs_by_slug
+    ]
+    if not affected_specs:
+        logger.info("受影响模块无可写入规格，降级为全量认知文档重建")
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
+
+    await _write_module_files(affected_specs, modules_dir, model)
+
+    # 修复并重渲染导航树
+    active_slugs = {slug for _, slug, _ in module_specs}
+    tree = _repair_navigation_tree(
+        tree.model_copy(update={
+            "generated_at": datetime.now(UTC),
+            "source_digest": _compute_source_digest(valid_sections),
+        }),
+        active_slugs,
     )
+    tree_errors = _validate_navigation_tree(tree, active_slugs)
+    if tree_errors:
+        logger.info(
+            "现有导航树不再可信，降级为全量认知文档重建: %s",
+            " | ".join(tree_errors),
+        )
+        await _write_annotations(entries, project_meta, root_path, model=model)
+        return
+
+    sections_by_slug = {s["slug"]: s for s in valid_sections}
+    await _atomic_write_text(
+        index_path,
+        _render_hierarchical_index_md(tree, sections_by_slug),
+    )
+    areas_dir.mkdir(parents=True, exist_ok=True)
+    for area in tree.areas:
+        await _atomic_write_text(
+            areas_dir / f"{area.slug}.md",
+            _render_area_md(area, sections_by_slug),
+        )
+    await _atomic_write_text(
+        tree_path,
+        json.dumps(
+            tree.model_dump(mode="json"), ensure_ascii=False, indent=2
+        )
+        + "\n",
+    )
+    await _persist_navigation_area_cache(root_path, tree)
+    await _cleanup_stale_area_docs(areas_dir, {a.slug for a in tree.areas})
+
+    expected_files: set[Path] = {
+        Path(ANNOTATIONS_INDEX_FILE),
+        Path(NAVIGATION_TREE_FILE),
+    }
+    expected_files.update(
+        Path(ANNOTATIONS_MODULES_DIR) / f"{slug}.md"
+        for _, slug, _ in module_specs
+    )
+    expected_files.update(
+        Path(ANNOTATIONS_AREAS_DIR) / f"{a.slug}.md" for a in tree.areas
+    )
+    await _cleanup_stale_annotation_docs(root_path, expected_files)
+
     logger.info(
-        f"认知导航增量更新完成: {len(module_specs)} 个模块重建, {len(removed_slugs)} 个模块移除"
+        "认知导航增量更新完成: %d 个模块重建, %d 个区域重渲染",
+        len(affected_specs),
+        len(tree.areas),
     )
 
 

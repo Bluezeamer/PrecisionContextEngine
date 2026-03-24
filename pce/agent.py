@@ -44,6 +44,24 @@ from .agent_runtime.contracts import (
     SpawnStatus,
 )
 from .agent_runtime.spawner import invoke_spawn
+from .base_agent import (
+    DELIVER_TOOL as _BASE_DELIVER_TOOL,
+    BaseReActAgent,
+    DeliverDecision,
+    LLMCompletionError,
+    LoopState,
+    _extract_finish_reason,
+    _extract_message,
+    _extract_tool_call_args,
+    _extract_tool_calls,
+    _get_tool_call_id,
+    _get_tool_name,
+    _parse_model_fallbacks,
+    _parse_tool_call_args,
+    _safe_json_dumps,
+    _should_fallback_model,
+    _stringify_error,
+)
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse
 from .serena_client import SerenaClient, SerenaClientError
@@ -70,84 +88,11 @@ _CONTEXT_WINDOW = int(os.getenv("PCE_CONTEXT_WINDOW", "256000"))
 # ---------------------------------------------------------------------------
 
 
-def _parse_model_fallbacks(raw: str) -> list[str]:
-    """解析逗号分隔的 fallback 模型列表，按出现顺序去重。"""
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in raw.split(","):
-        model = item.strip()
-        if model and model not in seen:
-            seen.add(model)
-            result.append(model)
-    return result
-
-
-class LLMCompletionError(RuntimeError):
-    """所有候选模型均失败时抛出，携带完整降级记录。"""
-
-    def __init__(self, attempts: list[dict[str, str]]) -> None:
-        self.attempts = attempts
-        self.models = [a["model"] for a in attempts]
-        parts = [f'{a["model"]}({a["error_type"]}): {a["reason"]}' for a in attempts]
-        super().__init__(
-            f"LLM fallback chain exhausted; models={self.models}; " + " | ".join(parts)
-        )
-
-
-def _should_fallback_model(exc: Exception) -> bool:
-    """判断是否应切换到下一个模型（不可恢复的模型级错误）。
-
-    仅对以下情况触发 fallback，不在同一模型上重复重试（litellm 已重试过）：
-    - 限流（429）
-    - 鉴权/权限（401/403）
-    - 模型不存在（404 或特征文本）
-    """
-    # 优先使用 isinstance 判断（稳定、不受类名重命名影响）
-    if isinstance(
-        exc,
-        (
-            litellm_exc.RateLimitError,
-            litellm_exc.AuthenticationError,
-            litellm_exc.PermissionDeniedError,
-            litellm_exc.NotFoundError,
-        ),
-    ):
-        return True
-    if isinstance(exc, (litellm_exc.BadRequestError, litellm_exc.InvalidRequestError)):
-        msg = _stringify_error(exc).lower()
-        return any(
-            k in msg
-            for k in (
-                "model not found",
-                "unknown model",
-                "invalid model",
-                "does not exist",
-                "no deployments available",
-            )
-        )
-    return False
-
-
-def _stringify_error(exc: Exception) -> str:
-    """提取稳定、可读的异常原因字符串。"""
-    return str(getattr(exc, "message", None) or exc or type(exc).__name__)
-
-
-def _extract_finish_reason(response: Any) -> str:
-    """从 litellm 响应中提取 finish_reason，缺失时默认 'stop'。"""
-    choices = getattr(response, "choices", None)
-    if choices is None and isinstance(response, dict):
-        choices = response.get("choices", [])
-    if choices:
-        choice = choices[0]
-        raw = (
-            getattr(choice, "finish_reason", None)
-            if not isinstance(choice, dict)
-            else choice.get("finish_reason")
-        )
-        if raw:
-            return str(raw)
-    return "stop"
+# 以下公共函数已迁移到 base_agent.py，此处保留 re-export 兼容
+# LLMCompletionError, _extract_finish_reason, _extract_message,
+# _extract_tool_calls, _parse_tool_call_args, _safe_json_dumps,
+# _should_fallback_model, _stringify_error, _parse_model_fallbacks
+# 均通过上方 from .base_agent import 导入
 
 
 SYSTEM_PROMPT_HEADER = """\
@@ -465,14 +410,6 @@ class _TraceWriter:
 # ============================================================================
 
 
-def _safe_json_dumps(value: Any) -> str:
-    """安全地将值序列化为 JSON 字符串。"""
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return json.dumps(str(value), ensure_ascii=False)
-
-
 def _try_parse_json(value: Any) -> Any:
     """尝试将字符串解析为 JSON,失败时原样返回。"""
     if isinstance(value, str):
@@ -481,88 +418,6 @@ def _try_parse_json(value: Any) -> Any:
         except (ValueError, json.JSONDecodeError):
             pass
     return value
-
-
-def _extract_message(response: Any) -> dict[str, Any]:
-    """从 litellm 响应中提取 choice message。"""
-    # 处理 Pydantic/dataclass 格式
-    choices = getattr(response, "choices", None)
-    if choices is None and isinstance(response, dict):
-        choices = response.get("choices", [])
-
-    if not choices:
-        return {"role": "assistant", "content": ""}
-
-    choice = choices[0]
-    message = getattr(choice, "message", None)
-    if message is None and isinstance(choice, dict):
-        message = choice.get("message", {})
-
-    if hasattr(message, "model_dump"):
-        dumped = message.model_dump(exclude_none=False)
-        # 防御: model_dump 可能丢失 tool_calls 字段(某些模型返回格式差异)
-        if "tool_calls" not in dumped and hasattr(message, "tool_calls"):
-            tc = message.tool_calls
-            if tc is not None:
-                dumped["tool_calls"] = tc
-        # 兼容旧版 function_call 格式
-        if "function_call" not in dumped and hasattr(message, "function_call"):
-            fc = message.function_call
-            if fc is not None:
-                dumped["function_call"] = fc
-        # StepFun 等 provider 要求 assistant 消息的 content 字段必须存在
-        if dumped.get("content") is None:
-            dumped["content"] = ""
-        return dumped
-    if isinstance(message, dict):
-        # 同上，确保 content 字段存在
-        if message.get("content") is None:
-            message = {**message, "content": ""}
-        return message
-    return {"role": "assistant", "content": str(message)}
-
-
-def _extract_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
-    """从 message 中提取 tool_calls 列表。"""
-    tool_calls = message.get("tool_calls")
-    if isinstance(tool_calls, list) and tool_calls:
-        return tool_calls
-    # 兼容旧版 function_call 格式(某些模型/路由可能使用)
-    function_call = message.get("function_call")
-    if isinstance(function_call, dict) and function_call.get("name"):
-        return [{"id": str(uuid.uuid4()), "function": function_call}]
-    # 兼容 function_call 为 Pydantic/dataclass 对象的情况
-    if function_call is not None and hasattr(function_call, "name"):
-        name = getattr(function_call, "name", None)
-        if name:
-            return [
-                {
-                    "id": str(uuid.uuid4()),
-                    "function": {
-                        "name": name,
-                        "arguments": getattr(function_call, "arguments", None),
-                    },
-                }
-            ]
-    return []
-
-
-def _parse_tool_call_args(raw_args: Any) -> dict[str, Any] | None:
-    """解析 tool_call 的 arguments 字段。失败时返回 None（而非空 dict）。
-
-    返回 None 意味着调用方应将其视为解析错误，而非"无参数调用"。
-    """
-    if raw_args is None:
-        return None
-    if isinstance(raw_args, dict):
-        return raw_args
-    if isinstance(raw_args, str):
-        try:
-            result = json.loads(raw_args)
-            return result if isinstance(result, dict) else None
-        except (ValueError, json.JSONDecodeError):
-            return None
-    return None
 
 
 # ============================================================================
@@ -1789,6 +1644,12 @@ class PCEAgent:
             "",
             "## 项目认知导航 (annotations/index.md)",
             annotations_index_md.strip(),
+            "",
+            "## 认知导航路由说明",
+            "- 若 index.md 只给出区域入口，先读取对应的 `annotations/areas/{area}.md`。",
+            "- 在区域文档中根据模块列表继续下钻到 `annotations/modules/{module}.md`。",
+            "- 若当前仓库仍是旧布局、找不到 `areas/*.md`，再直接进入 `annotations/modules/*.md`。",
+            "- 回答具体实现问题前，不要停留在 area 层；需要继续检索模块文档或调用工具取证。",
         ]
         if injected.strip():
             sections += [
@@ -1803,8 +1664,8 @@ class PCEAgent:
     async def _build_system_prompt(self, memory_root: Path | None) -> str:
         """构建 system prompt,注入 structure.md 和 annotations/index.md 内容。
 
-        annotations/index.md 是轻量的模块导航入口；各模块深度认知文档（modules/*.md）
-        由 PCE Agent 在 ReAct 循环中按需通过 read_file 工具自主加载。
+        annotations/index.md 是轻量的项目/区域导航入口；区域文档（areas/*.md）与
+        各模块深度认知文档（modules/*.md）由 PCE Agent 在 ReAct 循环中按需加载。
 
         若 insight_cache 已配置，在末尾追加动态认知块（top-k 条目）。
 

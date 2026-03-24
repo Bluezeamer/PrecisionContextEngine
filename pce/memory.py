@@ -8,9 +8,12 @@
 ├── structure.md           # 项目结构导航
 ├── references.json        # 符号引用索引
 └── annotations/
-    ├── index.md           # 认知导航首页
+    ├── index.md              # 树状认知导航首页（项目级）
+    ├── navigation_tree.json  # 树状导航结构快照
+    ├── areas/
+    │   └── *.md              # 区域导航文档
     └── modules/
-        └── *.md           # 模块认知文档
+        └── *.md              # 模块认知文档
 """
 
 from __future__ import annotations
@@ -39,7 +42,9 @@ MODULE_REGISTRY_FILE = "module_registry.json"
 BASELINES_DIR = "baselines"
 BASELINE_FILES_DIR = "files"
 ANNOTATIONS_DIR = "annotations"
+ANNOTATIONS_AREAS_DIR = "areas"
 ANNOTATIONS_MODULES_DIR = "modules"
+NAVIGATION_TREE_FILE = "navigation_tree.json"
 
 # Markdown 模板
 STRUCTURE_TEMPLATE = """# PCE 项目结构导航
@@ -110,6 +115,16 @@ def _structure_path(root_path: Path) -> Path:
 def _annotations_dir(root_path: Path) -> Path:
     """返回 .pce/annotations 目录路径。"""
     return _pce_dir(root_path) / ANNOTATIONS_DIR
+
+
+def _annotation_areas_dir(root_path: Path) -> Path:
+    """返回 .pce/annotations/areas 目录路径。"""
+    return _annotations_dir(root_path) / ANNOTATIONS_AREAS_DIR
+
+
+def _navigation_tree_path(root_path: Path) -> Path:
+    """返回 .pce/annotations/navigation_tree.json 路径。"""
+    return _annotations_dir(root_path) / NAVIGATION_TREE_FILE
 
 
 def _annotation_modules_dir(root_path: Path) -> Path:

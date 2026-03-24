@@ -329,6 +329,10 @@ class ModuleRecord(BaseSchema):
     status: Literal["active", "merged", "deprecated"] = Field(
         default="active", description="模块状态"
     )
+    area_slug: Optional[str] = Field(
+        default=None,
+        description="当前树状认知导航归属区域 slug（缓存字段，非稳定 identity）",
+    )
 
 
 class ModuleRegistry(BaseSchema):
@@ -338,6 +342,74 @@ class ModuleRegistry(BaseSchema):
     records: dict[str, ModuleRecord] = Field(
         default_factory=dict, description="模块记录映射（key 为 module_id）"
     )
+
+
+# ============================================================================
+# 树状认知导航
+# ============================================================================
+
+
+class AreaRecord(BaseSchema):
+    """树状认知导航中的区域记录。"""
+
+    slug: NonEmptyStr = Field(..., description="区域稳定 slug")
+    display_name: NonEmptyStr = Field(..., description="区域展示名")
+    summary: str = Field(default="", description="区域一句话摘要")
+    module_slugs: list[NonEmptyStr] = Field(
+        default_factory=list, description="挂载到该区域的模块 slug 列表"
+    )
+    recommended_order: list[NonEmptyStr] = Field(
+        default_factory=list, description="区域内推荐阅读顺序（module slug 列表）"
+    )
+    source_prefixes: list[str] = Field(
+        default_factory=list, description="该区域对应的目录/路径前缀线索"
+    )
+    is_fallback: bool = Field(default=False, description="是否为兜底区域")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compat_title(cls, values: Any) -> Any:
+        """兼容旧代码中使用 title= 创建 AreaRecord 的场景。"""
+        if isinstance(values, dict) and "title" in values and "display_name" not in values:
+            values["display_name"] = values.pop("title")
+        return values
+
+    @property
+    def title(self) -> str:
+        """兼容旧代码中的 area.title 访问。"""
+        return self.display_name
+
+
+class NavigationTree(BaseSchema):
+    """三层认知导航的结构树（项目→区域→模块）。"""
+
+    version: str = Field(default="2", description="结构树版本号")
+    generated_at: UTCDateTime = Field(..., description="最近生成时间（UTC）")
+    project_summary: str = Field(default="", description="项目级一句话概览")
+    fallback_area_slug: NonEmptyStr = Field(
+        default="fallback", description="fallback 区域的 slug"
+    )
+    source_digest: str = Field(
+        default="", description="源模块集合指纹（Python 侧 SHA-256 计算）"
+    )
+    areas: list[AreaRecord] = Field(default_factory=list, description="区域列表")
+
+    @model_validator(mode="after")
+    def _validate_fallback_area(self) -> "NavigationTree":
+        """校验 fallback 区域必须唯一且与 fallback_area_slug 一致。"""
+        fallback_areas = [a for a in self.areas if a.is_fallback]
+        if len(fallback_areas) != 1:
+            raise ValueError("navigation tree must contain exactly one fallback area")
+        if fallback_areas[0].slug != self.fallback_area_slug:
+            raise ValueError(
+                f"fallback_area_slug ({self.fallback_area_slug}) "
+                f"must match the fallback area record ({fallback_areas[0].slug})"
+            )
+        return self
+
+
+# 兼容旧引用
+AnnotationTree = NavigationTree
 
 
 # ============================================================================
