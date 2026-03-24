@@ -31,7 +31,6 @@ import aiofiles
 import litellm
 
 from ._env import build_litellm_model, get_completion_overrides, get_env_text
-# annotation_tree 不再直接使用，树生成逻辑已内联到本文件
 from .file_discovery import (
     HARD_SKIP_DIRS,
     SYMBOL_INDEX_EXTENSIONS,
@@ -1192,11 +1191,6 @@ def _annotation_index_path(root_path: Path) -> Path:
 def _annotation_modules_dir(root_path: Path) -> Path:
     """返回 .pce/annotations/modules/ 目录路径。"""
     return _annotation_root_dir(root_path) / ANNOTATIONS_MODULES_DIR
-
-
-def _annotation_area_module_path(root_path: Path, area_slug: str, module_slug: str) -> Path:
-    """返回 .pce/annotations/areas/{area}/modules/{module}.md 路径。"""
-    return _annotation_areas_dir(root_path) / area_slug / "modules" / f"{module_slug}.md"
 
 
 def _module_slug(module_name: str) -> str:
@@ -3069,14 +3063,8 @@ async def _write_module_files(
     module_specs: list[tuple[str, str, list[IndexEntry]]],
     modules_dir: Path,
     model: str | None,
-    *,
-    module_doc_paths: dict[str, Path] | None = None,
 ) -> None:
-    """并发生成并写入模块认知文档，失败时使用回退内容。
-
-    当 module_doc_paths 不为 None 时，优先使用其中指定的路径写入（tree 布局）；
-    未在映射中的 slug 仍按 modules_dir/{slug}.md 写入（flat 降级）。
-    """
+    """并发生成并写入模块认知文档，失败时使用回退内容。"""
     results = await asyncio.gather(
         *[_generate_module_annotation(name, entries, model=model) for name, _, entries in module_specs],
         return_exceptions=True,
@@ -3089,12 +3077,7 @@ async def _write_module_files(
             content = result
         if not content:
             content = _build_fallback_module_md(module_name, module_entries)
-        target = (
-            module_doc_paths[slug]
-            if module_doc_paths is not None and slug in module_doc_paths
-            else modules_dir / f"{slug}.md"
-        )
-        await _atomic_write_text(target, content.rstrip() + "\n")
+        await _atomic_write_text(modules_dir / f"{slug}.md", content.rstrip() + "\n")
 
 
 async def _write_annotations(
