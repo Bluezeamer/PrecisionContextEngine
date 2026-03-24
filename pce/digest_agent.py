@@ -25,25 +25,25 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import litellm
-import litellm.exceptions as litellm_exc
-
-from ._env import build_litellm_model, get_completion_overrides, get_env_text
-from .agent import (
-    LLMCompletionError,
-    _extract_finish_reason,
-    _extract_message,
-    _extract_tool_calls,
-    _parse_tool_call_args,
+from .base_agent import (
+    BaseReActAgent,
+    DeliverDecision,
+    LoopState,
+    REACT_LENGTH_EXHAUSTED,
+    REACT_LLM_EXHAUSTED,
+    REACT_NO_TOOL_EXHAUSTED,
+    REACT_TIMEOUT,
+    REACT_TIMEOUT_BUDGET,
+    _extract_tool_call_args,
+    _get_tool_call_id,
+    _get_tool_name,
     _safe_json_dumps,
-    _should_fallback_model,
-    _stringify_error,
 )
 from .digest_delta_builder import DigestDeltaBuilder
 from .insight_cache import InsightCache
 from .memory import delete_file_baseline, load_index, save_file_baseline
 from .models import ModuleDigestDelta, SymbolFact
-from .serena_client import SerenaClient, SerenaClientError
+from .serena_client import SerenaClient
 from .staging import DirtyState
 
 logger = logging.getLogger(__name__)
@@ -66,12 +66,14 @@ ALLOWED_EXTENSION_SECTION_PREFIXES: tuple[str, ...] = (
 
 _DIGEST_TASKS_REL = Path(".pce") / "digest_tasks.json"
 _DEFAULT_MAX_SECONDS = 300.0
-_MAX_NO_TOOL_RETRIES = 3
-_MAX_TIMEOUT_RETRIES = 1
-_MAX_LENGTH_CONT = 2
-_BUDGET_WARNING_RATIO = 0.25
-_BUDGET_WARNING_MIN_SECONDS = 45.0
-_BUDGET_WARNING_MAX_SECONDS = 90.0
+
+_REACT_FAILURE_MESSAGES: dict[str, str] = {
+    REACT_TIMEOUT_BUDGET: "DigestAgent ReAct 循环超时，已达最大时间预算",
+    REACT_NO_TOOL_EXHAUSTED: "DigestAgent 连续未产生 tool_calls，已终止",
+    REACT_LENGTH_EXHAUSTED: "DigestAgent 输出连续被截断，已放弃本轮",
+    REACT_TIMEOUT: "DigestAgent 模型调用超时，重试次数耗尽",
+    REACT_LLM_EXHAUSTED: "DigestAgent 模型降级链耗尽，已终止",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -105,16 +107,6 @@ async def _write_file_atomic(path: Path, content: str) -> None:
 
     await asyncio.to_thread(_write)
 
-
-def _parse_model_fallbacks(raw: str) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in raw.split(","):
-        m = item.strip()
-        if m and m not in seen:
-            seen.add(m)
-            result.append(m)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +241,16 @@ class DigestPlanner:
 # ---------------------------------------------------------------------------
 
 
-class DigestAgent:
+class DigestAgent(BaseReActAgent):
     """认知整合专用 ReAct Agent。
 
-    复用 PCEAgent 的模型调用/降级机制，但工具集完全不同：
+    继承 BaseReActAgent，通过钩子注入 digest 特有行为：
     - 虚拟工具（任务追踪 + annotation 读写）由 Python 拦截
     - Serena 只读工具透传，供 Agent 按需探索代码库
     """
+
+    _completion_temperature = 0.1
+    _enable_budget_warning = True
 
     def __init__(
         self,
@@ -266,29 +261,18 @@ class DigestAgent:
         model_fallbacks: list[str] | None = None,
         max_seconds: float = _DEFAULT_MAX_SECONDS,
     ) -> None:
-        explicit_model = model.strip() if model else None
-        explicit_provider = provider.strip() if provider else None
-
-        if explicit_model is None:
-            self._provider = get_env_text("PCE_PROVIDER")
-            self._model = get_env_text("PCE_MODEL")
-            if not self._provider or not self._model:
-                raise ValueError("未配置 PCE_PROVIDER / PCE_MODEL，DigestAgent 无法调用模型")
-        else:
-            self._provider = explicit_provider
-            self._model = explicit_model
-
-        raw_fallbacks = (
-            model_fallbacks
-            if model_fallbacks is not None
-            else _parse_model_fallbacks(os.getenv("PCE_MODEL_FALLBACKS", ""))
+        super().__init__(
+            model=model,
+            provider=provider,
+            model_fallbacks=model_fallbacks,
+            max_seconds=max_seconds,
         )
-        self._model_fallbacks = [m for m in raw_fallbacks if m and m != self._model]
         self._project_root = project_root.resolve()
         self._task_list_path = task_list_path
-        self._max_seconds = max_seconds
         self._virtual_tools = self._build_virtual_tools()
-        self._virtual_tool_names = {schema["function"]["name"] for schema in self._virtual_tools}
+        self._virtual_tool_names_set = {
+            schema["function"]["name"] for schema in self._virtual_tools
+        }
         self._task_list: DigestTaskList | None = None
 
     async def run(
@@ -320,7 +304,12 @@ class DigestAgent:
             },
         ]
 
-        summary = await self._run_react_loop(messages, serena_client)
+        summary, _ = await self.run_loop(messages, serena_client)
+        # 检查是否为异常终止
+        failure = _REACT_FAILURE_MESSAGES.get(summary)
+        if failure is not None:
+            raise RuntimeError(failure)
+
         resolved = sum(1 for item in task_list.items if item.status != "pending")
         return {
             "summary": summary,
@@ -376,6 +365,221 @@ class DigestAgent:
                 task_json,
             ]
         )
+
+    # ── BaseReActAgent 钩子实现 ────────────────────────────────────────────
+
+    def build_tools_schema(
+        self, serena_client: SerenaClient, state: LoopState
+    ) -> list[dict[str, Any]]:
+        # DigestAgent 使用自定义 deliver schema（参数为 summary 而非 answer）
+        digest_deliver = {
+            "type": "function",
+            "function": {
+                "name": "deliver",
+                "description": "提交本轮 digest 总结并结束循环。所有任务 resolved 后才能调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "本次 digest 的整合总结",
+                        },
+                    },
+                    "required": ["summary"],
+                },
+            },
+        }
+        return serena_client.tools_schema + self._virtual_tools + [digest_deliver]
+
+    @property
+    def virtual_tool_names(self) -> set[str]:
+        return self._virtual_tool_names_set
+
+    async def on_before_round(self, state: LoopState) -> None:
+        logger.info(
+            "DigestAgent round=%d elapsed=%.1fs pending=%d",
+            state.round_num,
+            state.elapsed,
+            len(self._task_list.pending_items()) if self._task_list else -1,
+        )
+
+    async def on_budget_warning(self, state: LoopState) -> None:
+        self._append(state, {
+            "role": "user",
+            "content": (
+                f"时间预算仅剩约 {int(state.remaining)} 秒。请停止扩散探索：\n"
+                "1) 对证据已足够的任务，立即用 write_annotation_and_mark_done 或 mark_task_done 收尾；\n"
+                "2) 对暂时证据不足的任务，直接用 mark_task_skipped 说明原因；\n"
+                "3) 不要再做大范围 Serena 探索，全部任务 resolved 后再 deliver。"
+            ),
+        })
+
+    def build_no_tool_correction(
+        self, state: LoopState, finish_reason: str
+    ) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                "你刚才没有调用工具。DigestAgent 必须通过工具处理任务，"
+                "请先用 read_task_list 查看任务，"
+                "然后优先用 read_annotation / write_annotation_and_mark_done / mark_task_skipped 收尾。"
+            ),
+        }
+
+    async def on_deliver(
+        self, args: dict[str, Any] | None, state: LoopState
+    ) -> DeliverDecision:
+        assert self._task_list is not None
+        summary = str((args or {}).get("summary") or "").strip()
+        if not summary:
+            return DeliverDecision.continue_with({
+                "role": "user",
+                "content": "deliver.summary 不能为空，请重新调用 deliver。",
+            })
+
+        if not self._task_list.all_resolved():
+            if not state.extra.get("deliver_guard_used", False):
+                pending = [
+                    self._task_list._summarize_item(item)
+                    for item in self._task_list.pending_items()
+                ]
+                state.extra["deliver_guard_used"] = True
+                return DeliverDecision.continue_with({
+                    "role": "user",
+                    "content": (
+                        f"还有 {len(pending)} 个未解决的任务，请继续处理后再 deliver。\n"
+                        "优先使用 write_annotation_and_mark_done 收尾；"
+                        "若证据不足则调用 mark_task_skipped，禁止继续空转：\n"
+                        f"{json.dumps(pending, ensure_ascii=False, indent=2)}"
+                    ),
+                })
+            # 追问后仍有遗漏，记录 warning 但允许退出
+            for item in self._task_list.pending_items():
+                self._task_list.warnings.append(
+                    f"任务未被 Agent 处理即结束: {item.id} ({item.kind})"
+                )
+
+        return DeliverDecision.finish(summary)
+
+    async def handle_virtual_tool(
+        self, tool_call: Any, state: LoopState
+    ) -> dict[str, Any] | None:
+        assert self._task_list is not None
+
+        tc_id = _get_tool_call_id(tool_call)
+        name = _get_tool_name(tool_call) or "unknown"
+        args: dict[str, Any] = _extract_tool_call_args(tool_call) or {}
+
+        def _err(msg: str) -> dict[str, Any]:
+            return {"tool_call_id": tc_id, "name": name, "content": msg}
+
+        def _ok(msg: str) -> dict[str, Any]:
+            return {"tool_call_id": tc_id, "name": name, "content": msg}
+
+        if name == "read_task_list":
+            return _ok(_safe_json_dumps(self._task_list.to_summary_dict()))
+
+        if name == "read_digest_delta":
+            task_id = str(args.get("task_id") or "").strip()
+            if not task_id:
+                return _err("task_id 不能为空")
+            task = self._find_task(task_id)
+            if task is None:
+                return _err(f"未找到任务: {task_id}")
+            if task.digest_delta is None:
+                return _err(f"任务无 digest_delta: {task_id}")
+            return _ok(_safe_json_dumps(task.digest_delta.model_dump(mode="json")))
+
+        if name in {"mark_task_done", "mark_task_skipped"}:
+            task_id = str(args.get("task_id") or "").strip()
+            note = str(args.get("note") or "").strip()
+            if not task_id:
+                return _err("task_id 不能为空")
+            if not note:
+                return _err("note 不能为空")
+            task = self._find_task(task_id)
+            if task is None:
+                return _err(f"未找到任务: {task_id}")
+            await self._update_task_status(
+                task,
+                "done" if name == "mark_task_done" else "skipped",
+                note,
+            )
+            return _ok(f"任务 {task_id} 已标记为 {task.status}")
+
+        if name == "read_annotation":
+            module_slug = str(args.get("module_slug") or "").strip()
+            if not module_slug:
+                return _err("module_slug 不能为空")
+            content = await self._load_annotation(module_slug)
+            return _ok(content)
+
+        if name == "write_annotation_patch":
+            module_slug = str(args.get("module_slug") or "").strip()
+            operation = str(args.get("operation") or "").strip().lower()
+            target = args.get("target")
+            target_str = (
+                str(target).strip()
+                if isinstance(target, str) and target.strip()
+                else None
+            )
+            content = str(args.get("content") or "")
+            if not module_slug:
+                return _err("module_slug 不能为空")
+            try:
+                await self._write_annotation_patch(
+                    module_slug=module_slug,
+                    operation=operation,
+                    target=target_str,
+                    content=content,
+                )
+                return _ok(
+                    f"annotation 已更新: module={module_slug}, operation={operation}, "
+                    f"target={target_str!r}"
+                )
+            except Exception as e:
+                return _err(f"annotation 更新失败: {e}")
+
+        if name == "write_annotation_and_mark_done":
+            task_id = str(args.get("task_id") or "").strip()
+            note = str(args.get("note") or "").strip()
+            module_slug = str(args.get("module_slug") or "").strip()
+            operation = str(args.get("operation") or "").strip().lower()
+            target = args.get("target")
+            target_str = (
+                str(target).strip()
+                if isinstance(target, str) and target.strip()
+                else None
+            )
+            content = str(args.get("content") or "")
+            if not task_id:
+                return _err("task_id 不能为空")
+            if not note:
+                return _err("note 不能为空")
+            task = self._find_task(task_id)
+            if task is None:
+                return _err(f"未找到任务: {task_id}")
+            effective_module_slug = module_slug or (task.module_slug or "")
+            if not effective_module_slug:
+                return _err("module_slug 不能为空，且任务自身未提供 module_slug")
+            try:
+                await self._write_annotation_patch(
+                    module_slug=effective_module_slug,
+                    operation=operation,
+                    target=target_str,
+                    content=content,
+                )
+                await self._update_task_status(task, "done", note)
+                return _ok(
+                    f"annotation 已更新并完成任务: task={task_id}, "
+                    f"module={effective_module_slug}, operation={operation}, target={target_str!r}"
+                )
+            except Exception as e:
+                return _err(f"更新 annotation 并完成任务失败: {e}")
+
+        return _err(f"未知虚拟工具: {name}")
+
+    # ── 私有方法 ─────────────────────────────────────────────────────────
 
     def _build_virtual_tools(self) -> list[dict[str, Any]]:
         return [
@@ -521,391 +725,7 @@ class DigestAgent:
                     },
                 },
             },
-            {
-                "type": "function",
-                "function": {
-                    "name": "deliver",
-                    "description": "提交本轮 digest 总结并结束循环。所有任务 resolved 后才能调用。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "summary": {
-                                "type": "string",
-                                "description": "本次 digest 的整合总结",
-                            },
-                        },
-                        "required": ["summary"],
-                    },
-                },
-            },
         ]
-
-    async def _run_react_loop(
-        self,
-        messages: list[dict[str, Any]],
-        serena_client: SerenaClient,
-    ) -> str:
-        tools_schema = serena_client.tools_schema + self._virtual_tools
-        no_tool_retries = 0
-        length_continuations = 0
-        deliver_guard_used = False
-        budget_warning_used = False
-        start = time.monotonic()
-        round_num = 0
-
-        while True:
-            elapsed = time.monotonic() - start
-            if elapsed >= self._max_seconds:
-                raise RuntimeError("DigestAgent ReAct 循环超时，已达最大时间预算")
-            remaining = self._max_seconds - elapsed
-            warn_threshold = min(
-                _BUDGET_WARNING_MAX_SECONDS,
-                max(_BUDGET_WARNING_MIN_SECONDS, self._max_seconds * _BUDGET_WARNING_RATIO),
-            )
-            if not budget_warning_used and remaining <= warn_threshold:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"时间预算仅剩约 {int(remaining)} 秒。请停止扩散探索：\n"
-                            "1) 对证据已足够的任务，立即用 write_annotation_and_mark_done 或 mark_task_done 收尾；\n"
-                            "2) 对暂时证据不足的任务，直接用 mark_task_skipped 说明原因；\n"
-                            "3) 不要再做大范围 Serena 探索，全部任务 resolved 后再 deliver。"
-                        ),
-                    }
-                )
-                budget_warning_used = True
-            round_num += 1
-            logger.info(
-                "DigestAgent round=%d elapsed=%.1fs pending=%d",
-                round_num,
-                elapsed,
-                len(self._task_list.pending_items()) if self._task_list else -1,
-            )
-
-            # 模型调用（含单步超时重试）
-            timeout_retries = 0
-            while True:
-                try:
-                    response, finish_reason = await self._completion(messages, tools_schema)
-                    break
-                except LLMCompletionError:
-                    raise
-                except TimeoutError as exc:
-                    timeout_retries += 1
-                    if timeout_retries <= _MAX_TIMEOUT_RETRIES:
-                        logger.warning("DigestAgent 模型调用超时，正在重试")
-                        continue
-                    raise RuntimeError("DigestAgent 模型调用超时，重试次数耗尽") from exc
-
-            message = _extract_message(response)
-            if "role" not in message:
-                message["role"] = "assistant"
-            messages.append(message)
-
-            # 输出被截断，续写
-            if finish_reason == "length":
-                length_continuations += 1
-                if length_continuations > _MAX_LENGTH_CONT:
-                    raise RuntimeError("DigestAgent 输出连续被截断，已放弃本轮")
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "输出被截断了，请继续完成剩余内容，并继续用工具调用处理任务。",
-                    }
-                )
-                continue
-
-            tool_calls = _extract_tool_calls(message)
-            if not tool_calls:
-                no_tool_retries += 1
-                if no_tool_retries <= _MAX_NO_TOOL_RETRIES:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "你刚才没有调用工具。DigestAgent 必须通过工具处理任务，"
-                                "请先用 read_task_list 查看任务，"
-                                "然后优先用 read_annotation / write_annotation_and_mark_done / mark_task_skipped 收尾。"
-                            ),
-                        }
-                    )
-                    continue
-                raise RuntimeError("DigestAgent 连续未产生 tool_calls，已终止")
-
-            no_tool_retries = 0
-
-            # 分拣：虚拟工具 vs Serena 工具
-            virtual_calls: list[Any] = []
-            serena_calls: list[Any] = []
-            deliver_summary: str | None = None
-
-            for tc in tool_calls:
-                name = self._get_tool_name(tc)
-                if name in self._virtual_tool_names:
-                    virtual_calls.append(tc)
-                else:
-                    serena_calls.append(tc)
-
-            # Serena 工具并发执行
-            if serena_calls:
-                serena_results = await asyncio.gather(
-                    *[self._invoke_serena_tool(tc, serena_client) for tc in serena_calls]
-                )
-                for res in serena_results:
-                    messages.append({"role": "tool", **res})
-
-            # 虚拟工具顺序执行（保证任务状态更新有序）
-            for tc in virtual_calls:
-                tool_msg, maybe_summary = await self._handle_virtual_tool(tc)
-                if tool_msg is not None:
-                    messages.append({"role": "tool", **tool_msg})
-                if maybe_summary is not None:
-                    deliver_summary = maybe_summary
-
-            # deliver 处理
-            if deliver_summary is not None:
-                assert self._task_list is not None
-                if not self._task_list.all_resolved() and not deliver_guard_used:
-                    pending = [
-                        self._task_list._summarize_item(item)
-                        for item in self._task_list.pending_items()
-                    ]
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"还有 {len(pending)} 个未解决的任务，请继续处理后再 deliver。\n"
-                                "优先使用 write_annotation_and_mark_done 收尾；"
-                                "若证据不足则调用 mark_task_skipped，禁止继续空转：\n"
-                                f"{json.dumps(pending, ensure_ascii=False, indent=2)}"
-                            ),
-                        }
-                    )
-                    deliver_guard_used = True
-                    continue
-                if not self._task_list.all_resolved():
-                    # 追问后仍有遗漏，记录 warning 但允许退出
-                    for item in self._task_list.pending_items():
-                        self._task_list.warnings.append(
-                            f"任务未被 Agent 处理即结束: {item.id} ({item.kind})"
-                        )
-                return deliver_summary
-
-    async def _completion(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-    ) -> tuple[Any, str]:
-        overrides = get_completion_overrides()
-        model_chain = [
-            build_litellm_model(self._provider, m) for m in [self._model, *self._model_fallbacks]
-        ]
-        attempts: list[dict[str, str]] = []
-
-        for idx, full_model in enumerate(model_chain):
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        litellm.completion,
-                        model=full_model,
-                        messages=messages,
-                        tools=tools if tools else None,
-                        temperature=0.1,
-                        **overrides,
-                    ),
-                    timeout=60.0,
-                )
-                if idx > 0:
-                    logger.info("DigestAgent 模型降级成功: %s", full_model)
-                return response, _extract_finish_reason(response)
-            except (TimeoutError, litellm_exc.Timeout) as exc:
-                raise TimeoutError("litellm timeout") from exc
-            except Exception as exc:
-                if not _should_fallback_model(exc):
-                    raise
-                attempts.append(
-                    {
-                        "model": full_model,
-                        "error_type": type(exc).__name__,
-                        "reason": _stringify_error(exc),
-                    }
-                )
-                if idx < len(model_chain) - 1:
-                    logger.warning("DigestAgent 模型调用失败，尝试降级: %s", full_model)
-                    continue
-                raise LLMCompletionError(attempts) from exc
-
-        raise LLMCompletionError(attempts)
-
-    @staticmethod
-    def _get_tool_name(tool_call: Any) -> str | None:
-        if isinstance(tool_call, dict):
-            fn = tool_call.get("function") or {}
-            return fn.get("name") or tool_call.get("name")
-        fn = getattr(tool_call, "function", None)
-        return getattr(fn, "name", None) or getattr(tool_call, "name", None)
-
-    @staticmethod
-    def _get_tool_call_id(tool_call: Any) -> str:
-        if isinstance(tool_call, dict):
-            return str(tool_call.get("id") or uuid.uuid4())
-        return str(getattr(tool_call, "id", None) or uuid.uuid4())
-
-    async def _invoke_serena_tool(
-        self,
-        tool_call: Any,
-        serena_client: SerenaClient,
-    ) -> dict[str, Any]:
-        tc_id = self._get_tool_call_id(tool_call)
-        name = self._get_tool_name(tool_call) or "unknown"
-        raw_args = (
-            tool_call.get("function", {}).get("arguments")
-            if isinstance(tool_call, dict)
-            else getattr(getattr(tool_call, "function", None), "arguments", None)
-        )
-        args = _parse_tool_call_args(raw_args)
-        if args is None:
-            return {
-                "tool_call_id": tc_id,
-                "name": name,
-                "content": f"工具参数解析失败: {name}",
-            }
-        try:
-            result = await serena_client.call(name, args)
-            return {
-                "tool_call_id": tc_id,
-                "name": name,
-                "content": _safe_json_dumps(result),
-            }
-        except SerenaClientError as e:
-            return {
-                "tool_call_id": tc_id,
-                "name": name,
-                "content": f"Serena 工具调用失败: {e}",
-            }
-
-    async def _handle_virtual_tool(
-        self,
-        tool_call: Any,
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        assert self._task_list is not None
-
-        tc_id = self._get_tool_call_id(tool_call)
-        name = self._get_tool_name(tool_call) or "unknown"
-        raw_args = (
-            tool_call.get("function", {}).get("arguments")
-            if isinstance(tool_call, dict)
-            else getattr(getattr(tool_call, "function", None), "arguments", None)
-        )
-        args: dict[str, Any] = _parse_tool_call_args(raw_args) or {}
-
-        def _err(msg: str) -> tuple[dict[str, Any], None]:
-            return {"tool_call_id": tc_id, "name": name, "content": msg}, None
-
-        def _ok(msg: str) -> tuple[dict[str, Any], None]:
-            return {"tool_call_id": tc_id, "name": name, "content": msg}, None
-
-        if name == "deliver":
-            summary = str(args.get("summary") or "").strip()
-            if not summary:
-                return _err("deliver.summary 不能为空")
-            return None, summary
-
-        if name == "read_task_list":
-            return _ok(_safe_json_dumps(self._task_list.to_summary_dict()))
-
-        if name == "read_digest_delta":
-            task_id = str(args.get("task_id") or "").strip()
-            if not task_id:
-                return _err("task_id 不能为空")
-            task = self._find_task(task_id)
-            if task is None:
-                return _err(f"未找到任务: {task_id}")
-            if task.digest_delta is None:
-                return _err(f"任务无 digest_delta: {task_id}")
-            return _ok(_safe_json_dumps(task.digest_delta.model_dump(mode="json")))
-
-        if name in {"mark_task_done", "mark_task_skipped"}:
-            task_id = str(args.get("task_id") or "").strip()
-            note = str(args.get("note") or "").strip()
-            if not task_id:
-                return _err("task_id 不能为空")
-            if not note:
-                return _err("note 不能为空")
-            task = self._find_task(task_id)
-            if task is None:
-                return _err(f"未找到任务: {task_id}")
-            await self._update_task_status(
-                task,
-                "done" if name == "mark_task_done" else "skipped",
-                note,
-            )
-            return _ok(f"任务 {task_id} 已标记为 {task.status}")
-
-        if name == "read_annotation":
-            module_slug = str(args.get("module_slug") or "").strip()
-            if not module_slug:
-                return _err("module_slug 不能为空")
-            content = await self._load_annotation(module_slug)
-            return _ok(content)
-
-        if name == "write_annotation_patch":
-            module_slug = str(args.get("module_slug") or "").strip()
-            operation = str(args.get("operation") or "").strip().lower()
-            target = args.get("target")
-            target_str = str(target).strip() if isinstance(target, str) and target.strip() else None
-            content = str(args.get("content") or "")
-            if not module_slug:
-                return _err("module_slug 不能为空")
-            try:
-                await self._write_annotation_patch(
-                    module_slug=module_slug,
-                    operation=operation,
-                    target=target_str,
-                    content=content,
-                )
-                return _ok(
-                    f"annotation 已更新: module={module_slug}, operation={operation}, "
-                    f"target={target_str!r}"
-                )
-            except Exception as e:
-                return _err(f"annotation 更新失败: {e}")
-
-        if name == "write_annotation_and_mark_done":
-            task_id = str(args.get("task_id") or "").strip()
-            note = str(args.get("note") or "").strip()
-            module_slug = str(args.get("module_slug") or "").strip()
-            operation = str(args.get("operation") or "").strip().lower()
-            target = args.get("target")
-            target_str = str(target).strip() if isinstance(target, str) and target.strip() else None
-            content = str(args.get("content") or "")
-            if not task_id:
-                return _err("task_id 不能为空")
-            if not note:
-                return _err("note 不能为空")
-            task = self._find_task(task_id)
-            if task is None:
-                return _err(f"未找到任务: {task_id}")
-            effective_module_slug = module_slug or (task.module_slug or "")
-            if not effective_module_slug:
-                return _err("module_slug 不能为空，且任务自身未提供 module_slug")
-            try:
-                await self._write_annotation_patch(
-                    module_slug=effective_module_slug,
-                    operation=operation,
-                    target=target_str,
-                    content=content,
-                )
-                await self._update_task_status(task, "done", note)
-                return _ok(
-                    f"annotation 已更新并完成任务: task={task_id}, "
-                    f"module={effective_module_slug}, operation={operation}, target={target_str!r}"
-                )
-            except Exception as e:
-                return _err(f"更新 annotation 并完成任务失败: {e}")
-
-        return _err(f"未知虚拟工具: {name}")
 
     def _find_task(self, task_id: str) -> DigestTaskItem | None:
         assert self._task_list is not None
