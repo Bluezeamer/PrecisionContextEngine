@@ -243,54 +243,6 @@ class DigestPlanner:
 
         return DigestTaskList(items=items, warnings=warnings, created_at=_utc_now())
 
-    async def _load_file_module_map(self) -> tuple[dict[str, str], list[str]]:
-        """解析 annotations/index.md，返回 {文件路径: module_slug} 映射。"""
-        index_path = self._project_root / ".pce" / "annotations" / "index.md"
-        warnings: list[str] = []
-        try:
-            raw = await _read_file(index_path)
-        except FileNotFoundError:
-            return {}, ["未找到 .pce/annotations/index.md，DigestAgent 只能依赖自身探索"]
-        except Exception as e:
-            return {}, [f"读取 annotations/index.md 失败: {e}"]
-
-        mapping: dict[str, str] = {}
-        current_name: str | None = None
-        current_slug: str | None = None
-        current_files: list[str] = []
-
-        def flush() -> None:
-            if current_slug is None:
-                return
-            for fp in current_files:
-                if fp in mapping and mapping[fp] != current_slug:
-                    warnings.append(f"文件归属到多个模块，取最后一次映射: {fp} -> {current_slug}")
-                mapping[fp] = current_slug
-
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("## "):
-                flush()
-                current_name = stripped[3:].strip()
-                current_slug = _module_slug_from_name(current_name)
-                current_files = []
-                continue
-            if current_name is None:
-                continue
-            # 解析 "文件：a.py, b.py"
-            if stripped.startswith("文件：") or stripped.startswith("文件:"):
-                payload = re.split(r"[：:]", stripped, maxsplit=1)[1]
-                current_files = [p.strip() for p in payload.split(",") if p.strip()]
-                continue
-            # 从 "详细认知：.pce/annotations/modules/xxx.md" 中提取真实 slug
-            if stripped.startswith("详细认知：") or stripped.startswith("详细认知:"):
-                match = re.search(r"modules/([^/\s]+)\.md", stripped)
-                if match:
-                    current_slug = match.group(1).strip()
-
-        flush()
-        return mapping, warnings
-
 
 # ---------------------------------------------------------------------------
 # DigestAgent：ReAct 循环执行认知整合
