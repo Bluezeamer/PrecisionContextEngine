@@ -67,6 +67,7 @@ ALLOWED_EXTENSION_SECTION_PREFIXES: tuple[str, ...] = (
 
 _DIGEST_TASKS_REL = Path(".pce") / "digest_tasks.json"
 _DEFAULT_MAX_SECONDS = 300.0
+_DEFAULT_DIGEST_BATCH_SIZE = 4
 
 _REACT_FAILURE_MESSAGES: dict[str, str] = {
     REACT_TIMEOUT_BUDGET: "DigestAgent ReAct 循环超时，已达最大时间预算",
@@ -84,6 +85,26 @@ _REACT_FAILURE_MESSAGES: dict[str, str] = {
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _get_digest_batch_size() -> int:
+    raw = os.getenv("PCE_DIGEST_BATCH_SIZE", str(_DEFAULT_DIGEST_BATCH_SIZE)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("PCE_DIGEST_BATCH_SIZE 非法，回退默认值: %s", raw)
+        return _DEFAULT_DIGEST_BATCH_SIZE
+    return max(1, value)
+
+
+def _chunk_digest_items(
+    items: list[DigestTaskItem],
+    *,
+    batch_size: int,
+) -> list[list[DigestTaskItem]]:
+    if batch_size <= 0:
+        batch_size = _DEFAULT_DIGEST_BATCH_SIZE
+    return [items[idx: idx + batch_size] for idx in range(0, len(items), batch_size)]
 
 
 def _module_slug_from_name(name: str) -> str:
@@ -1174,9 +1195,11 @@ async def _run_module_tasks(
     model: str | None,
     provider: str | None,
 ) -> dict[str, Any]:
-    """按模块并发执行 DigestAgent，收窄单任务上下文规模。"""
+    """按模块分批并发执行 DigestAgent，收窄单任务上下文规模。"""
     warnings: list[str] = list(task_list.warnings)
     pending_items = [item for item in task_list.items if item.status == "pending"]
+    batch_size = _get_digest_batch_size()
+    batches = _chunk_digest_items(pending_items, batch_size=batch_size)
 
     async def _run_one(index: int, item: DigestTaskItem) -> tuple[int, str, list[str]]:
         sub_task_path = _module_task_list_path(task_list_path, item)
@@ -1208,15 +1231,25 @@ async def _run_module_tasks(
         summary = str(result.get("summary") or "").strip()
         return index, summary, task_warnings
 
-    results = await asyncio.gather(
-        *[_run_one(index, item) for index, item in enumerate(pending_items)],
-        return_exceptions=False,
-    )
-
     ordered_summaries: list[str] = [""] * len(pending_items)
-    for index, summary, task_warnings in results:
-        ordered_summaries[index] = summary
-        warnings.extend(task_warnings)
+    for batch_no, batch in enumerate(batches, start=1):
+        logger.info(
+            "Digest 批次执行: batch=%d/%d size=%d",
+            batch_no,
+            len(batches),
+            len(batch),
+        )
+        start_index = (batch_no - 1) * batch_size
+        batch_results = await asyncio.gather(
+            *[
+                _run_one(start_index + offset, item)
+                for offset, item in enumerate(batch)
+            ],
+            return_exceptions=False,
+        )
+        for index, summary, task_warnings in batch_results:
+            ordered_summaries[index] = summary
+            warnings.extend(task_warnings)
 
     summaries = [
         f"[{item.module_slug}] {summary}"

@@ -13,17 +13,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pce.digest_agent import DigestAgent, DigestTaskItem, DigestTaskList
+from pce.base_agent import LoopState
+from pce.digest_agent import DigestAgent, DigestTaskItem, DigestTaskList, _run_module_tasks
 from pce.models import InsightConfidence, InsightFact, ModuleDigestDelta
 
 
 def _assert(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def _dummy_state() -> LoopState:
+    now = time.monotonic()
+    return LoopState(messages=[], start_time=now, deadline=now + 30.0)
 
 
 async def _test_prompt_guidance() -> None:
@@ -104,8 +112,7 @@ async def _test_atomic_write_and_mark_done() -> None:
             },
         }
 
-        tool_msg, summary = await agent._handle_virtual_tool(tool_call)
-        _assert(summary is None, "原子化收尾工具不应直接 deliver")
+        tool_msg = await agent.handle_virtual_tool(tool_call, _dummy_state())
         _assert(tool_msg is not None, "原子化收尾工具应返回 tool result")
         _assert("完成任务" in tool_msg["content"], "tool result 未体现任务已完成")
 
@@ -180,8 +187,7 @@ async def _test_task_summary_and_digest_delta_split() -> None:
                 "arguments": json.dumps({"task_id": "module:core-module"}, ensure_ascii=False),
             },
         }
-        tool_msg, summary_out = await agent._handle_virtual_tool(tool_call)
-        _assert(summary_out is None, "read_digest_delta 不应直接 deliver")
+        tool_msg = await agent.handle_virtual_tool(tool_call, _dummy_state())
         _assert(tool_msg is not None, "read_digest_delta 应返回 tool result")
         payload = json.loads(tool_msg["content"])
         _assert(payload["module_slug"] == "core-module", "read_digest_delta 应返回完整事实包")
@@ -227,10 +233,73 @@ async def _test_extension_heading_guard() -> None:
                 ),
             },
         }
-        tool_msg, summary = await agent._handle_virtual_tool(tool_call)
-        _assert(summary is None, "非法扩展标题不应直接 deliver")
+        tool_msg = await agent.handle_virtual_tool(tool_call, _dummy_state())
         _assert(tool_msg is not None, "非法扩展标题应返回 tool result")
         _assert("扩展章节标题必须使用受控前缀" in tool_msg["content"], "未拦截非法扩展标题")
+
+
+async def _test_digest_batching() -> None:
+    items = [
+        DigestTaskItem(
+            id=f"module:core-{idx}",
+            kind="module",
+            status="pending",
+            module_slug=f"core-{idx}",
+        )
+        for idx in range(5)
+    ]
+    task_list = DigestTaskList(
+        items=items,
+        warnings=[],
+        created_at=datetime.now(UTC),
+    )
+
+    class _FakeSerena:
+        tools_schema: list[dict[str, object]] = []
+
+    starts: list[tuple[str, float]] = []
+    original_run = DigestAgent.run
+    original_batch_size = os.environ.get("PCE_DIGEST_BATCH_SIZE")
+
+    async def _fake_run(self, *, task_list: DigestTaskList, serena_client):  # type: ignore[override]
+        item = task_list.items[0]
+        starts.append((item.id, time.monotonic()))
+        await asyncio.sleep(0.05)
+        item.status = "done"
+        return {
+            "summary": f"done:{item.id}",
+            "resolved_tasks": 1,
+            "pending_tasks": 0,
+            "warnings": [],
+        }
+
+    os.environ["PCE_DIGEST_BATCH_SIZE"] = "2"
+    DigestAgent.run = _fake_run  # type: ignore[assignment]
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = await _run_module_tasks(
+                task_list=task_list,
+                task_list_path=root / ".pce" / "digest_tasks.json",
+                project_root=root,
+                serena_client=_FakeSerena(),
+                model="dummy-model",
+                provider="openai",
+            )
+        _assert(result["pending_tasks"] == 0, "分批执行后不应遗留 pending 任务")
+        _assert(len(starts) == 5, "应执行全部 5 个模块任务")
+        starts.sort(key=lambda item: item[1])
+        first_wave_end = starts[1][1] + 0.045
+        _assert(
+            starts[2][1] >= first_wave_end,
+            "第 3 个任务应在首批任务接近完成后再启动，说明需按批次执行",
+        )
+    finally:
+        DigestAgent.run = original_run  # type: ignore[assignment]
+        if original_batch_size is None:
+            os.environ.pop("PCE_DIGEST_BATCH_SIZE", None)
+        else:
+            os.environ["PCE_DIGEST_BATCH_SIZE"] = original_batch_size
 
 
 async def main() -> None:
@@ -238,6 +307,7 @@ async def main() -> None:
     await _test_atomic_write_and_mark_done()
     await _test_task_summary_and_digest_delta_split()
     await _test_extension_heading_guard()
+    await _test_digest_batching()
     print(
         json.dumps(
             {
@@ -247,6 +317,7 @@ async def main() -> None:
                     "write_annotation_and_mark_done 可同时写 annotation 与持久化 done 状态",
                     "read_task_list 与 read_digest_delta 已完成摘要/明细分离，并移除旧字段摘要",
                     "annotation 扩展标题受控前缀约束已生效",
+                    "digest 模块任务会按批次执行，而不是一次性全并发",
                 ],
             },
             ensure_ascii=False,
