@@ -42,12 +42,121 @@ from .models import (
     ProjectMeta,
 )
 from .module_registry import ModuleRegistryManager
+from .prompt_guard import build_prompt_budget, estimate_input_tokens, fit_text_to_budget
 from .serena_client import SerenaClient, SerenaClientError
 
 logger = logging.getLogger(__name__)
 
 # 常量（与 indexer.py 共享的导航路径常量）
 ANNOTATIONS_INDEX_FILE = "index.md"
+_STRUCTURE_STATE_FILE = "structure_state.json"
+_STRUCTURE_REQUIRED_HEADINGS: tuple[str, ...] = (
+    "## 项目形态概览",
+    "## 顶层区域",
+    "## 关键入口候选",
+    "## 模块对齐提示",
+    "## 导航建议",
+)
+_STRUCTURE_HEDGE_MARKERS: tuple[str, ...] = (
+    "候选",
+    "可优先",
+    "可先",
+    "可视为",
+    "可能",
+    "线索",
+    "提示",
+    "建议",
+)
+_STRUCTURE_CAUTIOUS_SECTION_HEADINGS: tuple[str, ...] = (
+    "## 项目形态概览",
+    "## 顶层区域",
+    "## 关键入口候选",
+    "## 模块对齐提示",
+)
+_FRONTEND_HINTS = frozenset({"frontend", "web", "ui", "client", "vite", "react", "vue"})
+_BACKEND_HINTS = frozenset({"backend", "api", "server", "service", "fastapi", "flask"})
+_SCRIPT_HINTS = frozenset({"script", "scripts", "tool", "tools", "cli", "cmd", "bin"})
+_TEST_HINTS = frozenset({"test", "tests", "spec", "specs"})
+_DOC_HINTS = frozenset({"doc", "docs", "design", "designs"})
+_CONFIG_HINTS = frozenset({"config", "configs", "setting", "settings", "env"})
+_ENTRY_FILE_PRIORITY: dict[str, tuple[int, str]] = {
+    "main.py": (100, "文件名命中 `main.*` 规则"),
+    "main.ts": (100, "文件名命中 `main.*` 规则"),
+    "main.js": (100, "文件名命中 `main.*` 规则"),
+    "main.rs": (100, "文件名命中 `main.*` 规则"),
+    "app.py": (96, "文件名命中 `app.*` 规则"),
+    "app.ts": (96, "文件名命中 `app.*` 规则"),
+    "app.js": (96, "文件名命中 `app.*` 规则"),
+    "server.py": (94, "文件名命中 `server.*` 规则"),
+    "server.ts": (94, "文件名命中 `server.*` 规则"),
+    "server.js": (94, "文件名命中 `server.*` 规则"),
+    "cli.py": (92, "文件名命中 `cli.*` 规则"),
+    "cli.ts": (92, "文件名命中 `cli.*` 规则"),
+    "cli.js": (92, "文件名命中 `cli.*` 规则"),
+    "__main__.py": (90, "文件名命中 Python 包入口规则"),
+    "lib.rs": (88, "文件名命中 Rust 库入口规则"),
+    "index.ts": (84, "文件名命中 `index.*` 规则"),
+    "index.js": (84, "文件名命中 `index.*` 规则"),
+}
+_DIRECTORY_HINT_GROUPS: tuple[tuple[frozenset[str], str], ...] = (
+    (_FRONTEND_HINTS, "路径 token 命中前端相关词"),
+    (_BACKEND_HINTS, "路径 token 命中服务端相关词"),
+    (_SCRIPT_HINTS, "路径 token 命中脚本/工具相关词"),
+    (_TEST_HINTS, "路径 token 命中测试相关词"),
+    (_DOC_HINTS, "路径 token 命中文档相关词"),
+    (_CONFIG_HINTS, "路径 token 命中配置相关词"),
+)
+_MISSING_COVERAGE_REPAIR_BATCH_SIZE = 24
+_MISSING_FACT_FULL_LINES = 60
+_MISSING_FACT_WINDOW_LINES = 20
+_MISSING_KIND_VALUES = {
+    "implementation",
+    "config",
+    "documentation",
+    "test",
+    "resource",
+    "shell",
+    "entrypoint",
+    "unknown",
+}
+_ANNOTATION_LLM_TIMEOUT_SECONDS = 20.0
+_MODULE_ANNOTATION_CONCURRENCY = 4
+_INDEX_PROMPT_MAX_SUMMARY_LINES = 48
+_MODULE_PROMPT_MAX_FILE_LINES = 24
+_MISSING_COVERAGE_INDEX_BUDGET = 5000
+
+
+def _annotation_model_for_budget() -> str | None:
+    return _resolve_annotation_model(None)
+
+
+def _fit_lines_with_budget(
+    *,
+    prefix_lines: list[str],
+    candidate_lines: list[str],
+    suffix_lines: list[str],
+    max_items: int,
+    min_items: int,
+) -> list[str]:
+    model = _annotation_model_for_budget()
+    if model is None:
+        return candidate_lines[:max_items]
+
+    budget = build_prompt_budget()
+    selected = candidate_lines[:max_items]
+    while len(selected) > min_items:
+        prompt = "\n".join([*prefix_lines, *selected, *suffix_lines])
+        tokens = estimate_input_tokens(
+            model,
+            [
+                {"role": "system", "content": "annotation-writer-budget-check"},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        if tokens <= budget.target_input_budget:
+            return selected
+        selected = selected[:-4]
+    return selected[:min_items]
 
 def _structure_path(root_path: Path) -> Path:
     return root_path / ".pce" / "structure.md"
@@ -943,13 +1052,36 @@ async def _llm_complete_text(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
+    budget = build_prompt_budget()
+    tokens = estimate_input_tokens(effective_model, messages)
+    if tokens > budget.soft_input_budget:
+        trimmed_prompt = fit_text_to_budget(
+            effective_model,
+            prompt,
+            token_budget=max(800, budget.target_input_budget // 2),
+            notice="\n\n[提示词过长，已保留前后关键部分]\n\n",
+        )
+        messages[1]["content"] = trimmed_prompt
+        tokens = estimate_input_tokens(effective_model, messages)
+        if tokens > budget.hard_input_budget:
+            trimmed_prompt = fit_text_to_budget(
+                effective_model,
+                trimmed_prompt,
+                token_budget=max(600, budget.target_input_budget // 3),
+                notice="\n\n[提示词进一步压缩]\n\n",
+            )
+            messages[1]["content"] = trimmed_prompt
+        logger.warning("%s: prompt_guard 生效，tokens=%d", failure_log, tokens)
     try:
-        response = await asyncio.to_thread(
-            litellm.completion,
-            model=effective_model,
-            messages=messages,
-            temperature=0.1,
-            **get_completion_overrides(),
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                litellm.completion,
+                model=effective_model,
+                messages=messages,
+                temperature=0.1,
+                **get_completion_overrides(),
+            ),
+            timeout=_ANNOTATION_LLM_TIMEOUT_SECONDS,
         )
     except Exception as e:
         logger.warning(f"{failure_log}(已降级): {e}")
@@ -1107,40 +1239,47 @@ def _format_missing_entry_fact_block(fact: dict[str, Any]) -> str:
 
 def _build_index_md_prompt(entries: list[IndexEntry], project_meta: ProjectMeta) -> str:
     """构建生成 annotations/index.md 的 LLM 提示词（含 in-context learning 示例）。"""
-    summary_lines = [_format_entry_outline(entry) for entry in entries[:80]]
-    return "\n".join(
-        [
-            "你要为代码库生成一个可渐进加载的项目认知导航首页 index.md。",
-            "请严格模仿示例的结构输出，不要输出任何额外解释，不要使用代码块。",
-            "",
-            "示例输出:",
-            "# 项目认知导航",
-            "",
-            "## Agent Core",
-            "文件：pce/agent.py, pce/agent_runtime/contracts.py, pce/agent_runtime/spawner.py",
-            "职责：负责 PCE 主循环、任务编排与子 Agent 协议。对外接收查询目标，对内协调工具调用、compact 与交付流程。高风险点：ReAct 循环无 tool_calls 时的纠错逻辑、spawn 预算与深度限制。",
-            "详细认知：.pce/annotations/modules/agent-core.md",
-            "",
-            "## Index Pipeline",
-            "文件：pce/indexer.py, pce/memory.py",
-            "职责：负责代码索引构建与持久化。维护结构索引、引用索引和渐进式认知文档；提供增量更新路径避免全量重建。高风险点：LLM 注解降级时需保证回退内容可机器解析。",
-            "详细认知：.pce/annotations/modules/index-pipeline.md",
-            "",
-            f"项目根路径: {project_meta.root_path}",
-            f"文件总数: {project_meta.file_count}, 代码行总数: {project_meta.loc_total}",
-            "",
-            "索引摘要:",
-            *summary_lines,
-            "",
-            "输出约束:",
-            "- 第一行必须是 `# 项目认知导航`",
-            "- 每个模块使用 `## 模块名` 开头",
-            "- `文件：` 行使用逗号分隔的相对路径，路径必须来自索引摘要",
-            "- `职责：` 2-3 句话，描述模块边界、关键职责、主要协作对象和高风险点",
-            "- `详细认知：` 写成 `.pce/annotations/modules/{slug}.md`，slug = 模块名小写后空格替换为连字符",
-            "- 不要输出 JSON、代码块、前言、结语或任何未在示例中出现的附加文本",
-        ]
+    prefix_lines = [
+        "你要为代码库生成一个可渐进加载的项目认知导航首页 index.md。",
+        "请严格模仿示例的结构输出，不要输出任何额外解释，不要使用代码块。",
+        "",
+        "示例输出:",
+        "# 项目认知导航",
+        "",
+        "## Agent Core",
+        "文件：pce/agent.py, pce/agent_runtime/contracts.py, pce/agent_runtime/spawner.py",
+        "职责：负责 PCE 主循环、任务编排与子 Agent 协议。对外接收查询目标，对内协调工具调用、compact 与交付流程。高风险点：ReAct 循环无 tool_calls 时的纠错逻辑、spawn 预算与深度限制。",
+        "详细认知：.pce/annotations/modules/agent-core.md",
+        "",
+        "## Index Pipeline",
+        "文件：pce/indexer.py, pce/memory.py",
+        "职责：负责代码索引构建与持久化。维护结构索引、引用索引和渐进式认知文档；提供增量更新路径避免全量重建。高风险点：LLM 注解降级时需保证回退内容可机器解析。",
+        "详细认知：.pce/annotations/modules/index-pipeline.md",
+        "",
+        f"项目根路径: {project_meta.root_path}",
+        f"文件总数: {project_meta.file_count}, 代码行总数: {project_meta.loc_total}",
+        "",
+        "索引摘要:",
+    ]
+    suffix_lines = [
+        "",
+        "输出约束:",
+        "- 第一行必须是 `# 项目认知导航`",
+        "- 每个模块使用 `## 模块名` 开头",
+        "- `文件：` 行使用逗号分隔的相对路径，路径必须来自索引摘要",
+        "- `职责：` 2-3 句话，描述模块边界、关键职责、主要协作对象和高风险点",
+        "- `详细认知：` 写成 `.pce/annotations/modules/{slug}.md`，slug = 模块名小写后空格替换为连字符",
+        "- 不要输出 JSON、代码块、前言、结语或任何未在示例中出现的附加文本",
+    ]
+    raw_summary_lines = [_format_entry_outline(entry) for entry in entries[:80]]
+    summary_lines = _fit_lines_with_budget(
+        prefix_lines=prefix_lines,
+        candidate_lines=raw_summary_lines,
+        suffix_lines=suffix_lines,
+        max_items=_INDEX_PROMPT_MAX_SUMMARY_LINES,
+        min_items=12,
     )
+    return "\n".join([*prefix_lines, *summary_lines, *suffix_lines])
 
 
 def _build_module_annotation_prompt(
@@ -1148,7 +1287,7 @@ def _build_module_annotation_prompt(
     module_entries: list[IndexEntry],
 ) -> str:
     """构建单模块深度认知文档的 LLM 提示词。"""
-    file_lines: list[str] = []
+    raw_file_lines: list[str] = []
     for entry in module_entries:
         symbol_lines = ", ".join(
             f"{sym.name}({sym.kind.value})[{sym.line_start}-{sym.line_end}]"
@@ -1156,42 +1295,59 @@ def _build_module_annotation_prompt(
         ) or "无显式符号"
         if len(entry.symbols) > 12:
             symbol_lines += ", ..."
-        file_lines.append(
+        raw_file_lines.append(
             f"- {entry.file_meta.path} [{entry.file_meta.language}, {entry.file_meta.loc} 行] "
             f"符号: {symbol_lines}"
         )
 
-    return "\n".join(
-        [
-            "你要为单个代码模块生成可按需加载的深度认知文档。",
-            "请输出 Markdown，不要代码块，不要额外解释。",
-            "",
-            f"模块名: {module_name}",
-            f"覆盖文件数: {len(module_entries)}",
-            "",
-            "文件与符号摘要:",
-            *file_lines,
-            "",
-            "输出要求:",
-            f"- 标题必须是 `# {module_name}`",
-            "- 必须包含 `## 覆盖文件`、`## 核心职责`、`## 关键符号`、`## 关键流程`、`## 外部协作`、`## 风险与约束` 这些二级标题",
-            "- `## 覆盖文件` 需列出所有文件路径",
-            "- `## 关键符号` 需优先引用给定摘要里的符号名和文件路径",
-            "- `## 关键流程` 关注控制流、数据流或调用链，不要泛泛而谈",
-            "- 结论必须基于输入，不得编造不存在的文件、符号或依赖",
-        ]
+    prefix_lines = [
+        "你要为单个代码模块生成可按需加载的深度认知文档。",
+        "请输出 Markdown，不要代码块，不要额外解释。",
+        "",
+        f"模块名: {module_name}",
+        f"覆盖文件数: {len(module_entries)}",
+        "",
+        "文件与符号摘要:",
+    ]
+    suffix_lines = [
+        "",
+        "输出要求:",
+        f"- 标题必须是 `# {module_name}`",
+        "- 必须包含 `## 覆盖文件`、`## 核心职责`、`## 关键符号`、`## 关键流程`、`## 外部协作`、`## 风险与约束` 这些二级标题",
+        "- `## 覆盖文件` 需列出所有文件路径",
+        "- `## 关键符号` 需优先引用给定摘要里的符号名和文件路径",
+        "- `## 关键流程` 关注控制流、数据流或调用链，不要泛泛而谈",
+        "- 结论必须基于输入，不得编造不存在的文件、符号或依赖",
+    ]
+    file_lines = _fit_lines_with_budget(
+        prefix_lines=prefix_lines,
+        candidate_lines=raw_file_lines,
+        suffix_lines=suffix_lines,
+        max_items=_MODULE_PROMPT_MAX_FILE_LINES,
+        min_items=4,
     )
+    return "\n".join([*prefix_lines, *file_lines, *suffix_lines])
 
 
 def _build_module_assignment_prompt(entry: IndexEntry, index_content: str) -> str:
     """构建新增文件模块归属判断的 LLM 提示词。"""
+    model = _annotation_model_for_budget()
+    compact_index = index_content.strip()
+    if model is not None:
+        compact_index = fit_text_to_budget(
+            model,
+            compact_index,
+            token_budget=_MISSING_COVERAGE_INDEX_BUDGET,
+            notice="\n\n[现有导航过长，已压缩]\n\n",
+            min_chars=1200,
+        )
     return "\n".join(
         [
             "请根据现有项目认知导航，为一个新增文件判断最合适的模块归属。",
             "只能从已有模块 slug 中选择；如果无法可靠判断，则返回空字符串。",
             "",
             "现有导航:",
-            index_content.strip(),
+            compact_index,
             "",
             "新增文件摘要:",
             _format_entry_outline(entry),
@@ -1210,6 +1366,16 @@ def _build_missing_coverage_repair_prompt(
     known_slugs: set[str],
 ) -> str:
     fact_blocks = [_format_missing_entry_fact_block(fact) for fact in entry_facts]
+    model = _annotation_model_for_budget()
+    compact_index = index_content.strip()
+    if model is not None:
+        compact_index = fit_text_to_budget(
+            model,
+            compact_index,
+            token_budget=_MISSING_COVERAGE_INDEX_BUDGET,
+            notice="\n\n[现有导航过长，已压缩]\n\n",
+            min_chars=1500,
+        )
     return "\n".join(
         [
             "当前项目认知导航已有第一轮模块划分，但仍有少量文件未被任何模块覆盖。",
@@ -1225,7 +1391,7 @@ def _build_missing_coverage_repair_prompt(
             "- implementation / config / documentation / test / resource / shell / entrypoint / unknown",
             "",
             "现有导航：",
-            index_content.strip(),
+            compact_index,
             "",
             "现有 module_slug 列表：",
             ", ".join(sorted(known_slugs)) or "(无)",
@@ -2749,10 +2915,29 @@ async def _write_module_files(
     modules_dir: Path,
     model: str | None,
 ) -> None:
-    """并发生成并写入模块认知文档，失败时使用回退内容。"""
+    """生成并写入模块认知文档，限制并发避免冷启动压垮模型侧队列。"""
+    semaphore = asyncio.Semaphore(_MODULE_ANNOTATION_CONCURRENCY)
+
+    async def _generate_with_limit(
+        module_name: str,
+        module_entries: list[IndexEntry],
+    ) -> str | BaseException | None:
+        async with semaphore:
+            try:
+                return await _generate_module_annotation(
+                    module_name,
+                    module_entries,
+                    model=model,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                return exc
+
     results = await asyncio.gather(
-        *[_generate_module_annotation(name, entries, model=model) for name, _, entries in module_specs],
-        return_exceptions=True,
+        *[
+            _generate_with_limit(name, entries)
+            for name, _, entries in module_specs
+        ],
+        return_exceptions=False,
     )
     for (module_name, slug, module_entries), result in zip(module_specs, results, strict=False):
         if isinstance(result, BaseException):
@@ -3086,5 +3271,3 @@ async def _update_annotations_incremental(
 # ============================================================================
 # 核心索引逻辑
 # ============================================================================
-
-

@@ -43,6 +43,7 @@ from .digest_delta_builder import DigestDeltaBuilder
 from .insight_cache import InsightCache
 from .memory import delete_file_baseline, load_index, save_file_baseline
 from .models import ModuleDigestDelta, SymbolFact
+from .prompt_guard import build_prompt_budget, estimate_input_tokens
 from .serena_client import SerenaClient
 from .staging import DirtyState
 
@@ -292,6 +293,7 @@ class DigestAgent(BaseReActAgent):
             }
 
         system_prompt = self._build_system_prompt(task_list)
+        system_prompt = self._guard_system_prompt(task_list, serena_client, system_prompt)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {
@@ -318,8 +320,54 @@ class DigestAgent(BaseReActAgent):
             "warnings": list(task_list.warnings),
         }
 
-    def _build_system_prompt(self, task_list: DigestTaskList) -> str:
-        task_json = json.dumps(task_list.to_summary_dict(), ensure_ascii=False, indent=2)
+    def _build_task_summary_payload(
+        self,
+        task_list: DigestTaskList,
+        *,
+        detail: str,
+    ) -> dict[str, Any]:
+        summary = task_list.to_summary_dict()
+        if detail == "full":
+            return summary
+        if detail == "compact":
+            return {
+                "created_at": summary["created_at"],
+                "warnings": summary["warnings"][:5],
+                "items": [
+                    {
+                        "id": item["id"],
+                        "module_slug": item["module_slug"],
+                        "status": item["status"],
+                        "changed_files_count": item["changed_files_count"],
+                        "related_insights_count": item["related_insights_count"],
+                        "insight_only": item["insight_only"],
+                        "changed_paths_preview": item["changed_paths_preview"][:2],
+                    }
+                    for item in summary["items"]
+                ],
+            }
+        return {
+            "created_at": summary["created_at"],
+            "task_count": len(summary["items"]),
+            "warnings_count": len(summary["warnings"]),
+            "items": [
+                {
+                    "id": item["id"],
+                    "module_slug": item["module_slug"],
+                    "changed_files_count": item["changed_files_count"],
+                    "related_insights_count": item["related_insights_count"],
+                    "insight_only": item["insight_only"],
+                }
+                for item in summary["items"][:12]
+            ],
+        }
+
+    def _build_system_prompt(self, task_list: DigestTaskList, *, detail: str = "full") -> str:
+        task_json = json.dumps(
+            self._build_task_summary_payload(task_list, detail=detail),
+            ensure_ascii=False,
+            indent=2,
+        )
         fixed = "、".join(FIXED_SECTION_HEADINGS)
         extension_prefixes = "、".join(f"`{prefix}...`" for prefix in ALLOWED_EXTENSION_SECTION_PREFIXES)
         return "\n".join(
@@ -363,6 +411,70 @@ class DigestAgent(BaseReActAgent):
                 "",
                 "## 当前任务清单",
                 task_json,
+            ]
+        )
+
+    def _guard_system_prompt(
+        self,
+        task_list: DigestTaskList,
+        serena_client: SerenaClient,
+        initial_prompt: str,
+    ) -> str:
+        budget = build_prompt_budget()
+        digest_deliver = {
+            "type": "function",
+            "function": {
+                "name": "deliver",
+                "description": "提交本轮 digest 总结并结束循环。所有任务 resolved 后才能调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["summary"],
+                },
+            },
+        }
+        tools_schema = serena_client.tools_schema + self._virtual_tools + [digest_deliver]
+        user_content = (
+            "请开始认知整合。先用 read_task_list 了解任务，"
+            "再按需通过 Serena 工具探索代码，读取并更新 annotation，"
+            "标记每个任务状态，最后调用 deliver(summary=...) 结束。"
+        )
+
+        prompt = initial_prompt
+        for detail in ("full", "compact", "minimal"):
+            prompt = self._build_system_prompt(task_list, detail=detail)
+            tokens = estimate_input_tokens(
+                self._model,
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                tools_schema,
+            )
+            if tokens <= budget.hard_input_budget:
+                if detail != "full":
+                    logger.warning("digest system prompt 触发降级: detail=%s tokens=%d", detail, tokens)
+                return prompt
+
+        logger.warning("digest system prompt 触发最终降级: 使用极简任务摘要")
+        minimal_payload = {
+            "task_count": len(task_list.items),
+            "pending_count": len(task_list.pending_items()),
+            "warnings_count": len(task_list.warnings),
+        }
+        return "\n".join(
+            [
+                "你是 PCE 的 DigestAgent，负责把历史 insight 和代码变更内化到模块 annotation 文档。",
+                "",
+                "## 目标",
+                "1. 先用 read_task_list 查看任务摘要，再用 read_digest_delta(task_id) 按需读取完整事实包。",
+                "2. 证据足够时，优先用 write_annotation_and_mark_done 收尾。",
+                "3. 若证据不足，调用 mark_task_skipped 写明原因。",
+                "",
+                "## 当前任务概览",
+                json.dumps(minimal_payload, ensure_ascii=False, indent=2),
             ]
         )
 

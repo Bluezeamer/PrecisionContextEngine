@@ -40,6 +40,7 @@ from .agent_runtime.contracts import (
 from .agent_runtime.spawner import invoke_spawn
 from .base_agent import (
     REACT_DELIVER_EMPTY,
+    REACT_INPUT_TOO_LARGE,
     BaseReActAgent,
     DeliverDecision,
     LLMCompletionError,
@@ -52,6 +53,7 @@ from .base_agent import (
 )
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse
+from .prompt_guard import build_prompt_budget, estimate_input_tokens, fit_text_to_budget
 from .serena_client import SerenaClient, SerenaClientError
 
 # 认知确认回调：接受文件路径列表，执行暂存区标记
@@ -1388,6 +1390,7 @@ def _parse_query_response(content: str, *, project_root: str | Path | None = Non
         "__REACT_TIMEOUT_BUDGET__": "Agent 推理超出总时长预算，请缩小问题范围后重试。",
         "__REACT_NO_TOOL_EXHAUSTED__": "Agent 多次未调用工具，推理异常终止，请重试。",
         "__REACT_DELIVER_EMPTY__": "Agent 提交了空结论，推理可能不完整，请重试。",
+        "__REACT_INPUT_TOO_LARGE__": "Agent 输入上下文超出预算且降级后仍过大，请缩小问题范围后重试。",
         "__REACT_LENGTH_EXHAUSTED__": "Agent 输出被多次截断且续写次数耗尽，请重试或缩小问题范围。",
         "__REACT_TIMEOUT__": "Agent 调用模型超时且重试耗尽，请稍后重试。",
         "__REACT_LLM_EXHAUSTED__": "Agent 的模型降级链已全部失败，请检查模型配置或限流状态后重试。",
@@ -1413,6 +1416,7 @@ def _parse_impact_response(
         "__REACT_TIMEOUT_BUDGET__": "Agent 分析超出总时长预算，请缩小分析范围后重试。",
         "__REACT_NO_TOOL_EXHAUSTED__": "Agent 多次未调用工具，分析异常终止，请重试。",
         "__REACT_DELIVER_EMPTY__": "Agent 提交了空结论，分析可能不完整，请重试。",
+        "__REACT_INPUT_TOO_LARGE__": "Agent 输入上下文超出预算且降级后仍过大，请缩小分析范围后重试。",
         "__REACT_LENGTH_EXHAUSTED__": "Agent 输出被多次截断且续写次数耗尽，请重试或缩小分析范围。",
         "__REACT_TIMEOUT__": "Agent 调用模型超时且重试耗尽，请稍后重试。",
         "__REACT_LLM_EXHAUSTED__": "Agent 的模型降级链已全部失败，请检查模型配置或限流状态后重试。",
@@ -1933,6 +1937,137 @@ class PCEAgent(BaseReActAgent):
             injected,
         )
 
+    def _placeholder_system_prompt(self) -> str:
+        return self._compose_system_prompt(
+            _SYSTEM_PROMPT_PLACEHOLDER,
+            _SYSTEM_PROMPT_PLACEHOLDER,
+            "",
+        )
+
+    def _build_initial_tools_schema(
+        self,
+        serena_client: SerenaClient,
+        acknowledge_cb: AcknowledgeCallback | None,
+    ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        state = LoopState(messages=[], start_time=now, deadline=now + 1.0)
+        state.extra["depth"] = 0
+        state.extra["acknowledge_cb"] = acknowledge_cb
+        return self.build_tools_schema(serena_client, state)
+
+    def _guard_query_prompt(
+        self,
+        *,
+        system_content: str,
+        question: str,
+        tools_schema: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        budget = build_prompt_budget(_CONTEXT_WINDOW)
+        user_content = question.strip()
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+        tokens = estimate_input_tokens(self._model, messages, tools_schema)
+        if tokens <= budget.soft_input_budget:
+            return system_content, user_content
+
+        user_budget = max(600, budget.target_input_budget // 4)
+        user_content = fit_text_to_budget(
+            self._model,
+            user_content,
+            token_budget=user_budget,
+            notice="\n\n[用户输入过长，已保留前后关键部分]\n\n",
+        )
+        messages[1]["content"] = user_content
+        tokens = estimate_input_tokens(self._model, messages, tools_schema)
+        if tokens <= budget.hard_input_budget:
+            logger.warning("query 初始输入触发降级: action=truncate_user tokens=%d", tokens)
+            return system_content, user_content
+
+        system_content = self._placeholder_system_prompt()
+        messages[0]["content"] = system_content
+        remaining_budget = max(400, budget.target_input_budget // 5)
+        user_content = fit_text_to_budget(
+            self._model,
+            user_content,
+            token_budget=remaining_budget,
+            notice="\n\n[上下文预算不足，已进一步压缩用户输入]\n\n",
+        )
+        logger.warning("query 初始输入触发降级: action=placeholder_system")
+        return system_content, user_content
+
+    def _guard_impact_prompt(
+        self,
+        *,
+        system_content: str,
+        target: str,
+        change_type: str,
+        strategy_note: str,
+        evidence_seed_note: str,
+        tools_schema: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        budget = build_prompt_budget(_CONTEXT_WINDOW)
+        task_prompt = _build_impact_task_prompt(target=target, change_type=change_type)
+        execution_note = "\n".join(
+            [
+                "执行要求补充：",
+                "- 在开始总结前，优先完成“首轮证据计划”中的确认动作。",
+                "- 若首轮证据不足，再自行补充工具取证，不要机械拘泥于策略块。",
+            ]
+        )
+
+        def _render(strategy_text: str, evidence_text: str) -> str:
+            blocks = [
+                task_prompt,
+                "以下是本轮任务的前置策略画像，请将其视为取证顺序建议，而不是硬性禁令：",
+                strategy_text.strip(),
+            ]
+            if evidence_text.strip():
+                blocks.extend(
+                    [
+                        "以下是根据首轮检索键预采集的证据种子，请优先消化这些证据后再扩展检索：",
+                        evidence_text.strip(),
+                    ]
+                )
+            blocks.append(execution_note)
+            return "\n\n".join(block for block in blocks if block.strip())
+
+        user_content = _render(strategy_note, evidence_seed_note)
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+        tokens = estimate_input_tokens(self._model, messages, tools_schema)
+        if tokens <= budget.soft_input_budget:
+            return system_content, user_content
+
+        user_content = _render(strategy_note, "")
+        messages[1]["content"] = user_content
+        tokens = estimate_input_tokens(self._model, messages, tools_schema)
+        if tokens <= budget.hard_input_budget:
+            logger.warning("impact 初始输入触发降级: action=drop_evidence_seed tokens=%d", tokens)
+            return system_content, user_content
+
+        minimal_strategy = _normalize_impact_strategy("", target=target)
+        user_content = _render(minimal_strategy, "")
+        messages[1]["content"] = user_content
+        tokens = estimate_input_tokens(self._model, messages, tools_schema)
+        if tokens <= budget.hard_input_budget:
+            logger.warning("impact 初始输入触发降级: action=minimal_strategy tokens=%d", tokens)
+            return system_content, user_content
+
+        system_content = self._placeholder_system_prompt()
+        messages[0]["content"] = system_content
+        user_content = fit_text_to_budget(
+            self._model,
+            user_content,
+            token_budget=max(700, budget.target_input_budget // 3),
+            notice="\n\n[影响分析提示过长，已保留关键任务描述]\n\n",
+        )
+        logger.warning("impact 初始输入触发降级: action=placeholder_system")
+        return system_content, user_content
+
     async def _maybe_compact(self, state: LoopState) -> list[dict[str, Any]] | None:
         """在上下文使用率达到阈值时触发 compact，蒸馏认知后重建对话窗口。
 
@@ -1970,6 +2105,22 @@ class PCEAgent(BaseReActAgent):
                 ),
             }
         ]
+        budget = build_prompt_budget(_CONTEXT_WINDOW)
+        compact_tokens = estimate_input_tokens(self._model, compact_request, [])
+        if compact_tokens > budget.hard_input_budget:
+            if len(system_msgs) > 1:
+                compact_request = [system_msgs[-1], compact_request[-1]]
+            compact_request[-1]["content"] = fit_text_to_budget(
+                self._model,
+                str(compact_request[-1]["content"]),
+                token_budget=max(800, budget.target_input_budget // 3),
+                notice="\n\n[compact 请求已压缩]\n\n",
+            )
+            logger.warning(
+                "compact 请求超出预算，触发预压缩: tokens=%d hard=%d",
+                compact_tokens,
+                budget.hard_input_budget,
+            )
 
         try:
             summary_response, _ = await self._completion(compact_request, [])
@@ -2103,13 +2254,19 @@ class PCEAgent(BaseReActAgent):
             logger.info('[req=%s] QUERY "%s"', req_id, question[:80])
             memory_path = Path(memory_root) if memory_root else None
             system_content = await self._build_system_prompt(memory_path)
+            tools_schema = self._build_initial_tools_schema(serena_client, acknowledge_cb)
+            system_content, user_content = self._guard_query_prompt(
+                system_content=system_content,
+                question=question,
+                tools_schema=tools_schema,
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_content},
-                {"role": "user", "content": question},
+                {"role": "user", "content": user_content},
             ]
             if trace:
                 await trace.write({"role": "system", "content": system_content})
-                await trace.write({"role": "user", "content": question})
+                await trace.write({"role": "user", "content": user_content})
 
             answer, confidence = await self.run_loop(
                 messages,
@@ -2169,23 +2326,19 @@ class PCEAgent(BaseReActAgent):
                 serena_client=serena_client,
                 trace=trace,
             )
+            tools_schema = self._build_initial_tools_schema(serena_client, acknowledge_cb)
+            system_content, prompt = self._guard_impact_prompt(
+                system_content=system_content,
+                target=target,
+                change_type=change_type,
+                strategy_note=strategy_note,
+                evidence_seed_note=evidence_seed_note,
+                tools_schema=tools_schema,
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_content},
+                {"role": "user", "content": prompt},
             ]
-
-            prompt = "\n\n".join(
-                [
-                    _build_impact_task_prompt(target=target, change_type=change_type),
-                    "以下是本轮任务的前置策略画像，请将其视为取证顺序建议，而不是硬性禁令：",
-                    strategy_note,
-                    "以下是根据首轮检索键预采集的证据种子，请优先消化这些证据后再扩展检索：",
-                    evidence_seed_note,
-                    "执行要求补充：",
-                    "- 在开始总结前，优先完成“首轮证据计划”中的确认动作。",
-                    "- 若首轮证据不足，再自行补充工具取证，不要机械拘泥于策略块。",
-                ]
-            )
-            messages.append({"role": "user", "content": prompt})
 
             if trace:
                 await trace.write({"role": "system", "content": system_content})

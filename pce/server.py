@@ -669,7 +669,9 @@ class PCEContext:
                 serena_client=serena_client,
                 acknowledge_cb=self.staging.acknowledge,
             )
-        return response.model_dump(mode="json")
+        payload = response.model_dump(mode="json")
+        payload["answer"] = response.answer
+        return payload
 
     async def handle_impact(
         self,
@@ -691,7 +693,9 @@ class PCEContext:
                 serena_client=serena_client,
                 acknowledge_cb=self.staging.acknowledge,
             )
-        return response.model_dump(mode="json")
+        payload = response.model_dump(mode="json")
+        payload["answer"] = response.answer
+        return payload
 
     async def handle_status(self) -> dict[str, Any]:
         """处理 pce_status 请求（无需初始化，随时可调用）。"""
@@ -762,9 +766,28 @@ class PCEContext:
         digest_warnings: list[str] = []
 
         async with self._sync_lock:
+            dirty = await self.staging.list_pending_reindex()
+            if dirty.empty:
+                snapshot = await load_index(root_path=self.project_path)
+                if snapshot is not None:
+                    logger.info("pce_sync: 暂存区无变更，跳过重建")
+                    return {
+                        "success": True,
+                        "message": "暂存区无变更，索引已是最新",
+                        "stats": snapshot.build_stats.model_dump(mode="json"),
+                        "warnings": [],
+                    }
+
             async with self.serena_session() as serena_client:
-                dirty = await self.staging.list_pending_reindex()
-                if not dirty.empty:
+                if dirty.empty:
+                    logger.info("pce_sync: 暂存区无变更，执行全量重建")
+                    snapshot = await build_index(
+                        project_path=self.project_path,
+                        serena_client=serena_client,
+                        memory_root=self.project_path,
+                    )
+                    message = "Serena 已重连，PCE 索引全量重建完成"
+                else:
                     all_paths = dirty.changed + dirty.deleted
                     # 索引前快照 hash，防止索引期间新变更被提前确认
                     hash_snapshot = await self.staging.snapshot_hashes(all_paths)
@@ -784,14 +807,6 @@ class PCEContext:
                         expected_hashes=hash_snapshot,
                     )
                     message = "Serena 已重连，PCE 索引增量更新完成"
-                else:
-                    logger.info("pce_sync: 暂存区无变更，执行全量重建")
-                    snapshot = await build_index(
-                        project_path=self.project_path,
-                        serena_client=serena_client,
-                        memory_root=self.project_path,
-                    )
-                    message = "Serena 已重连，PCE 索引全量重建完成"
 
                 # 认知整合：在 Serena 连接仍活跃时执行，复用当前连接
                 try:

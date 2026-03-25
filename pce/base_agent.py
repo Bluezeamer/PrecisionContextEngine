@@ -28,6 +28,7 @@ import litellm
 import litellm.exceptions as litellm_exc
 
 from ._env import build_litellm_model, get_completion_overrides, get_env_text
+from .prompt_guard import build_prompt_budget, estimate_input_tokens
 from .serena_client import SerenaClient, SerenaClientError
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ REACT_LENGTH_EXHAUSTED = "__REACT_LENGTH_EXHAUSTED__"
 REACT_TIMEOUT = "__REACT_TIMEOUT__"
 REACT_LLM_EXHAUSTED = "__REACT_LLM_EXHAUSTED__"
 REACT_DELIVER_EMPTY = "__REACT_DELIVER_EMPTY__"
+REACT_INPUT_TOO_LARGE = "__REACT_INPUT_TOO_LARGE__"
 
 # deliver 虚拟工具 schema（子类可覆盖 _deliver_tool 属性定制参数）
 DELIVER_TOOL: dict[str, Any] = {
@@ -97,6 +99,10 @@ class LLMCompletionError(RuntimeError):
         super().__init__(
             f"LLM fallback chain exhausted; models={self.models}; " + " | ".join(parts)
         )
+
+
+class PromptBudgetExceeded(RuntimeError):
+    """输入上下文在降级后仍超限。"""
 
 
 # ============================================================================
@@ -393,6 +399,14 @@ class BaseReActAgent(ABC):
     async def on_budget_warning(self, state: LoopState) -> None:
         """预算告警钩子。子类可覆盖以注入告警消息到 state.messages。"""
 
+    async def on_before_completion(
+        self,
+        state: LoopState,
+        tools_schema: list[dict[str, Any]],
+    ) -> None:
+        """在真正调用模型前执行输入预算检查。"""
+        self._enforce_input_budget(state, tools_schema)
+
     def build_no_tool_correction(self, state: LoopState, finish_reason: str) -> dict[str, Any]:
         """无 tool_calls 时的纠正消息。子类可覆盖以定制纠正措辞。"""
         return {
@@ -480,6 +494,12 @@ class BaseReActAgent(ABC):
 
             # ── 构建工具列表 ──
             tools_schema = self.build_tools_schema(serena_client, state)
+
+            try:
+                await self.on_before_completion(state, tools_schema)
+            except PromptBudgetExceeded as exc:
+                logger.warning("输入上下文超限，终止 ReAct 循环: %s", exc)
+                return REACT_INPUT_TOO_LARGE, None
 
             # ── LLM 调用（含单步超时重试） ──
             timeout_retries = 0
@@ -656,6 +676,59 @@ class BaseReActAgent(ABC):
         """
         state.messages.clear()
         state.messages.extend(new_messages)
+
+    def _enforce_input_budget(
+        self,
+        state: LoopState,
+        tools_schema: list[dict[str, Any]],
+    ) -> None:
+        """统一输入预算检查与默认降级。"""
+        budget = build_prompt_budget()
+        tokens = estimate_input_tokens(self._model, state.messages, tools_schema)
+        if tokens <= budget.soft_input_budget:
+            return
+
+        logger.warning(
+            "输入上下文接近预算上限: tokens=%d soft=%d hard=%d",
+            tokens,
+            budget.soft_input_budget,
+            budget.hard_input_budget,
+        )
+        self._prune_history_for_budget(state, tools_schema, budget)
+        final_tokens = estimate_input_tokens(self._model, state.messages, tools_schema)
+        if final_tokens > budget.hard_input_budget:
+            raise PromptBudgetExceeded(
+                f"tokens={final_tokens}, hard_budget={budget.hard_input_budget}"
+            )
+
+    def _prune_history_for_budget(
+        self,
+        state: LoopState,
+        tools_schema: list[dict[str, Any]],
+        budget: Any,
+    ) -> None:
+        """默认降级策略：裁剪较早的非 system 历史，保留尾部上下文。"""
+        messages = list(state.messages)
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        non_system = [m for m in messages if m.get("role") != "system"]
+        if len(non_system) <= 6:
+            return
+
+        note = {
+            "role": "user",
+            "content": (
+                "[系统提示] 为适应上下文预算，较早轮次的对话与工具结果已被折叠。"
+                "如缺失证据，请重新调用工具确认。"
+            ),
+        }
+        keep = max(4, min(12, len(non_system)))
+        while keep >= 4:
+            candidate = [*system_msgs, note, *non_system[-keep:]]
+            tokens = estimate_input_tokens(self._model, candidate, tools_schema)
+            if tokens <= budget.target_input_budget:
+                self._replace_messages(state, candidate)
+                return
+            keep -= 2
 
     @staticmethod
     def _extract_next_prompt_size(response: Any) -> int:
