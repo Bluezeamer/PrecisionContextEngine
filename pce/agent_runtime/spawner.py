@@ -2,7 +2,7 @@
 
 职责：
 - 验证 spawn 调用的合法性（深度、预算、参数）
-- 构建子 Agent 消息历史并调用 _run_react_loop
+- 构建子 Agent 消息历史并调用 run_loop
 - 将结果封装为 SpawnResult（失败不向外抛异常）
 
 设计说明：
@@ -30,7 +30,7 @@ from .contracts import (
 
 logger = logging.getLogger(__name__)
 
-# 回调签名：与 PCEAgent._run_react_loop 的关键字参数对齐
+# 回调签名：与 PCEAgent.run_loop 的关键字参数对齐
 RunLoopFn = Callable[..., Awaitable[tuple[str, str | None]]]
 
 # 子 Agent system prompt（简洁版，无项目结构注入）
@@ -81,7 +81,7 @@ async def invoke_spawn(
         serena_client:  工具层（ToolProvider Protocol），与父 Agent 共享。
         parent_depth:   父 Agent 的 spawn 深度（0 = 主 Agent，>=1 = 子 Agent）。
         parent_deadline: 父 Agent 的绝对截止时间（monotonic）。
-        run_loop_fn:    注入的 ReAct 循环函数（PCEAgent._run_react_loop 的绑定方法）。
+        run_loop_fn:    注入的 ReAct 循环函数（PCEAgent.run_loop 的绑定方法）。
 
     Returns:
         SpawnResult，失败时 ok=False，不抛出异常。

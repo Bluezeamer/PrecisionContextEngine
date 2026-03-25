@@ -24,7 +24,7 @@ class ToolProvider(Protocol):
     - project_path: 当前项目路径
 
     异常约定：call() 在工具调用失败时应抛出 SerenaClientError 或其子类，
-    以兼容 agent.py 中 _invoke_tool 的 except SerenaClientError 捕获。
+    以兼容 _invoke_serena 的 except SerenaClientError 捕获。
     """
 
     @property

@@ -50,7 +50,7 @@ from pce.models import QueryResponse  # noqa: E402
 
 logger = logging.getLogger("playground")
 
-# ── 兜底标记列表（与 agent.py 中 _run_react_loop 的终止路径对应）──────────
+# ── 兜底标记列表（与 BaseReActAgent.run_loop 的终止路径对应）──────────
 _FALLBACK_MARKERS = {
     "__REACT_TIMEOUT_BUDGET__": "超时预算耗尽",
     "__REACT_NO_TOOL_EXHAUSTED__": "无工具纠正次数耗尽",

@@ -1,7 +1,7 @@
 """
-测试 PCEAgent._run_react_loop 的健壮性。
+测试 PCEAgent ReAct 循环（BaseReActAgent.run_loop）的健壮性。
 
-策略：mock _completion 控制 LLM 返回序列，mock _invoke_tool 控制工具结果，
+策略：mock _completion 控制 LLM 返回序列，mock _invoke_serena 控制工具结果，
 不依赖真实 Serena 或 LLM，纯粹验证循环的状态机逻辑。
 
 覆盖的边界路径：
@@ -187,16 +187,16 @@ async def run_loop(
     deadline: float | None = None,
     observe: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> str:
-    """用 response_seq 依次替换 _completion 的返回值，运行 _run_react_loop。
+    """用 response_seq 依次替换 _completion 的返回值，运行 run_loop。
 
     注意：不能用 next(iter(...))，StopIteration 在 async 函数中会变成 RuntimeError。
     改用 list.pop(0)，序列耗尽时抛出 IndexError（会被测试框架捕获报告）。
 
-    _run_react_loop 现在返回 tuple[str, str | None]，此处只取 answer 部分，
+    run_loop 返回 tuple[str, str | None]，此处只取 answer 部分，
     使测试用例无需感知 confidence 字段。
 
     额外参数（spawn 测试专用）：
-        depth:    传给 _run_react_loop 的 depth 参数（0=主 Agent，1=子 Agent）
+        depth:    传给 run_loop 的 depth 参数（0=主 Agent，1=子 Agent）
         deadline: 绝对截止时间；None 时由 agent.max_seconds 决定
         observe:  每次 _completion 被调用前，将当前 messages 传入此回调，
                   供测试用例检查已回注的 spawn 结果
@@ -210,7 +210,7 @@ async def run_loop(
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=fake_completion):
-        answer, _ = await agent._run_react_loop(
+        answer, _ = await agent.run_loop(
             messages,
             serena,
             depth=depth,
@@ -344,7 +344,7 @@ async def t08_invalid_tool_args_then_recover():
         make_response(tool_calls=[make_deliver_tc("答案E")]),
     ])
     assert_eq("T08 args 解析失败后恢复", result, "答案E")
-    # Serena.call 不应被调用（args 解析失败由 _invoke_tool 拦截）
+    # Serena.call 不应被调用（args 解析失败由 _invoke_serena 拦截）
     ok = serena.call.call_count == 0
     _results.append(("T08 Serena 未被调用", ok, f"实际 call_count={serena.call.call_count}"))
 
@@ -400,7 +400,7 @@ async def t12_timeout_retry_success():
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=fake_completion_with_timeout):
-        result, _ = await agent._run_react_loop(messages, serena)
+        result, _ = await agent.run_loop(messages, serena)
 
     assert_eq("T12 超时重试成功", result, "答案H")
     ok = call_count == 2
@@ -417,7 +417,7 @@ async def t13_timeout_exhausted():
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=always_timeout):
-        result, _ = await agent._run_react_loop(messages, serena)
+        result, _ = await agent.run_loop(messages, serena)
 
     assert_eq("T13 超时耗尽", result, "__REACT_TIMEOUT__")
 
@@ -442,7 +442,7 @@ async def t14_max_steps_exceeded():
 
     messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "test"}]
     with patch.object(agent, "_completion", side_effect=completion_that_delays):
-        result, _ = await agent._run_react_loop(messages, serena)
+        result, _ = await agent.run_loop(messages, serena)
 
     assert_eq("T14 时间预算耗尽", result, "__REACT_TIMEOUT_BUDGET__")
 

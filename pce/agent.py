@@ -27,14 +27,8 @@ from typing import Any
 
 import aiofiles
 import litellm
-import litellm.exceptions as litellm_exc
 
-from ._env import (
-    build_litellm_model,
-    get_completion_overrides,
-    get_env_text,
-    get_system_prompt_soft_limit,
-)
+from ._env import get_system_prompt_soft_limit
 from .agent_runtime.contracts import (
     MAX_SPAWNS_PER_LOOP,
     SPAWN_AGENT_TOOL,
@@ -45,22 +39,16 @@ from .agent_runtime.contracts import (
 )
 from .agent_runtime.spawner import invoke_spawn
 from .base_agent import (
-    DELIVER_TOOL as _BASE_DELIVER_TOOL,
+    REACT_DELIVER_EMPTY,
     BaseReActAgent,
     DeliverDecision,
     LLMCompletionError,
     LoopState,
-    _extract_finish_reason,
     _extract_message,
     _extract_tool_call_args,
-    _extract_tool_calls,
     _get_tool_call_id,
     _get_tool_name,
-    _parse_model_fallbacks,
-    _parse_tool_call_args,
     _safe_json_dumps,
-    _should_fallback_model,
-    _stringify_error,
 )
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse
@@ -83,16 +71,6 @@ _CONTEXT_WINDOW = int(os.getenv("PCE_CONTEXT_WINDOW", "256000"))
 #   PCE_PROVIDER=anthropic   PCE_MODEL=claude-3-haiku-20240307
 
 
-# ---------------------------------------------------------------------------
-# 模型降级路由（fallback chain）
-# ---------------------------------------------------------------------------
-
-
-# 以下公共函数已迁移到 base_agent.py，此处保留 re-export 兼容
-# LLMCompletionError, _extract_finish_reason, _extract_message,
-# _extract_tool_calls, _parse_tool_call_args, _safe_json_dumps,
-# _should_fallback_model, _stringify_error, _parse_model_fallbacks
-# 均通过上方 from .base_agent import 导入
 
 
 SYSTEM_PROMPT_HEADER = """\
@@ -1455,11 +1433,14 @@ def _parse_impact_response(
 # ============================================================================
 
 
-class PCEAgent:
+class PCEAgent(BaseReActAgent):
     """PCE ReAct Agent。
 
     驱动 Serena 工具调用，返回推理结论。每次调用均从 Memory 快照重新起步（无状态）。
     """
+
+    # PCEAgent 启用预算告警
+    _enable_budget_warning: bool = True
 
     def __init__(
         self,
@@ -1469,33 +1450,216 @@ class PCEAgent:
         max_seconds: float = MAX_SECONDS,
         insight_cache: InsightCache | None = None,
     ) -> None:
-        explicit_model = model.strip() if model else None
-        explicit_provider = provider.strip() if provider else None
-
-        if explicit_model is None:
-            self._provider = get_env_text("PCE_PROVIDER")
-            self._model = get_env_text("PCE_MODEL")
-            if not self._provider or not self._model:
-                raise ValueError(
-                    "未配置 PCE_PROVIDER / PCE_MODEL，请通过 MCP config env、系统环境变量"
-                    "或项目 .env 设置，例如 PCE_PROVIDER=openrouter, "
-                    "PCE_MODEL=openai/gpt-4o-mini。"
-                )
-        else:
-            # 显式传参保留灵活性：用于测试或调试脚本时，可直接传完整 LiteLLM model。
-            self._provider = explicit_provider
-            self._model = explicit_model
-
-        # 降级链：去掉与主模型相同的候选项
-        raw_fallbacks = (
-            model_fallbacks
-            if model_fallbacks is not None
-            else _parse_model_fallbacks(os.getenv("PCE_MODEL_FALLBACKS", ""))
+        super().__init__(
+            model=model,
+            provider=provider,
+            model_fallbacks=model_fallbacks,
+            max_seconds=max_seconds,
         )
-        self._model_fallbacks = [m for m in raw_fallbacks if m and m != self._model]
-        self._max_seconds = max_seconds
         self._deliver_tool = DELIVER_TOOL
         self._insight_cache = insight_cache
+
+    # =========================================================================
+    # BaseReActAgent 抽象方法实现
+    # =========================================================================
+
+    def build_tools_schema(
+        self,
+        serena_client: SerenaClient,
+        state: LoopState,
+    ) -> list[dict[str, Any]]:
+        tools = [*serena_client.tools_schema, self._deliver_tool]
+        if state.extra.get("depth", 0) == 0:
+            tools.append(SPAWN_AGENT_TOOL)
+        if state.extra.get("acknowledge_cb") is not None:
+            tools.append(ACKNOWLEDGE_TOOL)
+        return tools
+
+    @property
+    def virtual_tool_names(self) -> set[str]:
+        return {"spawn_agent", "acknowledge_changes"}
+
+    async def handle_virtual_tool(
+        self,
+        tool_call: Any,
+        state: LoopState,
+    ) -> dict[str, Any] | None:
+        name = _get_tool_name(tool_call)
+        tc_id = _get_tool_call_id(tool_call)
+        args = _extract_tool_call_args(tool_call)
+        req_id = _req_id_var.get()
+
+        # ── acknowledge_changes ──
+        if name == "acknowledge_changes":
+            paths = (args or {}).get("paths", []) or []
+            acknowledge_cb = state.extra.get("acknowledge_cb")
+            if acknowledge_cb and paths:
+                try:
+                    await acknowledge_cb(paths)
+                    content = f"已确认 {len(paths)} 个文件的认知状态"
+                except Exception as exc:
+                    content = f"认知确认失败: {exc}"
+            else:
+                content = "无需确认（无变更文件或回调未配置）"
+            logger.info(
+                "[req=%s] round=%d -> acknowledge_changes paths=%d",
+                req_id, state.round_num, len(paths),
+            )
+            return {"tool_call_id": tc_id, "name": "acknowledge_changes", "content": content}
+
+        # ── spawn_agent ──
+        if name != "spawn_agent":
+            return None
+
+        serena_client: SerenaClient = state.extra["serena_client"]
+        depth = int(state.extra.get("depth", 0))
+        spawn_count = int(state.extra.get("spawn_count", 0))
+
+        if args is None:
+            spawn_result = SpawnResult(
+                ok=False, task_id=str(uuid.uuid4()),
+                status=SpawnStatus.FAILED, answer="", confidence="low",
+                elapsed_seconds=0.0,
+                error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
+                error_message="spawn_agent 参数解析失败：无效 JSON",
+            )
+        elif spawn_count >= MAX_SPAWNS_PER_LOOP:
+            spawn_result = SpawnResult(
+                ok=False, task_id=str(uuid.uuid4()),
+                status=SpawnStatus.FAILED, answer="", confidence="low",
+                elapsed_seconds=0.0,
+                error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
+                error_message=(
+                    f"本次循环 spawn 次数已达上限（max={MAX_SPAWNS_PER_LOOP}），"
+                    "请直接调用 Serena 工具或整合已有信息后 deliver。"
+                ),
+            )
+        else:
+            try:
+                request = SpawnRequest(
+                    task=str(args.get("task", "")).strip(),
+                    allocated_seconds=float(args.get("allocated_seconds", 0.0)),
+                    expected_output=str(args.get("expected_output", "") or ""),
+                    context=args["context"] if isinstance(args.get("context"), dict) else {},
+                    strict=bool(args.get("strict", False)),
+                )
+                if not request.task:
+                    raise ValueError("task 不能为空")
+            except Exception as exc:
+                spawn_result = SpawnResult(
+                    ok=False, task_id=str(uuid.uuid4()),
+                    status=SpawnStatus.FAILED, answer="", confidence="low",
+                    elapsed_seconds=0.0,
+                    error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
+                    error_message=f"spawn_agent 参数无效: {exc}",
+                )
+            else:
+                spawn_result = await invoke_spawn(
+                    request=request,
+                    serena_client=serena_client,
+                    parent_depth=depth,
+                    parent_deadline=state.deadline,
+                    run_loop_fn=self.run_loop,
+                )
+                state.extra["spawn_count"] = spawn_count + 1
+                if spawn_result.ok:
+                    await self._persist_insights(
+                        question=request.task,
+                        answer=spawn_result.answer,
+                        confidence=spawn_result.confidence,
+                    )
+
+        logger.info(
+            "[req=%s] round=%d -> spawn_agent ok=%s %.1fs",
+            req_id, state.round_num, spawn_result.ok, spawn_result.elapsed_seconds,
+        )
+        return {
+            "tool_call_id": tc_id,
+            "name": "spawn_agent",
+            "content": _safe_json_dumps(spawn_result.to_tool_content()),
+        }
+
+    async def on_deliver(
+        self,
+        args: dict[str, Any] | None,
+        state: LoopState,
+    ) -> DeliverDecision:
+        if args is None:
+            logger.warning("deliver 调用参数解析失败")
+            return DeliverDecision.finish(REACT_DELIVER_EMPTY)
+        answer = args.get("answer")
+        if not answer:
+            logger.warning("deliver 调用缺少 answer 参数")
+            return DeliverDecision.finish(REACT_DELIVER_EMPTY)
+
+        confidence = args.get("confidence")
+        req_id = _req_id_var.get()
+        logger.info(
+            "[req=%s] DELIVER confidence=%s elapsed=%.1fs rounds=%d",
+            req_id, confidence, state.elapsed, state.round_num,
+        )
+        trace = state.extra.get("trace")
+        if trace:
+            await trace.write({
+                "event": "deliver",
+                "confidence": confidence,
+                "elapsed_seconds": state.elapsed,
+                "rounds": state.round_num,
+                "answer": str(answer),
+            })
+        return DeliverDecision.finish(str(answer), str(confidence) if confidence else None)
+
+    # =========================================================================
+    # BaseReActAgent 钩子覆盖
+    # =========================================================================
+
+    async def on_before_round(self, state: LoopState) -> None:
+        """每轮 LLM 调用前执行 compact 检查。"""
+        new_messages = await self._maybe_compact(state)
+        if new_messages is not None:
+            self._replace_messages(state, new_messages)
+            trace = state.extra.get("trace")
+            if trace:
+                for msg in new_messages:
+                    await trace.write({"event": "compact_rebuild", **msg})
+
+    async def _invoke_serena(
+        self,
+        tool_call: Any,
+        serena_client: SerenaClient,
+        state: LoopState | None = None,
+    ) -> dict[str, Any]:
+        """增强版 Serena 调用：添加计时与 preview 日志。"""
+        tc_id = _get_tool_call_id(tool_call)
+        tool_name = _get_tool_name(tool_call) or "unknown"
+        args = _extract_tool_call_args(tool_call)
+        preview = _key_arg_preview(tool_name, args)
+        req_id = _req_id_var.get()
+        round_num = state.round_num if state is not None else 0
+
+        if args is None:
+            logger.warning("工具参数解析失败: %s", tool_name)
+            content = f"工具参数解析失败: 无效的 JSON。请重新调用 {tool_name} 并确保参数格式正确。"
+            logger.info(
+                "[req=%s] round=%d -> %s 0.00s %dchars",
+                req_id, round_num, _key_arg_preview(tool_name, None), len(content),
+            )
+            return {"tool_call_id": tc_id, "name": tool_name, "content": content}
+
+        t0 = time.monotonic()
+        try:
+            result = await serena_client.call(tool_name, args)
+            content = _safe_json_dumps(result)
+        except SerenaClientError as exc:
+            logger.warning("工具调用失败: %s: %s", tool_name, exc)
+            content = f"工具调用失败: {exc}"
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "[req=%s] round=%d -> %s %.2fs %dchars",
+            req_id, round_num, preview, elapsed, len(content),
+        )
+        return {"tool_call_id": tc_id, "name": tool_name, "content": content}
 
     # =========================================================================
     # Insight 蒸馏辅助
@@ -1769,160 +1933,31 @@ class PCEAgent:
             injected,
         )
 
-    async def _completion(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-    ) -> tuple[Any, str]:
-        """调用 litellm.completion，返回 (response, finish_reason)。
-
-        支持模型降级路由：当主模型遇到不可恢复的模型级错误（限流、鉴权、模型不存在等）时，
-        依次尝试 fallback 模型。litellm 本身已有重试机制，此处不对同一模型重复重试。
-
-        finish_reason 取值: "stop" | "tool_calls" | "length" | 其他
-        缺失时默认 "stop"。
-
-        Raises:
-            TimeoutError: 单步超时（由上层 _run_react_loop 处理）
-            LLMCompletionError: 所有候选模型均失败（fallback chain 非空时）
-            其他 litellm 异常: fallback chain 为空时原样透传
-        """
-        # litellm.Timeout 不是内置 TimeoutError 的子类，统一转换
-        _timeout_types = (TimeoutError, litellm_exc.Timeout)
-        completion_overrides = get_completion_overrides()
-
-        model_chain: list[str] = []
-        for model in [self._model, *self._model_fallbacks]:
-            model_chain.append(build_litellm_model(self._provider, model))
-
-        # fallback 为空时保持原行为：直接调用，异常原样透传
-        if len(model_chain) == 1:
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        litellm.completion,
-                        model=model_chain[0],
-                        messages=messages,
-                        tools=tools if tools else None,
-                        **completion_overrides,
-                        temperature=0.2,
-                    ),
-                    timeout=60.0,
-                )
-            except litellm_exc.Timeout as exc:
-                raise TimeoutError("litellm.Timeout -> TimeoutError") from exc
-            return response, _extract_finish_reason(response)
-
-        # 有 fallback 时：逐个尝试，记录每次失败
-        attempts: list[dict[str, str]] = []
-        for idx, model in enumerate(model_chain):
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        litellm.completion,
-                        model=model,
-                        messages=messages,
-                        tools=tools if tools else None,
-                        **completion_overrides,
-                        temperature=0.2,
-                    ),
-                    timeout=60.0,
-                )
-                if idx > 0:
-                    logger.info("模型降级成功: %s (第 %d 候选)", model, idx + 1)
-                return response, _extract_finish_reason(response)
-            except _timeout_types as exc:
-                # 超时由上层统一处理，不纳入降级逻辑
-                raise TimeoutError("timeout in _completion") from exc
-            except Exception as exc:
-                if not _should_fallback_model(exc):
-                    # 非模型级错误（如网络中断、JSON 解析失败等），直接透传
-                    raise
-
-                attempts.append(
-                    {
-                        "model": model,
-                        "error_type": type(exc).__name__,
-                        "reason": _stringify_error(exc),
-                    }
-                )
-
-                if idx < len(model_chain) - 1:
-                    next_model = model_chain[idx + 1]
-                    logger.warning(
-                        "模型调用失败，触发降级: %s -> %s (%s)",
-                        model,
-                        next_model,
-                        attempts[-1]["error_type"],
-                    )
-                    continue
-
-                # 所有模型均已尝试
-                logger.warning("模型降级链耗尽: %s", [a["model"] for a in attempts])
-                raise LLMCompletionError(attempts) from exc
-
-        # 理论上不可达，但类型检查需要
-        raise LLMCompletionError(attempts)
-
-    @staticmethod
-    def _extract_next_prompt_size(response: Any) -> int:
-        """估算下一轮调用的 prompt 大小，失败时返回 0。
-
-        下一轮 prompt = 本轮 prompt + 本轮 completion（本轮输出会追加到历史）
-        因此用 total_tokens（= prompt + completion）作为下一轮窗口占用的预测值，
-        无需累加历史（累加会因每轮 prompt 已包含完整历史而产生 O(n^2) 重复计数）。
-        """
-        usage = getattr(response, "usage", None)
-        if usage is None and isinstance(response, dict):
-            usage = response.get("usage")
-        if usage is None:
-            return 0
-
-        def _get(attr: str) -> int:
-            v = getattr(usage, attr, None) if not isinstance(usage, dict) else usage.get(attr)
-            return int(v) if v else 0
-
-        total = _get("total_tokens")
-        if total:
-            return total
-        # 部分 provider 不返回 total_tokens，退而求其次手动相加
-        return _get("prompt_tokens") + _get("completion_tokens")
-
-    async def _maybe_compact(
-        self,
-        messages: list[dict[str, Any]],
-        token_used: int,
-        compact_failed: bool = False,
-    ) -> tuple[list[dict[str, Any]], int, bool]:
+    async def _maybe_compact(self, state: LoopState) -> list[dict[str, Any]] | None:
         """在上下文使用率达到阈值时触发 compact，蒸馏认知后重建对话窗口。
 
-        Args:
-            messages: 当前对话消息列表
-            token_used: 上一轮的 total_tokens（= prompt + completion，即下一轮窗口占用预测值）
-            compact_failed: 本轮是否已经尝试过 compact 但失败，避免重复尝试
-
-        Returns:
-            (新 messages 列表, 更新后的 token_used, compact_failed 标记)
-            若未触发 compact，原样返回传入值。
+        通过 state.token_used 和 state.extra["compact_failed"] 管理状态。
+        成功时返回重建后的消息列表并更新 state；未触发或失败时返回 None。
         """
+        token_used = state.token_used
+        compact_failed = bool(state.extra.get("compact_failed", False))
+
         if (
             _CONTEXT_WINDOW <= 0
             or compact_failed
             or token_used / _CONTEXT_WINDOW < _COMPACT_THRESHOLD
         ):
-            return messages, token_used, compact_failed
+            return None
 
         logger.info(
             f"上下文使用率 {token_used}/{_CONTEXT_WINDOW} "
             f"({token_used / _CONTEXT_WINDOW:.1%}) 达到阈值，触发 compact"
         )
 
-        # 提取原始用户问题（第一条 user 消息），让摘要不丢失任务目标
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        first_user = next((m for m in messages if m.get("role") == "user"), None)
+        system_msgs = [m for m in state.messages if m.get("role") == "system"]
+        first_user = next((m for m in state.messages if m.get("role") == "user"), None)
         task_hint = f"\n\n当前任务：{first_user['content']}" if first_user else ""
 
-        # 仅传 system + 摘要请求，避免在 token 接近满时再塞满历史
         compact_request: list[dict[str, Any]] = system_msgs + [
             {
                 "role": "user",
@@ -1937,23 +1972,22 @@ class PCEAgent:
         ]
 
         try:
-            # 不传工具列表，让模型自由输出摘要文本
             summary_response, _ = await self._completion(compact_request, [])
             summary_msg = _extract_message(summary_response)
             summary_text = str(summary_msg.get("content") or "").strip()
             compact_tokens = self._extract_next_prompt_size(summary_response)
         except LLMCompletionError:
-            # 模型降级链耗尽，不应被 compact 吞掉，让上层处理
             raise
-        except Exception as e:
-            logger.warning(f"compact 摘要生成失败，跳过压缩（本轮不再重试）: {e}")
-            return messages, token_used, True  # 标记失败，本轮不再重试
+        except Exception as exc:
+            logger.warning(f"compact 摘要生成失败，跳过压缩（本轮不再重试）: {exc}")
+            state.extra["compact_failed"] = True
+            return None
 
         if not summary_text:
             logger.warning("compact 摘要为空，跳过压缩（本轮不再重试）")
-            return messages, token_used, True
+            state.extra["compact_failed"] = True
+            return None
 
-        # 重建消息列表：system prompt + 摘要注入（作为新窗口的起点）
         new_messages: list[dict[str, Any]] = system_msgs + [
             {
                 "role": "user",
@@ -1966,445 +2000,9 @@ class PCEAgent:
         ]
 
         logger.info(f"compact 完成，新窗口消息数: {len(new_messages)}")
-        # compact 调用本身消耗了 compact_tokens，以此作为新窗口的基线；重置失败标记
-        return new_messages, compact_tokens, False
-
-    async def _run_react_loop(
-        self,
-        messages: list[dict[str, Any]],
-        serena_client: SerenaClient,
-        acknowledge_cb: AcknowledgeCallback | None = None,
-        depth: int = 0,
-        deadline: float | None = None,
-        trace: _TraceWriter | None = None,
-    ) -> tuple[str, str | None]:
-        """执行 ReAct 循环直到 agent 调用 deliver 或超出时长预算。
-
-        Returns:
-            (answer, confidence)，正常终止时 confidence 为 deliver 提供的置信度字符串，
-            异常终止时 confidence 为 None。
-
-        终止路径:
-          正常: agent 调用 deliver(answer=...)
-          兜底: __REACT_TIMEOUT_BUDGET__      — 总时长预算耗尽
-                __REACT_NO_TOOL_EXHAUSTED__   — 无 tool_calls 纠正次数耗尽
-                __REACT_LENGTH_EXHAUSTED__    — length 截断续写次数耗尽
-                __REACT_TIMEOUT__             — 单步超时重试次数耗尽
-                __REACT_LLM_EXHAUSTED__       — 模型降级链耗尽
-                __REACT_DELIVER_EMPTY__       — deliver 参数为空或解析失败
-
-        计数器独立，互不干扰:
-          no_tool_retries      — LLM 无 tool_calls（无论 finish_reason）
-          length_continuations — finish_reason=length 触发续写
-          timeout_retries      — 每步内独立，TimeoutError
-        """
-        # 构建工具列表：Serena 只读工具 + 虚拟终止工具 + 可选工具
-        tools_schema = serena_client.tools_schema + [self._deliver_tool]
-        if depth == 0:
-            # 子 Agent（depth>=1）不能递归 spawn，仅主 Agent 注入该工具
-            tools_schema = tools_schema + [SPAWN_AGENT_TOOL]
-        if acknowledge_cb is not None:
-            tools_schema = tools_schema + [ACKNOWLEDGE_TOOL]
-
-        req_id = _req_id_var.get()
-        round_num = 0
-        no_tool_retries = 0
-        length_continuations = 0
-        spawn_count = 0  # 本循环内 spawn 次数，不超过 MAX_SPAWNS_PER_LOOP
-        token_used = 0
-        compact_failed = False
-        start = time.monotonic()
-        # 使用绝对 deadline，支持父子 Agent 共享同一时间轴
-        if deadline is None:
-            deadline = start + self._max_seconds
-
-        while True:
-            # ── 时间预算检查 ──────────────────────────────────────────────────
-            if time.monotonic() >= deadline:
-                logger.warning(f"ReAct 循环超出截止时间（depth={depth}），强制终止")
-                return "__REACT_TIMEOUT_BUDGET__", None
-
-            round_num += 1
-
-            # ── 上下文 compact 检查 ───────────────────────────────────────────
-            try:
-                old_len = len(messages)
-                messages, token_used, compact_failed = await self._maybe_compact(
-                    messages, token_used, compact_failed
-                )
-                # compact 重建了消息列表时，将新消息写入 trace
-                if trace and len(messages) != old_len:
-                    for m in messages:
-                        await trace.write({"event": "compact_rebuild", **m})
-            except LLMCompletionError as e:
-                logger.warning("compact 阶段模型降级链耗尽，终止 ReAct 循环: %s", e)
-                return "__REACT_LLM_EXHAUSTED__", None
-
-            # ── LLM 调用，内嵌超时重试（每步独立计数）────────────────────────
-            timeout_retries = 0
-            while True:
-                try:
-                    response, finish_reason = await self._completion(messages, tools_schema)
-                    break
-                except LLMCompletionError as e:
-                    logger.warning("模型降级链耗尽，终止 ReAct 循环: %s", e)
-                    return "__REACT_LLM_EXHAUSTED__", None
-                except TimeoutError:
-                    timeout_retries += 1
-                    if timeout_retries <= _MAX_TIMEOUT_RETRIES:
-                        logger.warning(f"模型调用超时(第 {timeout_retries} 次),正在重试当前步骤")
-                        continue
-                    logger.warning("模型调用超时，重试次数耗尽，强制终止")
-                    return "__REACT_TIMEOUT__", None
-
-            token_used = self._extract_next_prompt_size(response)
-
-            message = _extract_message(response)
-            if "role" not in message:
-                message["role"] = "assistant"
-
-            tool_calls = _extract_tool_calls(message)
-
-            # ── finish_reason=length：输出被截断 ─────────────────────────────
-            # 256K 上下文下概率极低，但仍需兜底处理
-            if finish_reason == "length":
-                length_continuations += 1
-                if length_continuations > _MAX_LENGTH_CONT:
-                    logger.warning("输出截断续写次数耗尽，强制终止")
-                    return "__REACT_LENGTH_EXHAUSTED__", None
-                if message.get("content"):
-                    # 推理文字被截断：保留已有内容，追加"请继续"
-                    messages.append(message)
-                    if trace:
-                        await trace.write(message)
-                    continue_msg = {"role": "user", "content": "请继续"}
-                    messages.append(continue_msg)
-                    if trace:
-                        await trace.write(continue_msg)
-                    logger.warning(f"输出被截断(content,第 {length_continuations} 次),追加续写指令")
-                else:
-                    # tool_call JSON 被截断：追加空占位 assistant 保持对话结构连续，
-                    # 再追加 user 纠正，避免产生"孤立 user 消息"的非法序列
-                    empty_assistant = {"role": "assistant", "content": ""}
-                    messages.append(empty_assistant)
-                    if trace:
-                        await trace.write(empty_assistant)
-                    user_correction = {
-                        "role": "user",
-                        "content": "刚才的工具调用格式不完整，请重新完整地调用工具。",
-                    }
-                    messages.append(user_correction)
-                    if trace:
-                        await trace.write(user_correction)
-                    logger.warning(
-                        f"输出被截断(tool_call,第 {length_continuations} 次),要求重新调用"
-                    )
-                continue
-
-            # 正常路径：将 assistant 消息追加到历史
-            messages.append(message)
-            if trace:
-                await trace.write(message)
-
-            # ── 无 tool_calls：LLM 违反约束（无论 finish_reason）────────────
-            # 统一处理，避免 finish_reason=tool_calls 但实际 tool_calls 为空的漏网情况
-            if not tool_calls:
-                no_tool_retries += 1
-                if no_tool_retries <= _MAX_NO_TOOL_RETRIES:
-                    logger.warning(
-                        f"无 tool_calls 输出(第 {no_tool_retries} 次),"
-                        f"finish_reason={finish_reason},追加强化纠正指令"
-                    )
-                    user_correction = {
-                        "role": "user",
-                        "content": (
-                            "你刚才直接用文字回答，这违反了强制流程。"
-                            "必须先通过 tool_calls 调用工具获取证据，"
-                            "完成推理后再用 deliver 提交最终结论，禁止直接回答。"
-                        ),
-                    }
-                    messages.append(user_correction)
-                    if trace:
-                        await trace.write(user_correction)
-                else:
-                    logger.warning("无 tool_calls 纠正次数耗尽，强制终止循环")
-                    return "__REACT_NO_TOOL_EXHAUSTED__", None
-                continue
-
-            # ── 分拣 deliver、acknowledge、spawn 与 Serena 工具调用 ────────────
-            deliver_call = None
-            acknowledge_calls = []
-            spawn_calls = []
-            serena_calls = []
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    name = fn.get("name") or tc.get("name")
-                else:
-                    fn = getattr(tc, "function", None)
-                    name = getattr(fn, "name", None) or getattr(tc, "name", None)
-                if name == "deliver":
-                    deliver_call = tc
-                elif name == "acknowledge_changes":
-                    acknowledge_calls.append(tc)
-                elif name == "spawn_agent":
-                    spawn_calls.append(tc)
-                else:
-                    serena_calls.append(tc)
-
-            # 先并行执行所有 Serena 工具（确保工具结果不丢失）
-            if serena_calls:
-                tool_results = await asyncio.gather(
-                    *[self._invoke_tool(tc, serena_client) for tc in serena_calls]
-                )
-                for result_msg in tool_results:
-                    # 提取内部计时/预览字段（不写入 messages）
-                    elapsed_s = float(result_msg.pop("_elapsed_seconds", 0.0))
-                    preview = result_msg.pop("_preview", result_msg.get("name", "?"))
-                    content_len = len(result_msg.get("content", ""))
-                    logger.info(
-                        "[req=%s] round=%d -> %s %.2fs %dchars",
-                        req_id,
-                        round_num,
-                        preview,
-                        elapsed_s,
-                        content_len,
-                    )
-                    tool_msg = {"role": "tool", **result_msg}
-                    messages.append(tool_msg)
-                    if trace:
-                        await trace.write(tool_msg)
-
-            # ── 处理 spawn_agent 调用（串行，避免子任务并发挤占预算）────────────
-            for tc in spawn_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    tc_id = tc.get("id") or str(uuid.uuid4())
-                    raw_args = fn.get("arguments") or tc.get("arguments")
-                else:
-                    fn = getattr(tc, "function", None)
-                    tc_id = getattr(tc, "id", None) or str(uuid.uuid4())
-                    raw_args = getattr(fn, "arguments", None)
-
-                args = _parse_tool_call_args(raw_args)
-                if args is None:
-                    spawn_result = SpawnResult(
-                        ok=False,
-                        task_id=str(uuid.uuid4()),
-                        status=SpawnStatus.FAILED,
-                        answer="",
-                        confidence="low",
-                        elapsed_seconds=0.0,
-                        error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
-                        error_message="spawn_agent 参数解析失败：无效 JSON",
-                    )
-                elif spawn_count >= MAX_SPAWNS_PER_LOOP:
-                    spawn_result = SpawnResult(
-                        ok=False,
-                        task_id=str(uuid.uuid4()),
-                        status=SpawnStatus.FAILED,
-                        answer="",
-                        confidence="low",
-                        elapsed_seconds=0.0,
-                        error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
-                        error_message=(
-                            f"本次循环 spawn 次数已达上限（max={MAX_SPAWNS_PER_LOOP}），"
-                            "请直接调用 Serena 工具或整合已有信息后 deliver。"
-                        ),
-                    )
-                else:
-                    try:
-                        request = SpawnRequest(
-                            task=str(args.get("task", "")).strip(),
-                            allocated_seconds=float(args.get("allocated_seconds", 0.0)),
-                            expected_output=str(args.get("expected_output", "") or ""),
-                            context=(
-                                args["context"] if isinstance(args.get("context"), dict) else {}
-                            ),
-                            strict=bool(args.get("strict", False)),
-                        )
-                        if not request.task:
-                            raise ValueError("task 不能为空")
-                    except Exception as exc:
-                        spawn_result = SpawnResult(
-                            ok=False,
-                            task_id=str(uuid.uuid4()),
-                            status=SpawnStatus.FAILED,
-                            answer="",
-                            confidence="low",
-                            elapsed_seconds=0.0,
-                            error_code=SpawnErrorCode.SUBAGENT_INVALID_ARGS,
-                            error_message=f"spawn_agent 参数无效: {exc}",
-                        )
-                    else:
-                        spawn_result = await invoke_spawn(
-                            request=request,
-                            serena_client=serena_client,
-                            parent_depth=depth,
-                            parent_deadline=deadline,
-                            run_loop_fn=self._run_react_loop,
-                        )
-                        spawn_count += 1
-                        # 子 Agent 成功结论也写入 InsightCache
-                        if spawn_result.ok:
-                            await self._persist_insights(
-                                question=request.task,
-                                answer=spawn_result.answer,
-                                confidence=spawn_result.confidence,
-                            )
-
-                spawn_msg = {
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": "spawn_agent",
-                    "content": _safe_json_dumps(spawn_result.to_tool_content()),
-                }
-                messages.append(spawn_msg)
-                logger.info(
-                    "[req=%s] round=%d -> spawn_agent ok=%s %.1fs",
-                    req_id,
-                    round_num,
-                    spawn_result.ok,
-                    spawn_result.elapsed_seconds,
-                )
-                if trace:
-                    await trace.write(spawn_msg)
-
-            # 处理认知确认调用
-            for tc in acknowledge_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    tc_id = tc.get("id") or str(uuid.uuid4())
-                    raw_args = fn.get("arguments") or tc.get("arguments")
-                else:
-                    fn = getattr(tc, "function", None)
-                    tc_id = getattr(tc, "id", None) or str(uuid.uuid4())
-                    raw_args = getattr(fn, "arguments", None)
-                args = _parse_tool_call_args(raw_args)
-                paths = (args or {}).get("paths", [])
-                if acknowledge_cb and paths:
-                    try:
-                        await acknowledge_cb(paths)
-                        ack_result = f"已确认 {len(paths)} 个文件的认知状态"
-                    except Exception as e:
-                        ack_result = f"认知确认失败: {e}"
-                else:
-                    ack_result = "无需确认（无变更文件或回调未配置）"
-                ack_msg = {
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": "acknowledge_changes",
-                    "content": ack_result,
-                }
-                messages.append(ack_msg)
-                logger.info(
-                    "[req=%s] round=%d -> acknowledge_changes paths=%d",
-                    req_id,
-                    round_num,
-                    len(paths),
-                )
-                if trace:
-                    await trace.write(ack_msg)
-
-            # deliver 到来，提取结论并正常终止
-            if deliver_call is not None:
-                if isinstance(deliver_call, dict):
-                    fn = deliver_call.get("function") or {}
-                    raw_args = fn.get("arguments") or deliver_call.get("arguments")
-                else:
-                    fn = getattr(deliver_call, "function", None)
-                    raw_args = getattr(fn, "arguments", None)
-                args = _parse_tool_call_args(raw_args)
-                if args is None:
-                    logger.warning("deliver 调用参数解析失败")
-                    return "__REACT_DELIVER_EMPTY__", None
-                answer = args.get("answer")
-                if not answer:
-                    logger.warning("deliver 调用缺少 answer 参数")
-                    return "__REACT_DELIVER_EMPTY__", None
-                confidence = args.get("confidence")
-                elapsed = time.monotonic() - start
-                logger.info(
-                    "[req=%s] DELIVER confidence=%s elapsed=%.1fs rounds=%d",
-                    req_id,
-                    confidence,
-                    elapsed,
-                    round_num,
-                )
-                if trace:
-                    await trace.write(
-                        {
-                            "event": "deliver",
-                            "confidence": confidence,
-                            "elapsed_seconds": elapsed,
-                            "rounds": round_num,
-                            "answer": str(answer),
-                        }
-                    )
-                return str(answer), str(confidence) if confidence else None
-
-            # 本轮仅有 Serena 工具调用，重置无工具计数，继续下一轮
-            no_tool_retries = 0
-
-    async def _invoke_tool(
-        self, tool_call: dict[str, Any], serena_client: SerenaClient
-    ) -> dict[str, Any]:
-        """执行单个工具调用,返回格式化的 tool 消息（含内部计时字段）。"""
-        # 提取 tool_call 字段(兼容 dict 和 object 两种格式)
-        if isinstance(tool_call, dict):
-            tool_call_id = tool_call.get("id") or str(uuid.uuid4())
-            function = tool_call.get("function") or {}
-            tool_name = function.get("name") or tool_call.get("name")
-            raw_args = function.get("arguments") or tool_call.get("arguments")
-        else:
-            tool_call_id = getattr(tool_call, "id", None) or str(uuid.uuid4())
-            function = getattr(tool_call, "function", {})
-            tool_name = getattr(function, "name", None)
-            raw_args = getattr(function, "arguments", None)
-
-        if not tool_name:
-            return {
-                "tool_call_id": tool_call_id,
-                "name": "unknown",
-                "content": "工具调用缺少 name 字段",
-                "_elapsed_seconds": 0.0,
-                "_preview": "unknown",
-            }
-
-        args = _parse_tool_call_args(raw_args)
-
-        # args 为 None 说明 JSON 解析失败（参数不完整或格式错误）
-        # 返回错误 tool result，让 LLM 感知并重新构造正确的调用
-        if args is None:
-            logger.warning(f"工具参数解析失败: {tool_name}, raw_args={raw_args!r:.100}")
-            return {
-                "tool_call_id": tool_call_id,
-                "name": tool_name,
-                "content": f"工具参数解析失败: 无效的 JSON。请重新调用 {tool_name} 并确保参数格式正确。",
-                "_elapsed_seconds": 0.0,
-                "_preview": _key_arg_preview(tool_name, None),
-            }
-
-        preview = _key_arg_preview(tool_name, args)
-        t0 = time.monotonic()
-        try:
-            result = await serena_client.call(tool_name, args)
-            return {
-                "tool_call_id": tool_call_id,
-                "name": tool_name,
-                "content": _safe_json_dumps(result),
-                "_elapsed_seconds": time.monotonic() - t0,
-                "_preview": preview,
-            }
-        except SerenaClientError as e:
-            logger.warning(f"工具调用失败: {tool_name}: {e}")
-            return {
-                "tool_call_id": tool_call_id,
-                "name": tool_name,
-                "content": f"工具调用失败: {e}",
-                "_elapsed_seconds": time.monotonic() - t0,
-                "_preview": preview,
-            }
+        state.token_used = compact_tokens
+        state.extra["compact_failed"] = False
+        return new_messages
 
     async def _plan_impact_strategy(
         self,
@@ -2513,11 +2111,11 @@ class PCEAgent:
                 await trace.write({"role": "system", "content": system_content})
                 await trace.write({"role": "user", "content": question})
 
-            answer, confidence = await self._run_react_loop(
+            answer, confidence = await self.run_loop(
                 messages,
                 serena_client,
-                acknowledge_cb,
-                trace=trace,
+                acknowledge_cb=acknowledge_cb,
+                trace_writer=trace,
             )
             await self._persist_insights(question=question, answer=answer, confidence=confidence)
             return _parse_query_response(answer, project_root=serena_client.project_path)
@@ -2593,11 +2191,11 @@ class PCEAgent:
                 await trace.write({"role": "system", "content": system_content})
                 await trace.write({"role": "user", "content": prompt})
 
-            answer, confidence = await self._run_react_loop(
+            answer, confidence = await self.run_loop(
                 messages,
                 serena_client,
-                acknowledge_cb,
-                trace=trace,
+                acknowledge_cb=acknowledge_cb,
+                trace_writer=trace,
             )
             await self._persist_insights(question=prompt, answer=answer, confidence=confidence)
             return _parse_impact_response(
