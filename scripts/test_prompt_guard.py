@@ -14,13 +14,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pce.agent as agent_module
+import pce.annotation_writer as annotation_writer_module
 from pce.agent import PCEAgent, _SYSTEM_PROMPT_PLACEHOLDER
-from pce.annotation_writer import _build_index_md_prompt, _build_missing_coverage_repair_prompt
+from pce.annotation_writer import (
+    _build_index_md_prompt,
+    _build_missing_coverage_repair_prompt,
+    _llm_complete_text,
+)
 from pce.digest_agent import DigestAgent, DigestTaskItem, DigestTaskList
 from pce.models import FileMeta, IndexEntry
 from pce.prompt_guard import build_prompt_budget, estimate_input_tokens
@@ -146,11 +152,45 @@ async def _test_annotation_prompt_compaction() -> None:
     _assert(payload["repair_prompt_tokens"] <= build_prompt_budget().hard_input_budget, "遗漏补归属 prompt 仍然明显超限")
 
 
+async def _test_annotation_failure_logging() -> None:
+    messages: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    def _boom(**_: object) -> object:
+        raise TimeoutError()
+
+    handler = _ListHandler()
+    logger = logging.getLogger(annotation_writer_module.__name__)
+    logger.addHandler(handler)
+    original = annotation_writer_module.litellm.completion
+    annotation_writer_module.litellm.completion = _boom
+    try:
+        result = await _llm_complete_text(
+            "prompt",
+            system_prompt="sys",
+            model="gpt-4o-mini",
+            failure_log="annotation smoke",
+        )
+    finally:
+        annotation_writer_module.litellm.completion = original
+        logger.removeHandler(handler)
+
+    _assert(result is None, "失败时应降级返回 None")
+    _assert(
+        any("TimeoutError" in message for message in messages),
+        "降级日志至少应包含异常类型",
+    )
+
+
 async def main() -> None:
     await _test_query_guard()
     await _test_digest_guard()
     await _test_annotation_prompt_compaction()
-    print(json.dumps({"ok": True, "tests": ["query guard", "digest guard", "annotation prompt compaction"]}, ensure_ascii=False))
+    await _test_annotation_failure_logging()
+    print(json.dumps({"ok": True, "tests": ["query guard", "digest guard", "annotation prompt compaction", "annotation failure logging"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -34,7 +34,11 @@ from .agent import PCEAgent
 from .digest_agent import run_digest
 from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
-from .models import InitResponse
+from .models import InitResponse, LanguageHealthReport
+from .serena_language_health import (
+    preflight_serena_language_health,
+    verify_serena_language_health,
+)
 from .staging import DirtyState, FileWatcher, StagingArea
 from .memory import get_status, index_exists, load_index
 from ._env import configure_litellm_runtime
@@ -114,6 +118,14 @@ def _get_serena_timeout() -> int:
         logger.warning(f"PCE_SERENA_TIMEOUT 值需为正数: {raw},使用默认值 {DEFAULT_TIMEOUT_SECONDS}")
         return DEFAULT_TIMEOUT_SECONDS
     return value
+
+
+def _format_exception_brief(exc: BaseException) -> str:
+    """将异常格式化为稳定、非空的 warning 文本。"""
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    return f"{type(exc).__name__}: {exc!r}"
 
 
 # ============================================================================
@@ -318,6 +330,7 @@ class PCEContext:
         self._init_lock = asyncio.Lock()
         self._bootstrap_event = asyncio.Event()
         self._bootstrap_warnings: list[str] = []
+        self._language_health_report: LanguageHealthReport | None = None
 
     @property
     def project_path(self) -> Path:
@@ -404,6 +417,7 @@ class PCEContext:
         """
         warnings: list[str] = []
         self._bootstrap_warnings = []
+        self._language_health_report = None
         self._last_init_error = None
         bootstrap_start = time.monotonic()
         # 注意：不在此处 clear event，handle_init 在切换到 initializing 时已 clear。
@@ -424,6 +438,15 @@ class PCEContext:
             serena_timeout = _get_serena_timeout()
             self.insight_cache = InsightCache(project_path)
             self.agent = PCEAgent(insight_cache=self.insight_cache)
+            try:
+                language_health = await preflight_serena_language_health(project_path)
+            except Exception as exc:
+                warning = f"语言健康预检失败（已降级）: {_format_exception_brief(exc)}"
+                warnings.append(warning)
+                logger.warning(warning)
+            else:
+                self._language_health_report = language_health
+                warnings.extend(language_health.warnings)
 
             async with self._sync_lock:
                 serena_connect_start = time.monotonic()
@@ -436,6 +459,21 @@ class PCEContext:
                         time.monotonic() - serena_connect_start,
                     )
                     self._edit_tools_schema = serena_client.edit_tools_schema
+                    if self._language_health_report is not None:
+                        try:
+                            language_health = await verify_serena_language_health(
+                                self._language_health_report,
+                                serena_client,
+                            )
+                        except Exception as exc:
+                            warning = f"语言健康校验失败（已降级）: {_format_exception_brief(exc)}"
+                            warnings.append(warning)
+                            logger.warning(warning)
+                        else:
+                            self._language_health_report = language_health
+                            warnings = [*warnings, *[
+                                item for item in language_health.warnings if item not in warnings
+                            ]]
 
                     # 显式校验 Serena 项目激活：启动时激活失败会被静默吞掉，
                     # 再调一次可捕获失败并记录 warning，而不是直接报错
@@ -486,7 +524,7 @@ class PCEContext:
                             digest_result.get("deleted_insights", 0),
                         )
                     except Exception as e:
-                        warning = f"Bootstrap Digest 失败（不影响初始化）: {e}"
+                        warning = f"Bootstrap Digest 失败（不影响初始化）: {_format_exception_brief(e)}"
                         warnings.append(warning)
                         logger.warning(warning)
                     finally:
@@ -517,6 +555,7 @@ class PCEContext:
                 file_count=file_count,
                 init_mode=init_mode,
                 warnings=self._bootstrap_warnings,
+                language_health_report=self._language_health_report,
             )
 
         except Exception as e:
@@ -537,6 +576,7 @@ class PCEContext:
                 file_count=0,
                 init_mode=init_mode,
                 warnings=self._bootstrap_warnings,
+                language_health_report=self._language_health_report,
                 error=str(e),
             )
 
@@ -576,6 +616,7 @@ class PCEContext:
                     file_count=snapshot.project_meta.file_count if snapshot else 0,
                     init_mode="reused",
                     warnings=list(self._bootstrap_warnings),
+                    language_health_report=self._language_health_report,
                 ).model_dump(mode="json")
 
             elif self._init_state == "initializing":
@@ -602,6 +643,7 @@ class PCEContext:
                     file_count=snapshot.project_meta.file_count if snapshot else 0,
                     init_mode="reused",
                     warnings=list(self._bootstrap_warnings),
+                    language_health_report=self._language_health_report,
                 ).model_dump(mode="json")
             else:
                 return InitResponse(
@@ -612,6 +654,7 @@ class PCEContext:
                     file_count=0,
                     init_mode="retry_after_failure",
                     warnings=list(self._bootstrap_warnings),
+                    language_health_report=self._language_health_report,
                     error=self._last_init_error,
                 ).model_dump(mode="json")
 
@@ -723,6 +766,11 @@ class PCEContext:
             "bootstrapping": self._init_state == "initializing",
             "last_init_error": self._last_init_error,
             "bootstrap_warnings": list(self._bootstrap_warnings),
+            "language_health_report": (
+                self._language_health_report.model_dump(mode="json")
+                if self._language_health_report is not None
+                else None
+            ),
             "project_path": str(root) if root is not None else None,
             "staging": staging_summary,
             "watcher_running": self.watcher.running if self.watcher is not None else False,

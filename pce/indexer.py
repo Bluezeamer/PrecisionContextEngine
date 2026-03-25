@@ -25,7 +25,6 @@ import aiofiles
 
 from .file_discovery import (
     HARD_SKIP_DIRS,
-    SYMBOL_INDEX_EXTENSIONS,
     filter_trackable_files,
     is_hard_skipped,
     should_track_deleted_path,
@@ -43,29 +42,9 @@ from .models import (
     SymbolRef,
 )
 from .serena_client import SerenaClient, SerenaClientError
+from .serena_language_registry import infer_language_for_path
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# 常量配置
-# ============================================================================
-
-CODE_EXTENSIONS = SYMBOL_INDEX_EXTENSIONS
-SKIP_DIRS = HARD_SKIP_DIRS
-
-LANGUAGE_MAP: dict[str, str] = {
-    ".py": "python",
-    ".ts": "typescript",
-    ".js": "javascript",
-    ".tsx": "typescriptreact",
-    ".jsx": "javascriptreact",
-    ".go": "go",
-    ".java": "java",
-    ".rs": "rust",
-    ".cpp": "cpp",
-    ".c": "c",
-    ".h": "c",
-}
 
 DEFAULT_CONCURRENCY = 10
 
@@ -114,14 +93,9 @@ def _should_skip(path: Path) -> bool:
     return is_hard_skipped(path)
 
 
-def _is_code_file(path: Path) -> bool:
-    """判断路径是否为支持的代码文件。"""
-    return supports_symbol_index(path)
-
-
 def _infer_language(path: Path) -> str:
     """从文件扩展名推断语言标识。"""
-    return LANGUAGE_MAP.get(path.suffix.lower(), path.suffix.lstrip(".") or "text")
+    return infer_language_for_path(path) or (path.suffix.lstrip(".") or "text")
 
 
 def _count_lines(path: Path) -> int:

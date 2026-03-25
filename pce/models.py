@@ -188,6 +188,90 @@ class ErrorResponse(BaseSchema):
     details: Optional[NonEmptyStr] = Field(default=None, description="详细错误信息（可选）")
 
 
+class LanguageSupportIssue(BaseSchema):
+    """单语言支持问题与修复建议。"""
+
+    language: NonEmptyStr = Field(..., description="语言 key")
+    status: Literal["degraded", "repaired", "manual_action_required"] = Field(
+        ...,
+        description="当前语言健康状态",
+    )
+    failure_stage: Literal[
+        "language_detection",
+        "config_repair",
+        "runtime_precheck",
+        "serena_startup",
+        "post_start_verification",
+    ] = Field(..., description="失败或告警发生的阶段")
+    reason_code: NonEmptyStr = Field(..., description="稳定的原因代码")
+    reason: NonEmptyStr = Field(..., description="人类可读的原因说明")
+    auto_fix_attempted: bool = Field(default=False, description="是否尝试过自动修复")
+    auto_fix_result: Literal["not_needed", "succeeded", "failed", "skipped"] = Field(
+        default="not_needed",
+        description="自动修复结果",
+    )
+    required_runtime: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="该语言需要的运行时命令",
+    )
+    install_channel: str | None = Field(default=None, description="推荐安装通道")
+    representative_files: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="代表性文件路径",
+    )
+    suggested_fix: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="给上层 Agent / 用户的修复建议",
+    )
+    impact: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="若不修复会造成的退化影响",
+    )
+
+
+class LanguageHealthReport(BaseSchema):
+    """init 时的 Serena 语言环境健康报告。"""
+
+    snapshot_version: NonEmptyStr = Field(..., description="PCE 内置 Serena 语言快照版本")
+    detected_languages: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="根据项目文件扫描得到的语言集合",
+    )
+    configured_languages_before: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="修复前的 Serena 配置语言集合",
+    )
+    configured_languages_after: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="修复后的 Serena 配置语言集合",
+    )
+    repaired_languages: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="本次 init 自动补齐的语言集合",
+    )
+    project_config_path: str | None = Field(default=None, description="project.yml 路径")
+    project_local_override_path: str | None = Field(
+        default=None,
+        description="project.local.yml 路径（若存在）",
+    )
+    effective_config_path: str | None = Field(
+        default=None,
+        description="本次实际生效或尝试修复的配置文件路径",
+    )
+    representative_files: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="每种语言对应的代表文件列表",
+    )
+    issues: list[LanguageSupportIssue] = Field(
+        default_factory=list,
+        description="结构化语言健康问题列表",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="对上层 Agent 直接可消费的 warning 摘要",
+    )
+
+
 class InitResponse(BaseModel):
     """pce_init 工具的响应结果。"""
 
@@ -198,6 +282,7 @@ class InitResponse(BaseModel):
     file_count: int
     init_mode: Literal["full_build", "reused", "retry_after_failure"]
     warnings: list[str]
+    language_health_report: LanguageHealthReport | None = None
     error: str | None = None
 
 

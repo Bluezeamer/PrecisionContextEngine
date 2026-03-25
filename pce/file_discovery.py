@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pathspec
 
+from .serena_language_registry import supports_symbol_index_for_path
+
 HARD_SKIP_DIRS = frozenset(
     {
         ".git",
@@ -24,22 +26,6 @@ HARD_SKIP_DIRS = frozenset(
         "__pycache__",
         ".venv",
         "venv",
-    }
-)
-
-SYMBOL_INDEX_EXTENSIONS = frozenset(
-    {
-        ".py",
-        ".ts",
-        ".js",
-        ".tsx",
-        ".jsx",
-        ".go",
-        ".java",
-        ".rs",
-        ".cpp",
-        ".c",
-        ".h",
     }
 )
 
@@ -59,7 +45,7 @@ def is_hard_skipped(path: str | Path) -> bool:
 
 def supports_symbol_index(path: str | Path) -> bool:
     """是否启用符号索引增强。"""
-    return Path(path).suffix.lower() in SYMBOL_INDEX_EXTENSIONS
+    return supports_symbol_index_for_path(path)
 
 
 @lru_cache(maxsize=32)

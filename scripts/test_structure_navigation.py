@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pce.agent import PCEAgent
-from pce.indexer import (
+from pce.annotation_writer import (
     _build_structure_refresh_signals,
     _build_structure_rule_bundle,
     _is_cautious_structure_markdown,
@@ -53,8 +53,8 @@ async def _test_structure_navigation_layout() -> None:
     entries = [
         _entry("main.py", "python", 20),
         _entry("backend/app.py", "python", 120),
-        _entry("frontend/src/main.js", "javascript", 40),
-        _entry("frontend/src/App.vue", "javascript", 60),
+        _entry("frontend/src/main.js", "typescript", 40),
+        _entry("frontend/src/App.vue", "vue", 60),
         _entry("PrecisionContextEngine/pce/agent.py", "python", 300),
         _entry("PrecisionContextEngine/pce/server.py", "python", 240),
         _entry("PrecisionContextEngine/scripts/test_e2e.py", "python", 80),
@@ -108,7 +108,7 @@ async def _test_structure_refresh_signals() -> None:
     entries = [
         _entry("main.py", "python", 20),
         _entry("backend/app.py", "python", 120),
-        _entry("frontend/src/main.js", "javascript", 40),
+        _entry("frontend/src/main.js", "typescript", 40),
     ]
     bundle = _build_structure_rule_bundle(
         entries,

@@ -1024,6 +1024,14 @@ def _extract_llm_text(response: Any) -> str:
     return ""
 
 
+def _format_exception_brief(exc: BaseException) -> str:
+    """将异常格式化为稳定、非空的简短字符串。"""
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    return f"{type(exc).__name__}: {exc!r}"
+
+
 def _resolve_annotation_model(model: str | None) -> str | None:
     """解析注解生成所用的模型配置，失败时返回 None（触发降级）。"""
     if model is not None:
@@ -1084,7 +1092,7 @@ async def _llm_complete_text(
             timeout=_ANNOTATION_LLM_TIMEOUT_SECONDS,
         )
     except Exception as e:
-        logger.warning(f"{failure_log}(已降级): {e}")
+        logger.warning("%s(已降级): %s", failure_log, _format_exception_brief(e))
         return None
 
     content = _strip_markdown_fence(_extract_llm_text(response))

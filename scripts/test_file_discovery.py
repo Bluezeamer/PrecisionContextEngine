@@ -55,8 +55,9 @@ def main() -> None:
         assert should_track_existing_file(root, "src/app.vue") is True
         assert should_track_existing_file(root, "blob.bin") is False
         assert should_track_deleted_path("ignored-by-project/a.py") is True
-        assert supports_symbol_index("src/app.vue") is False
+        assert supports_symbol_index("src/app.vue") is True
         assert supports_symbol_index("server.py") is True
+        assert supports_symbol_index("src/lib.rs") is True
 
     print(json.dumps({
         "ok": True,
