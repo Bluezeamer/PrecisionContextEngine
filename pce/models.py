@@ -391,6 +391,10 @@ class ModuleDigestDelta(BaseSchema):
     changed_files: list[ChangedFileFact] = Field(
         default_factory=list, description="该模块相关的文件差异事实"
     )
+    change_scope_hint: Literal["route", "module", "agent_decide"] = Field(
+        default="agent_decide",
+        description="对该模块变更层级的轻量预判提示",
+    )
     external_context: list[str] = Field(
         default_factory=list, description="模块级外部上下文提示"
     )

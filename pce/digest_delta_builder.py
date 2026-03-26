@@ -118,10 +118,48 @@ class DigestDeltaBuilder:
                     or "",
                     related_insights=related_insights,
                     changed_files=module_file_facts,
+                    change_scope_hint=self._classify_change_scope(module_file_facts),
                     external_context=[],
                 )
             )
         return results
+
+    @staticmethod
+    def _classify_change_scope(
+        changed_files: list[ChangedFileFact],
+    ) -> str:
+        if not changed_files:
+            return "agent_decide"
+
+        if all(file_fact.status == "modified" for file_fact in changed_files):
+            return "module"
+
+        created = [file_fact for file_fact in changed_files if file_fact.status == "created"]
+        deleted = [file_fact for file_fact in changed_files if file_fact.status == "deleted"]
+        modified = [file_fact for file_fact in changed_files if file_fact.status == "modified"]
+
+        if created and deleted and not modified:
+            remaining_deleted = list(deleted)
+            matched = 0
+            for created_fact in created:
+                match_idx = next(
+                    (
+                        idx
+                        for idx, deleted_fact in enumerate(remaining_deleted)
+                        if created_fact.new_hash
+                        and deleted_fact.old_hash
+                        and created_fact.new_hash == deleted_fact.old_hash
+                    ),
+                    None,
+                )
+                if match_idx is None:
+                    continue
+                matched += 1
+                remaining_deleted.pop(match_idx)
+            if matched == len(created) and not remaining_deleted:
+                return "route"
+
+        return "agent_decide"
 
     @staticmethod
     def _guess_deleted_owner(path: str, registry: ModuleRegistry) -> ModuleRecord | None:

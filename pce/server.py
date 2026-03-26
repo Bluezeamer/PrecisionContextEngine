@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from .agent import PCEAgent
 from .digest_agent import run_digest
+from .file_discovery import HARD_SKIP_DIRS, should_track_existing_file, should_track_deleted_path
 from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
 from .models import InitResponse, LanguageHealthReport
@@ -40,7 +42,7 @@ from .serena_language_health import (
     verify_serena_language_health,
 )
 from .staging import DirtyState, FileWatcher, StagingArea
-from .memory import get_status, index_exists, load_index
+from .memory import get_status, index_exists, load_file_baseline, load_index
 from ._env import configure_litellm_runtime
 from .serena_client import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -78,6 +80,49 @@ def _make_tool_description(
 def _text_response(content: Any) -> list[TextContent]:
     """将任意数据序列化为 MCP TextContent 列表。"""
     return [TextContent(type="text", text=json.dumps(content, ensure_ascii=False, indent=2))]
+
+
+async def _hash_existing_file(path: Path) -> str | None:
+    def _hash() -> str | None:
+        if not path.exists() or not path.is_file():
+            return None
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    return await asyncio.to_thread(_hash)
+
+
+async def _scan_trackable_files(project_root: Path) -> list[str]:
+    def _walk() -> list[str]:
+        results: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [name for name in dirnames if name not in HARD_SKIP_DIRS]
+            base = Path(dirpath)
+            for filename in filenames:
+                rel_path = (base / filename).relative_to(project_root).as_posix()
+                if should_track_existing_file(project_root, rel_path):
+                    results.append(rel_path)
+        return sorted(set(results))
+
+    return await asyncio.to_thread(_walk)
+
+
+async def _collect_baseline_paths(project_root: Path) -> set[str]:
+    def _collect() -> set[str]:
+        base_dir = project_root / ".pce" / "baselines" / "files"
+        if not base_dir.exists():
+            return set()
+        results: set[str] = set()
+        for path in base_dir.rglob("*.json"):
+            rel = path.relative_to(base_dir).as_posix()
+            if rel.endswith(".json"):
+                results.add(rel[:-5])
+        return results
+
+    return await asyncio.to_thread(_collect)
 
 
 def _markdown_response(content: str) -> list[TextContent]:
@@ -367,9 +412,9 @@ class PCEContext:
         3. 索引存在且无变更 → 直接跳过，返回当前（空）DirtyState
         """
         assert self.staging is not None
+        dirty = await self._backfill_dirty_if_needed()
         if not await index_exists(root_path=self.project_path):
             logger.info("PCE 索引不存在，开始全量构建...")
-            dirty = await self.staging.list_pending_reindex()
             all_paths = dirty.changed + dirty.deleted
             hash_snapshot = await self.staging.snapshot_hashes(all_paths) if all_paths else None
             await build_index(
@@ -385,7 +430,6 @@ class PCEContext:
             logger.info("PCE 索引全量构建完成")
             return dirty
 
-        dirty = await self.staging.list_pending_reindex()
         if not dirty.empty:
             all_paths = dirty.changed + dirty.deleted
             hash_snapshot = await self.staging.snapshot_hashes(all_paths)
@@ -404,6 +448,56 @@ class PCEContext:
             logger.info("增量索引更新完成")
 
         return dirty
+
+    async def _backfill_dirty_if_needed(self) -> DirtyState:
+        """当 watcher 离线导致暂存区为空时，基于 baseline/索引做轻量补录。"""
+        assert self.staging is not None
+
+        dirty = await self.staging.list_pending_reindex()
+        if not dirty.empty:
+            return dirty
+
+        project_root = self.project_path
+        snapshot = await load_index(root_path=project_root)
+        baseline_paths = await _collect_baseline_paths(project_root)
+        if not baseline_paths and snapshot is None:
+            return dirty
+        current_files = await _scan_trackable_files(project_root)
+        current_set = set(current_files)
+
+        expected_paths = set(baseline_paths)
+        if not expected_paths and snapshot is not None:
+            expected_paths = {str(entry.file_meta.path) for entry in snapshot.entries}
+
+        created_paths = sorted(current_set - expected_paths)
+        deleted_paths = sorted(path for path in (expected_paths - current_set) if should_track_deleted_path(path))
+
+        modified_paths: list[str] = []
+        if baseline_paths:
+            for rel_path in sorted(current_set & baseline_paths):
+                baseline = await load_file_baseline(rel_path, root_path=project_root)
+                if baseline is None:
+                    continue
+                current_hash = await _hash_existing_file(project_root / rel_path)
+                if current_hash is not None and current_hash != baseline.content_hash:
+                    modified_paths.append(rel_path)
+
+        if not created_paths and not deleted_paths and not modified_paths:
+            return dirty
+
+        logger.info(
+            "离线 dirty 补录: created=%d modified=%d deleted=%d",
+            len(created_paths),
+            len(modified_paths),
+            len(deleted_paths),
+        )
+
+        for rel_path in sorted(set([*created_paths, *modified_paths])):
+            await self.staging.record_change(rel_path)
+        for rel_path in deleted_paths:
+            await self.staging.record_change(rel_path, deleted=True)
+
+        return await self.staging.list_pending_reindex()
 
     async def _bootstrap(
         self,
@@ -814,7 +908,7 @@ class PCEContext:
         digest_warnings: list[str] = []
 
         async with self._sync_lock:
-            dirty = await self.staging.list_pending_reindex()
+            dirty = await self._backfill_dirty_if_needed()
             if dirty.empty:
                 snapshot = await load_index(root_path=self.project_path)
                 if snapshot is not None:

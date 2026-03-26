@@ -33,6 +33,7 @@ from .memory import (
     ANNOTATIONS_MODULES_DIR,
     NAVIGATION_TREE_FILE,
     _atomic_write_text,
+    load_file_baseline,
 )
 from .models import (
     AreaRecord,
@@ -123,6 +124,9 @@ _ANNOTATION_LLM_TIMEOUT_SECONDS = 20.0
 _MODULE_ANNOTATION_CONCURRENCY = 4
 _INDEX_PROMPT_MAX_SUMMARY_LINES = 48
 _MODULE_PROMPT_MAX_FILE_LINES = 24
+_MODULE_PROMPT_SYMBOL_ANCHORS_PER_FILE = 2
+_MODULE_PROMPT_SYMBOL_ANCHORS_TOTAL = 6
+_MODULE_FALLBACK_SYMBOL_ANCHORS_TOTAL = 4
 _MISSING_COVERAGE_INDEX_BUDGET = 5000
 
 
@@ -1296,17 +1300,20 @@ def _build_module_annotation_prompt(
 ) -> str:
     """构建单模块深度认知文档的 LLM 提示词。"""
     raw_file_lines: list[str] = []
+    remaining_symbol_anchors = _MODULE_PROMPT_SYMBOL_ANCHORS_TOTAL
     for entry in module_entries:
-        symbol_lines = ", ".join(
-            f"{sym.name}({sym.kind.value})[{sym.line_start}-{sym.line_end}]"
-            for sym in entry.symbols[:12]
-        ) or "无显式符号"
-        if len(entry.symbols) > 12:
-            symbol_lines += ", ..."
-        raw_file_lines.append(
-            f"- {entry.file_meta.path} [{entry.file_meta.language}, {entry.file_meta.loc} 行] "
-            f"符号: {symbol_lines}"
-        )
+        anchor_limit = min(_MODULE_PROMPT_SYMBOL_ANCHORS_PER_FILE, remaining_symbol_anchors)
+        anchor_lines = [
+            f"{sym.name}({sym.kind.value})@{sym.line_start}"
+            for sym in entry.symbols[:anchor_limit]
+        ]
+        remaining_symbol_anchors = max(0, remaining_symbol_anchors - len(anchor_lines))
+        line = f"- {entry.file_meta.path} [{entry.file_meta.language}, {entry.file_meta.loc} 行]"
+        if anchor_lines:
+            line += f" 锚点: {', '.join(anchor_lines)}"
+            if len(entry.symbols) > anchor_limit:
+                line += " ..."
+        raw_file_lines.append(line)
 
     prefix_lines = [
         "你要为单个代码模块生成可按需加载的深度认知文档。",
@@ -1321,9 +1328,9 @@ def _build_module_annotation_prompt(
         "",
         "输出要求:",
         f"- 标题必须是 `# {module_name}`",
-        "- 必须包含 `## 覆盖文件`、`## 核心职责`、`## 关键符号`、`## 关键流程`、`## 外部协作`、`## 风险与约束` 这些二级标题",
+        "- 必须包含 `## 覆盖文件`、`## 核心职责`、`## 关键流程`、`## 外部协作`、`## 风险与约束` 这些二级标题",
         "- `## 覆盖文件` 需列出所有文件路径",
-        "- `## 关键符号` 需优先引用给定摘要里的符号名和文件路径",
+        "- 如确有必要，可额外写 `## 关键符号`，但只能保留少量高价值锚点，禁止枚举实现细节",
         "- `## 关键流程` 关注控制流、数据流或调用链，不要泛泛而谈",
         "- 结论必须基于输入，不得编造不存在的文件、符号或依赖",
     ]
@@ -1685,20 +1692,24 @@ def _build_fallback_module_md(module_name: str, module_entries: list[IndexEntry]
     for entry in module_entries:
         lines.append(f"- {entry.file_meta.path}")
 
-    lines.extend(["", "## 核心职责", "当前为基于索引条目的回退摘要，提供基本文件边界与符号概览。", "", "## 关键符号"])
-    has_symbols = False
+    lines.extend(["", "## 核心职责", "当前为基于索引条目的回退摘要，提供基本文件边界与少量入口锚点。"])
+
+    anchors: list[str] = []
     for entry in module_entries:
-        for sym in entry.symbols[:12]:
-            lines.append(f"- {sym.name} ({sym.kind.value}) — {sym.file_path}:{sym.line_start}")
-            has_symbols = True
-    if not has_symbols:
-        lines.append("- 无显式符号")
+        for sym in entry.symbols[:1]:
+            anchors.append(f"- {sym.name} ({sym.kind.value}) — {sym.file_path}:{sym.line_start}")
+            if len(anchors) >= _MODULE_FALLBACK_SYMBOL_ANCHORS_TOTAL:
+                break
+        if len(anchors) >= _MODULE_FALLBACK_SYMBOL_ANCHORS_TOTAL:
+            break
+    if anchors:
+        lines.extend(["", "## 专题：关键锚点", *anchors])
 
     lines.extend(
         [
             "",
             "## 关键流程",
-            "需结合具体文件内容进一步检索，当前回退摘要不直接推断控制流。",
+            "需结合具体文件内容进一步检索，当前回退摘要不直接推断控制流；符号细节请优先通过 Serena 工具动态查询。",
             "",
             "## 外部协作",
             "可结合 structure.md、references.json 及 Serena 工具继续定位模块交互关系。",
@@ -1708,6 +1719,135 @@ def _build_fallback_module_md(module_name: str, module_entries: list[IndexEntry]
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+async def _compute_file_hash(path: Path) -> str | None:
+    def _hash() -> str | None:
+        if not path.exists() or not path.is_file():
+            return None
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    return await asyncio.to_thread(_hash)
+
+
+def _rewrite_coverage_section(content: str, file_paths: list[str], module_name: str) -> str:
+    lines = content.splitlines()
+    title = module_name
+    sections: list[tuple[str, list[str]]] = []
+    current_heading: str | None = None
+    current_body: list[str] = []
+
+    def _flush() -> None:
+        nonlocal current_heading, current_body
+        if current_heading is None:
+            return
+        sections.append((current_heading, current_body[:]))
+
+    for line in lines:
+        if line.startswith("# ") and title == module_name:
+            title = line[2:].strip() or module_name
+            continue
+        if line.startswith("## "):
+            _flush()
+            current_heading = line[3:].strip()
+            current_body = []
+            continue
+        if current_heading is not None:
+            current_body.append(line.rstrip())
+
+    _flush()
+
+    replaced = False
+    rendered = [f"# {title}", "", "## 覆盖文件", *[f"- {path}" for path in file_paths]]
+    for heading, body in sections:
+        if heading == "覆盖文件":
+            replaced = True
+            continue
+        rendered.extend(["", f"## {heading}", *body])
+    if not replaced and not sections:
+        rendered.extend(["", "## 核心职责"])
+    return "\n".join(rendered).rstrip() + "\n"
+
+
+async def _patch_module_coverage_sections(
+    module_specs: list[tuple[str, str, list[IndexEntry]]],
+    modules_dir: Path,
+) -> None:
+    for module_name, slug, module_entries in module_specs:
+        module_path = modules_dir / f"{slug}.md"
+        file_paths = [str(entry.file_meta.path) for entry in module_entries]
+        try:
+            existing = await asyncio.to_thread(module_path.read_text, "utf-8")
+        except FileNotFoundError:
+            existing = _build_fallback_module_md(module_name, module_entries)
+        updated = _rewrite_coverage_section(existing, file_paths, module_name)
+        await _atomic_write_text(module_path, updated)
+
+
+async def _classify_incremental_annotation_scope(
+    *,
+    root_path: Path,
+    changed_files: list[str],
+    deleted_files: list[str],
+    current_map: dict[str, Any],
+    historical_map: dict[str, Any],
+) -> str:
+    if changed_files and not deleted_files:
+        all_module_like = True
+        for rel_path in changed_files:
+            if current_map.get(rel_path) is None:
+                all_module_like = False
+                break
+            baseline = await load_file_baseline(rel_path, root_path=root_path)
+            if baseline is None:
+                all_module_like = False
+                break
+        if all_module_like:
+            return "module"
+
+    if changed_files and deleted_files:
+        created_items: list[tuple[str, str | None, str | None]] = []
+        deleted_items: list[tuple[str, str | None, str | None]] = []
+
+        for rel_path in changed_files:
+            baseline = await load_file_baseline(rel_path, root_path=root_path)
+            if baseline is not None:
+                return "agent_decide"
+            owner = current_map.get(rel_path)
+            current_hash = await _compute_file_hash(root_path / rel_path)
+            created_items.append((rel_path, getattr(owner, "module_id", None), current_hash))
+
+        for rel_path in deleted_files:
+            baseline = await load_file_baseline(rel_path, root_path=root_path)
+            owner = current_map.get(rel_path) or historical_map.get(rel_path)
+            deleted_items.append((rel_path, getattr(owner, "module_id", None), baseline.content_hash if baseline else None))
+
+        remaining_deleted = list(deleted_items)
+        matched = 0
+        for _, owner_id, new_hash in created_items:
+            match_idx = next(
+                (
+                    idx
+                    for idx, (_, deleted_owner_id, old_hash) in enumerate(remaining_deleted)
+                    if new_hash
+                    and old_hash
+                    and new_hash == old_hash
+                    and (owner_id is None or deleted_owner_id is None or owner_id == deleted_owner_id)
+                ),
+                None,
+            )
+            if match_idx is None:
+                return "agent_decide"
+            matched += 1
+            remaining_deleted.pop(match_idx)
+        if matched == len(created_items) and not remaining_deleted:
+            return "route"
+
+    return "agent_decide"
 
 
 # ============================================================================
@@ -3133,6 +3273,14 @@ async def _update_annotations_incremental(
         await manager.build_file_owner_maps()
     )
 
+    scope_hint = await _classify_incremental_annotation_scope(
+        root_path=root_path,
+        changed_files=changed_files,
+        deleted_files=deleted_files,
+        current_map=current_map,
+        historical_map=historical_map,
+    )
+
     affected_slugs: set[str] = set()
     force_full = False
 
@@ -3204,7 +3352,7 @@ async def _update_annotations_incremental(
         slug: (name, slug, me) for name, slug, me in module_specs
     }
 
-    # 只重写受影响的模块文档
+    # 只重写受影响的模块文档（或最小化更新覆盖文件）
     affected_specs = [
         specs_by_slug[slug]
         for slug in sorted(affected_slugs)
@@ -3215,7 +3363,17 @@ async def _update_annotations_incremental(
         await _write_annotations(entries, project_meta, root_path, model=model)
         return
 
-    await _write_module_files(affected_specs, modules_dir, model)
+    if scope_hint == "module":
+        await _write_module_files(affected_specs, modules_dir, model)
+        logger.info("annotations 增量预判: module，仅重写受影响模块文档")
+        return
+
+    if scope_hint == "route":
+        await _patch_module_coverage_sections(affected_specs, modules_dir)
+        logger.info("annotations 增量预判: route，仅更新覆盖文件并重渲染导航层")
+    else:
+        await _write_module_files(affected_specs, modules_dir, model)
+        logger.info("annotations 增量预判: agent_decide，沿用当前模块重写 + 导航重渲染路径")
 
     # 修复并重渲染导航树
     active_slugs = {slug for _, slug, _ in module_specs}

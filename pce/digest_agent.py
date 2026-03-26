@@ -53,10 +53,12 @@ logger = logging.getLogger(__name__)
 FIXED_SECTION_HEADINGS: tuple[str, ...] = (
     "覆盖文件",
     "核心职责",
-    "关键符号",
     "关键流程",
     "外部协作",
     "风险与约束",
+)
+LEGACY_OPTIONAL_SECTION_HEADINGS: tuple[str, ...] = (
+    "关键符号",
 )
 ALLOWED_EXTENSION_SECTION_PREFIXES: tuple[str, ...] = (
     "专题：",
@@ -171,6 +173,7 @@ class DigestTaskList:
             "note": item.note,
             "module_slug": item.module_slug,
             "module_name": delta.module_name if delta is not None else None,
+            "change_scope_hint": delta.change_scope_hint if delta is not None else "agent_decide",
             "changed_files_count": len(delta.changed_files) if delta is not None else 0,
             "related_insights_count": len(delta.related_insights) if delta is not None else 0,
             "external_context_count": len(delta.external_context) if delta is not None else 0,
@@ -418,6 +421,9 @@ class DigestAgent(BaseReActAgent):
                 "- 优先消化 digest_delta 中的 annotation_baseline、related_insights、changed_files、patch_blocks。",
                 "- 若 changed_files_count=0 且 related_insights_count>0，默认先基于 annotation_baseline 和 related_insights 直接修正文档，不要先调用 Serena。",
                 "- 若 digest_delta 已足够支撑认知修正，尽量直接 deliver 或 write_annotation_and_mark_done，不要无谓探索。",
+                "- 若 `change_scope_hint=route`，默认视为导航/挂载变化；尽量少改模块正文，只在覆盖文件或明显失真时做最小修正。",
+                "- 若 `change_scope_hint=module`，默认优先更新该模块正文，不要为了求完整而扩散到其它模块。",
+                "- 若 `change_scope_hint=agent_decide`，先基于事实判断影响层级，再决定是否需要实质改写模块正文。",
                 "- 若任务已给出 module_slug，先 read_annotation；只有 digest_delta 证据不足时再调用 Serena。",
                 "- 处理代码文件时优先使用 get_symbols_overview / find_symbol / search_for_pattern，避免大段 read_file。",
                 "- 同一 module_slug 的多个任务尽量连续处理，减少重复探索与重复写入。",
@@ -426,6 +432,7 @@ class DigestAgent(BaseReActAgent):
                 "",
                 "## 输入说明",
                 "- `changed_paths_preview` 是当前模块改动文件的预览，优先据此定位需要核对的 patch blocks。",
+                "- `change_scope_hint` 是轻量预判提示，不是强制命令；若实际证据冲突，以代码事实为准。",
                 "- `related_insights_count>0` 表示该模块存在待内化的短期认知，需结合 annotation_baseline 校验是否已过时。",
                 "- `insight_only=true` 表示当前没有代码差异文件，重点是把已有 insight 稳定沉淀到 annotation。",
                 "- `changed_files_count=0` 不代表该任务无价值，通常表示“仅有 insight 待沉淀”的模块任务。",
@@ -910,13 +917,19 @@ class DigestAgent(BaseReActAgent):
             raise ValueError(f"不支持的 operation: {operation!r}")
 
         if operation == "rewrite":
-            # 校验 6 个固定章节存在
+            # 校验固定章节存在；允许保留旧版的「关键符号」章节。
             parsed = self._parse_annotation(content, module_slug, ensure_fixed=False)
             headings = {s["heading"] for s in parsed["sections"]}
             missing = [h for h in FIXED_SECTION_HEADINGS if h not in headings]
             if missing:
                 raise ValueError(f"rewrite 缺少固定章节: {missing}")
-            invalid = [h for h in headings if h not in FIXED_SECTION_HEADINGS and not self._is_allowed_extra_heading(h)]
+            invalid = [
+                h
+                for h in headings
+                if h not in FIXED_SECTION_HEADINGS
+                and h not in LEGACY_OPTIONAL_SECTION_HEADINGS
+                and not self._is_allowed_extra_heading(h)
+            ]
             if invalid:
                 raise ValueError(f"rewrite 包含不受支持的扩展章节标题: {invalid}")
             return self._render_annotation(parsed)
@@ -933,7 +946,11 @@ class DigestAgent(BaseReActAgent):
         if target is None:
             raise ValueError(f"{operation} 操作必须提供 target（章节标题）")
 
-        if target not in FIXED_SECTION_HEADINGS and not self._is_allowed_extra_heading(target):
+        if (
+            target not in FIXED_SECTION_HEADINGS
+            and target not in LEGACY_OPTIONAL_SECTION_HEADINGS
+            and not self._is_allowed_extra_heading(target)
+        ):
             raise ValueError(
                 "扩展章节标题必须使用受控前缀: "
                 + ", ".join(ALLOWED_EXTENSION_SECTION_PREFIXES)
