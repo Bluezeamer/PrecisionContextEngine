@@ -133,7 +133,7 @@ async def main() -> None:
                       f"{len(area.module_slugs)} 个模块, fallback={area.is_fallback}")
 
             # 校验
-            from pce.indexer import _validate_navigation_tree
+            from pce.annotation_writer import _validate_navigation_tree
             all_slugs = {
                 ms for area in tree.areas for ms in area.module_slugs
             }

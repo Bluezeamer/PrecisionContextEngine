@@ -37,6 +37,7 @@ from .models import (
     FileMeta,
     IndexEntry,
     IndexSnapshot,
+    NavigationTree,
     ProjectMeta,
     SymbolKind,
     SymbolRef,
@@ -324,6 +325,51 @@ _MISSING_KIND_VALUES = {
 
 
 
+def _annotation_refresh_reason(root_path: Path) -> str | None:
+    """判断现有 annotations 是否需要在无代码变更时强制刷新。"""
+    annotations_dir = root_path / ".pce" / "annotations"
+    tree_path = annotations_dir / "navigation_tree.json"
+    index_path = annotations_dir / "index.md"
+    areas_dir = annotations_dir / "areas"
+
+    if not tree_path.exists():
+        return "缺少 navigation_tree.json"
+    if not index_path.exists():
+        return "缺少 index.md"
+    if not areas_dir.exists():
+        return "缺少 areas/ 目录"
+
+    try:
+        payload = json.loads(tree_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"navigation_tree.json 读取失败: {exc}"
+
+    expected_version = str(NavigationTree.model_fields["version"].default)
+    actual_version = str(payload.get("version") or "").strip()
+    if actual_version != expected_version:
+        return (
+            f"navigation_tree 版本过期: current={actual_version or '(missing)'} "
+            f"expected={expected_version}"
+        )
+
+    areas = payload.get("areas")
+    if not isinstance(areas, list) or not areas:
+        return "navigation_tree 缺少 areas"
+
+    try:
+        index_content = index_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return f"index.md 读取失败: {exc}"
+    if "## 区域入口" not in index_content:
+        return "index.md 缺少区域入口章节"
+
+    area_files = list(areas_dir.glob("*.md"))
+    if len(area_files) < len(areas):
+        return "areas 文档数量不足"
+
+    return None
+
+
 # ============================================================================
 # 认知文档生成（已迁出到 annotation_writer.py）
 # ============================================================================
@@ -535,7 +581,13 @@ async def build_index(
     # 渐进式认知导航(可降级)
     annotations_start = time.monotonic()
     try:
-        await _write_annotations(entries, project_meta, memory_root_path, model=model)
+        await _write_annotations(
+            entries,
+            project_meta,
+            memory_root_path,
+            model=model,
+            serena_client=serena_client,
+        )
     except Exception as e:
         logger.warning(f"写入项目认知导航失败(已降级): {e}")
     finally:
@@ -617,7 +669,28 @@ async def build_index_incremental(
     deleted = {path for path in (deleted_files or []) if should_track_deleted_path(path)}
 
     if not effective_changes and not deleted:
-        logger.info("无有效变更，跳过增量更新")
+        refresh_reason = _annotation_refresh_reason(memory_root_path)
+        if refresh_reason is None:
+            logger.info("无有效变更，跳过增量更新")
+            return existing
+
+        logger.info("无有效变更，但 annotations 需要刷新: %s", refresh_reason)
+        await _write_annotations(
+            existing.entries,
+            existing.project_meta,
+            memory_root_path,
+            model=model,
+            serena_client=serena_client,
+        )
+        try:
+            await _write_structure_md(
+                existing.entries,
+                memory_root_path,
+                model=model,
+                force_refresh=False,
+            )
+        except Exception as e:
+            logger.warning(f"刷新 structure.md 失败(已忽略): {e}")
         return existing
 
     logger.info(f"开始增量索引: {len(effective_changes)} 个变更, " f"{len(deleted)} 个删除")
@@ -694,6 +767,7 @@ async def build_index_incremental(
             changed_files=effective_changes,
             deleted_files=sorted(deleted),
             model=model,
+            serena_client=serena_client,
         )
     except Exception as e:
         logger.warning(f"增量更新项目认知导航失败(已降级): {e}")

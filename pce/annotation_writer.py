@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 import tomllib
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
@@ -35,9 +36,12 @@ from .memory import (
     _atomic_write_text,
     load_file_baseline,
 )
+from .module_annotation_contract import validate_module_annotation_markdown
 from .models import (
     AreaRecord,
     IndexEntry,
+    ModuleCognitionFacts,
+    ModuleNavRecord,
     ModuleRegistry,
     NavigationTree,
     ProjectMeta,
@@ -45,8 +49,11 @@ from .models import (
 from .module_registry import ModuleRegistryManager
 from .prompt_guard import build_prompt_budget, estimate_input_tokens, fit_text_to_budget
 from .serena_client import SerenaClient, SerenaClientError
+from .topology_cognition_agent import TopologyCognitionAgent
 
 logger = logging.getLogger(__name__)
+_TOPOLOGY_STAGE_MAX_ATTEMPTS = 3
+_TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS = 3
 
 # 常量（与 indexer.py 共享的导航路径常量）
 ANNOTATIONS_INDEX_FILE = "index.md"
@@ -976,6 +983,11 @@ def _annotation_root_dir(root_path: Path) -> Path:
     return root_path / ".pce" / ANNOTATIONS_DIR
 
 
+def _topology_debug_dir(root_path: Path) -> Path:
+    """返回 topology init 调试输出目录。"""
+    return _annotation_root_dir(root_path) / "_topology_debug"
+
+
 def _annotation_areas_dir(root_path: Path) -> Path:
     """返回 .pce/annotations/areas/ 目录路径。"""
     return _annotation_root_dir(root_path) / ANNOTATIONS_AREAS_DIR
@@ -1034,6 +1046,52 @@ def _format_exception_brief(exc: BaseException) -> str:
     if text:
         return f"{type(exc).__name__}: {text}"
     return f"{type(exc).__name__}: {exc!r}"
+
+
+async def _persist_topology_stage_debug(
+    root_path: Path,
+    *,
+    stage: str,
+    payload: Any,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """持久化 topology init 各阶段原始输出，便于排查结构漂移。"""
+    debug_dir = _topology_debug_dir(root_path)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "stage": stage,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "payload": payload,
+    }
+    if extra:
+        record["extra"] = extra
+    await _atomic_write_text(
+        debug_dir / f"{stage}.json",
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+async def _persist_topology_debug_error(
+    root_path: Path,
+    *,
+    stage: str,
+    message: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """持久化 topology init 阶段错误。"""
+    debug_dir = _topology_debug_dir(root_path)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "stage": stage,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "error": message,
+    }
+    if extra:
+        record["extra"] = extra
+    await _atomic_write_text(
+        debug_dir / f"{stage}_error.json",
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def _resolve_annotation_model(model: str | None) -> str | None:
@@ -2654,6 +2712,24 @@ def _repair_navigation_tree(
             [*fallback_order, *fallback_modules]
         )
 
+    # 至少保留 1 个非 fallback area，避免模型把所有模块都塞进 fallback
+    if not repaired_areas and fallback_modules:
+        logger.warning(
+            "navigation tree repair: 检测到 fallback-only 结构，自动生成默认主区域 core"
+        )
+        seed_modules = _dedupe_keep_order(fallback_modules[: min(len(fallback_modules), 8)])
+        repaired_areas.append(AreaRecord(
+            slug=_uniq_slug("core"),
+            display_name="核心模块",
+            summary="模型未给出稳定区域划分时的默认主区域。",
+            module_slugs=seed_modules,
+            recommended_order=seed_modules,
+            source_prefixes=[],
+            is_fallback=False,
+        ))
+        fallback_modules = [slug for slug in fallback_modules if slug not in set(seed_modules)]
+        fallback_order = [slug for slug in fallback_order if slug not in set(seed_modules)]
+
     fb_slug = tree.fallback_area_slug or NAVIGATION_FALLBACK_AREA_SLUG
     if fb_slug in used_area_slugs:
         fb_slug = _uniq_slug(NAVIGATION_FALLBACK_AREA_SLUG)
@@ -2859,6 +2935,13 @@ async def _generate_navigation_tree(
     return tree
 
 
+def _module_nav_record_by_slug(area: AreaRecord, slug: str) -> Any | None:
+    for module in area.modules:
+        if module.slug == slug:
+            return module
+    return None
+
+
 def _render_hierarchical_index_md(
     tree: NavigationTree,
     sections_by_slug: dict[str, dict[str, Any]],
@@ -2877,10 +2960,17 @@ def _render_hierarchical_index_md(
         "## 区域入口",
     ]
     for area in tree.areas:
-        previews = [
-            sections_by_slug.get(s, {}).get("name", s)
-            for s in area.module_slugs[:3]
-        ]
+        previews: list[str] = []
+        for slug in area.module_slugs[:3]:
+            section = sections_by_slug.get(slug, {})
+            module = _module_nav_record_by_slug(area, slug)
+            previews.append(
+                str(
+                    section.get("name")
+                    or getattr(module, "display_name", None)
+                    or slug
+                )
+            )
         preview_text = (
             f"；示例模块：{'、'.join(previews)}" if previews else ""
         )
@@ -2908,8 +2998,17 @@ def _render_area_md(
     if area.module_slugs:
         for slug in area.module_slugs:
             section = sections_by_slug.get(slug, {})
-            name = section.get("name", slug)
-            summary = _extract_section_summary(section) or "暂无模块摘要。"
+            module = _module_nav_record_by_slug(area, slug)
+            name = str(
+                section.get("name")
+                or getattr(module, "display_name", None)
+                or slug
+            )
+            summary = (
+                _extract_section_summary(section)
+                or str(getattr(module, "summary", "") or "").strip()
+                or "暂无模块摘要。"
+            )
             lines.append(
                 f"- [{name}](../modules/{slug}.md) (`{slug}`)：{summary}"
             )
@@ -2920,7 +3019,13 @@ def _render_area_md(
     ordered = area.recommended_order or area.module_slugs
     if ordered:
         for idx, slug in enumerate(ordered, start=1):
-            name = sections_by_slug.get(slug, {}).get("name", slug)
+            section = sections_by_slug.get(slug, {})
+            module = _module_nav_record_by_slug(area, slug)
+            name = str(
+                section.get("name")
+                or getattr(module, "display_name", None)
+                or slug
+            )
             lines.append(f"{idx}. [{name}](../modules/{slug}.md)")
     else:
         lines.append("1. 当前无推荐顺序。")
@@ -2983,19 +3088,22 @@ async def _stabilize_sections_with_registry(
     manager = ModuleRegistryManager(root_path)
     stabilized: list[dict[str, Any]] = []
     for section in sections:
+        cloned = dict(section)
+        cloned["file_paths"] = list(section.get("file_paths", []))
+        cloned["body_lines"] = list(section.get("body_lines", []))
         file_paths = [p for p in _dedupe_keep_order(section["file_paths"]) if p in entries_map]
         if not file_paths:
-            stabilized.append(section)
+            stabilized.append(cloned)
             continue
         record = await manager.get_or_create_module(
             display_name=section["name"],
             file_paths=file_paths,
             key_symbols=_extract_module_key_symbols([entries_map[p] for p in file_paths]),
         )
-        section["name"] = record.display_name
-        _update_section_file_list(section, file_paths)
-        _update_section_module_link(section, slug=record.slug)
-        stabilized.append(section)
+        cloned["name"] = record.display_name
+        _update_section_file_list(cloned, file_paths)
+        _update_section_module_link(cloned, slug=record.slug)
+        stabilized.append(cloned)
     return stabilized
 
 
@@ -3098,38 +3206,296 @@ async def _write_module_files(
         await _atomic_write_text(modules_dir / f"{slug}.md", content.rstrip() + "\n")
 
 
-async def _write_annotations(
+def _build_topology_discovery_facts(
+    entries_map: dict[str, IndexEntry],
+    root_path: Path,
+) -> dict[str, Any]:
+    """构建 topology init 的文件级 discovery facts。"""
+    top_dir_entries: dict[str, list[IndexEntry]] = defaultdict(list)
+    language_counter: Counter[str] = Counter()
+    file_facts: list[dict[str, Any]] = []
+
+    for entry in sorted(entries_map.values(), key=lambda item: str(item.file_meta.path)):
+        path_str = str(entry.file_meta.path)
+        parts = Path(path_str).parts
+        top_dir = f"{parts[0]}/" if len(parts) > 1 else "./"
+        top_dir_entries[top_dir].append(entry)
+        language_counter[entry.file_meta.language] += 1
+        file_facts.append({
+            "path": path_str,
+            "language": entry.file_meta.language,
+            "loc": entry.file_meta.loc,
+            "top_dir": top_dir,
+            "key_symbols": [sym.name for sym in entry.symbols[:3]],
+        })
+
+    top_level_dirs = [
+        {
+            "path": directory,
+            "file_count": len(items),
+            "languages": _format_language_summary(items, max_items=3),
+            "representatives": _select_representative_paths(items, max_items=4),
+        }
+        for directory, items in sorted(
+            top_dir_entries.items(),
+            key=lambda item: (-len(item[1]), item[0]),
+        )[:10]
+    ]
+    primary_language = (
+        language_counter.most_common(1)[0][0] if language_counter else "unknown"
+    )
+    return {
+        "project": {
+            "name": root_path.name,
+            "file_count": len(entries_map),
+            "primary_language": primary_language,
+            "top_level_dirs": top_level_dirs,
+        },
+        "files": file_facts,
+    }
+
+
+def _strip_markdown_emphasis(text: str) -> str:
+    return re.sub(r"[*_`]+", "", text).strip()
+
+
+def _module_nav_summary_from_cognition_fact(fact: Any) -> str:
+    candidates = [
+        *(list(getattr(fact, "core_responsibility", []) or [])),
+        *(list(getattr(fact, "key_flow", []) or [])),
+        *(list(getattr(fact, "external_collaboration", []) or [])),
+        *(list(getattr(fact, "risks_constraints", []) or [])),
+    ]
+    for item in candidates:
+        text = _strip_markdown_emphasis(" ".join(str(item).strip().split()))
+        if text:
+            return text
+    return ""
+
+
+def _truncate_sentence(text: str, *, max_chars: int) -> str:
+    normalized = " ".join(str(text).strip().split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _is_generic_project_summary(summary: str) -> bool:
+    text = " ".join(summary.strip().split())
+    if not text:
+        return True
+    return text.startswith("项目当前共 ") or text.startswith("共 ")
+
+
+def _is_generic_area_summary(summary: str) -> bool:
+    text = " ".join(summary.strip().split())
+    if not text:
+        return True
+    return (
+        text.startswith("主要覆盖 `")
+        or text.startswith("承接")
+        or text.startswith("覆盖 `")
+        or text.startswith("模型未给出稳定区域划分时")
+    )
+
+
+def _inject_section_summaries_from_cognition(
+    sections: list[dict[str, Any]],
+    cognition_facts: ModuleCognitionFacts,
+) -> list[dict[str, Any]]:
+    facts_by_slug = {fact.slug: fact for fact in cognition_facts.modules}
+    injected: list[dict[str, Any]] = []
+    for section in sections:
+        cloned = {
+            "name": section["name"],
+            "slug": section["slug"],
+            "file_paths": list(section.get("file_paths", [])),
+            "body_lines": list(section.get("body_lines", [])),
+        }
+        summary = _module_nav_summary_from_cognition_fact(facts_by_slug.get(section["slug"]))
+        if not summary:
+            section_name = str(section.get("name") or section.get("slug") or "").strip()
+            if section_name.startswith("补充归类 "):
+                summary = "当前用于承接尚未稳定并入主模块的文件与目录。"
+            elif section_name:
+                summary = f"主要负责 {section_name} 相关能力。"
+        if summary:
+            summary_line = f"职责：{_truncate_sentence(summary, max_chars=160)}"
+            replaced = False
+            new_body: list[str] = []
+            for line in cloned["body_lines"]:
+                if not replaced and re.match(r"^职责[:：]\s*", line.strip()):
+                    new_body.append(summary_line)
+                    replaced = True
+                else:
+                    new_body.append(line)
+            if not replaced:
+                insert_at = 1 if new_body and re.match(r"^文件[:：]\s*", new_body[0].strip()) else 0
+                new_body.insert(insert_at, summary_line)
+            cloned["body_lines"] = new_body
+        injected.append(cloned)
+    return injected
+
+
+def _enrich_tree_summaries_with_cognition(
+    tree: NavigationTree,
+    *,
+    sections_by_slug: dict[str, dict[str, Any]],
+    cognition_facts: ModuleCognitionFacts,
+) -> NavigationTree:
+    facts_by_slug = {fact.slug: fact for fact in cognition_facts.modules}
+    enriched_areas: list[AreaRecord] = []
+    derived_area_summaries: list[str] = []
+
+    for area in tree.areas:
+        summary = (area.summary or "").strip()
+        if _is_generic_area_summary(summary):
+            module_names: list[str] = []
+            module_summaries: list[str] = []
+            for slug in area.module_slugs:
+                section = sections_by_slug.get(slug, {})
+                module_names.append(str(section.get("name") or slug))
+                fact = facts_by_slug.get(slug)
+                module_summary = _module_nav_summary_from_cognition_fact(fact)
+                if module_summary:
+                    module_summaries.append(_truncate_sentence(module_summary, max_chars=72))
+                if len(module_summaries) >= 2:
+                    break
+            if module_summaries:
+                prefix = (
+                    f"围绕{'、'.join(module_names[:2])}等模块，"
+                    if len(area.module_slugs) > 1
+                    else ""
+                )
+                summary = prefix + "；".join(module_summaries[:2])
+            elif module_names:
+                summary = f"围绕{'、'.join(module_names[:3])}等模块展开。"
+        summary = _truncate_sentence(summary, max_chars=140)
+        if summary and not area.is_fallback:
+            derived_area_summaries.append(summary)
+        enriched_areas.append(area.model_copy(update={"summary": summary}))
+
+    project_summary = (tree.project_summary or "").strip()
+    if _is_generic_project_summary(project_summary):
+        non_fallback_names = [area.display_name for area in enriched_areas if not area.is_fallback]
+        project_parts: list[str] = []
+        if non_fallback_names:
+            project_parts.append(
+                f"项目围绕{'、'.join(non_fallback_names[:3])}等区域组织代码与能力。"
+            )
+        if derived_area_summaries:
+            project_parts.append(_truncate_sentence("；".join(derived_area_summaries[:2]), max_chars=180))
+        project_summary = "\n".join(part for part in project_parts if part).strip()
+        if not project_summary:
+            project_summary = tree.project_summary
+
+    return tree.model_copy(update={
+        "project_summary": project_summary,
+        "areas": enriched_areas,
+    })
+
+
+def _append_markdown_list_section(
+    lines: list[str],
+    heading: str,
+    items: list[str],
+    *,
+    omit_if_empty: bool = False,
+) -> None:
+    normalized = [str(item).strip() for item in items if str(item).strip()]
+    if omit_if_empty and not normalized:
+        return
+    lines.extend(["", f"## {heading}"])
+    for item in normalized:
+        lines.append(f"- {item}")
+
+
+def _render_module_md_from_cognition(
+    module_name: str,
+    module_entries: list[IndexEntry],
+    fact: Any | None,
+) -> str:
+    title = str(getattr(fact, "display_name", None) or module_name).strip() or module_name
+    coverage = [str(entry.file_meta.path) for entry in module_entries]
+    lines = [f"# {title}", "", "## 覆盖文件"]
+    for path in coverage:
+        lines.append(f"- {path}")
+
+    _append_markdown_list_section(
+        lines,
+        "核心职责",
+        list(getattr(fact, "core_responsibility", []) or []),
+    )
+    _append_markdown_list_section(
+        lines,
+        "关键流程",
+        list(getattr(fact, "key_flow", []) or []),
+    )
+    _append_markdown_list_section(
+        lines,
+        "外部协作",
+        list(getattr(fact, "external_collaboration", []) or []),
+    )
+    _append_markdown_list_section(
+        lines,
+        "风险与约束",
+        list(getattr(fact, "risks_constraints", []) or []),
+    )
+    _append_markdown_list_section(
+        lines,
+        "关键符号",
+        list(getattr(fact, "key_anchors", []) or []),
+        omit_if_empty=True,
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+async def _write_module_files_from_cognition(
+    module_specs: list[tuple[str, str, list[IndexEntry]]],
+    modules_dir: Path,
+    cognition_facts: ModuleCognitionFacts,
+) -> None:
+    facts_by_slug = {item.slug: item for item in cognition_facts.modules}
+    for module_name, slug, module_entries in module_specs:
+        fact = facts_by_slug.get(slug)
+        if fact is None:
+            content = _build_fallback_module_md(module_name, module_entries)
+        else:
+            content = _render_module_md_from_cognition(
+                module_name, module_entries, fact
+            )
+        await _atomic_write_text(modules_dir / f"{slug}.md", content.rstrip() + "\n")
+
+
+async def _write_empty_annotations(root_path: Path) -> None:
+    index_path = _annotation_index_path(root_path)
+    areas_dir = _annotation_areas_dir(root_path)
+    await _atomic_write_text(index_path, "# 项目认知导航\n\n当前暂无可导航模块。\n")
+    await _cleanup_stale_area_docs(areas_dir, set())
+    tree_path = _navigation_tree_path(root_path)
+    if tree_path.exists():
+        await asyncio.to_thread(tree_path.unlink, missing_ok=True)
+    await _cleanup_stale_annotation_docs(root_path, {Path(ANNOTATIONS_INDEX_FILE)})
+
+
+async def _prepare_annotation_payload(
     entries: list[IndexEntry],
     project_meta: ProjectMeta,
     root_path: Path,
-    model: str | None = None,
-) -> None:
-    """全量生成并写入三层树状认知导航。"""
-    index_path = _annotation_index_path(root_path)
-    areas_dir = _annotation_areas_dir(root_path)
-    modules_dir = _annotation_modules_dir(root_path)
-
-    if not entries:
-        await _atomic_write_text(
-            index_path, "# 项目认知导航\n\n当前暂无可导航模块。\n"
-        )
-        await _cleanup_stale_area_docs(areas_dir, set())
-        # 删除残留的 navigation_tree.json
-        tree_path = _navigation_tree_path(root_path)
-        if tree_path.exists():
-            await asyncio.to_thread(tree_path.unlink, missing_ok=True)
-        await _cleanup_stale_annotation_docs(
-            root_path, {Path(ANNOTATIONS_INDEX_FILE)}
-        )
-        return
-
-    # ── 阶段 1：模块发现与稳定化（保留原有逻辑不动）──
+    *,
+    model: str | None,
+) -> tuple[
+    dict[str, IndexEntry],
+    list[dict[str, Any]],
+    list[tuple[str, str, list[IndexEntry]]],
+]:
+    """执行模块发现与 registry 稳定化，返回后续渲染所需 payload。"""
     index_content = await _generate_index_md(entries, project_meta, model=model)
     if not index_content:
         logger.warning("认知导航 index.md 不可用，使用索引级回退模板")
         index_content = _build_fallback_index_md(entries)
 
-    entries_map = {str(e.file_meta.path): e for e in entries}
+    entries_map = {str(entry.file_meta.path): entry for entry in entries}
     _, sections = _split_index_md(index_content)
     sections = _dedupe_sections_by_slug(sections)
     sections = _merge_missing_sections(
@@ -3143,9 +3509,7 @@ async def _write_annotations(
         model=model,
     )
     sections = _dedupe_semantic_sections(sections)
-    sections = _append_fallback_sections_for_unassigned_entries(
-        sections, entries_map
-    )
+    sections = _append_fallback_sections_for_unassigned_entries(sections, entries_map)
     sections = await _stabilize_sections_with_registry(
         sections,
         root_path=root_path,
@@ -3157,49 +3521,27 @@ async def _write_annotations(
         logger.warning("认知导航解析为空，回退到结构化模板")
         index_content = _build_fallback_index_md(entries)
         _, sections = _split_index_md(index_content)
-        valid_sections, module_specs = _prepare_module_specs(
-            sections, entries_map
-        )
+        valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
 
-    # ── 阶段 2：树状导航生成 ──
-    sections_by_slug = {s["slug"]: s for s in valid_sections}
-    active_slugs = {slug for _, slug, _ in module_specs}
-    facts = _build_navigation_facts(valid_sections, entries_map, root_path)
+    return entries_map, valid_sections, module_specs
 
-    tree = await _generate_navigation_tree(facts, active_slugs, model=model)
-    if tree is None:
-        logger.warning("导航树生成失败，回退到确定性 fallback 方案")
-        tree = _build_fallback_navigation_tree(valid_sections, active_slugs)
 
-    tree = _repair_navigation_tree(
-        tree.model_copy(
-            update={"source_digest": str(facts["source_digest"])}
-        ),
-        active_slugs,
-    )
-    tree_errors = _validate_navigation_tree(tree, active_slugs)
-    if tree_errors:
-        logger.warning(
-            "导航树校验失败，改用目录前缀 fallback: %s",
-            " | ".join(tree_errors),
-        )
-        tree = _build_fallback_navigation_tree(valid_sections, active_slugs)
-        tree = _repair_navigation_tree(tree, active_slugs)
-
-    # 写入模块正文（路径不变，仍是 modules/*.md）
-    await _write_module_files(module_specs, modules_dir, model)
-
-    # 渲染并持久化层级导航文档
+async def _persist_annotation_outputs(
+    *,
+    root_path: Path,
+    tree: NavigationTree,
+    sections_by_slug: dict[str, dict[str, Any]],
+    module_specs: list[tuple[str, str, list[IndexEntry]]],
+) -> None:
+    index_path = _annotation_index_path(root_path)
+    areas_dir = _annotation_areas_dir(root_path)
     await _atomic_write_text(
         index_path,
         _render_hierarchical_index_md(tree, sections_by_slug),
     )
     await _atomic_write_text(
         _navigation_tree_path(root_path),
-        json.dumps(
-            tree.model_dump(mode="json"), ensure_ascii=False, indent=2
-        )
-        + "\n",
+        json.dumps(tree.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
     )
     areas_dir.mkdir(parents=True, exist_ok=True)
     for area in tree.areas:
@@ -3208,11 +3550,9 @@ async def _write_annotations(
             _render_area_md(area, sections_by_slug),
         )
 
-    # 缓存 area_slug 到 registry
     await _persist_navigation_area_cache(root_path, tree)
 
-    # 清理过期文件
-    valid_area_slugs = {a.slug for a in tree.areas}
+    valid_area_slugs = {area.slug for area in tree.areas}
     await _cleanup_stale_area_docs(areas_dir, valid_area_slugs)
 
     expected_files: set[Path] = {
@@ -3224,14 +3564,800 @@ async def _write_annotations(
         for _, slug, _ in module_specs
     )
     expected_files.update(
-        Path(ANNOTATIONS_AREAS_DIR) / f"{a.slug}.md" for a in tree.areas
+        Path(ANNOTATIONS_AREAS_DIR) / f"{area.slug}.md" for area in tree.areas
     )
     await _cleanup_stale_annotation_docs(root_path, expected_files)
 
+
+def _build_sections_from_navigation_tree(
+    tree: NavigationTree,
+) -> list[dict[str, Any]]:
+    """将 navigation_tree 中的模块入口恢复为 section 列表。"""
+    sections: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+    mounted_files: dict[str, str] = {}
+
+    for area in tree.areas:
+        for module in area.modules:
+            file_paths = _dedupe_keep_order(list(module.file_paths))
+            if not file_paths:
+                continue
+            if module.slug in seen_slugs:
+                raise ValueError(f"navigation_tree 模块 slug 重复: {module.slug}")
+            for file_path in file_paths:
+                prev = mounted_files.get(file_path)
+                if prev is not None and prev != module.slug:
+                    raise ValueError(
+                        f"navigation_tree 文件重复挂载: {file_path} 同时属于 {prev} / {module.slug}"
+                    )
+                mounted_files[file_path] = module.slug
+
+            body_lines = [f"文件：{', '.join(file_paths)}"]
+            summary = _truncate_sentence(str(module.summary or '').strip(), max_chars=160)
+            if summary:
+                body_lines.append(f"职责：{summary}")
+            body_lines.append(f"详细认知：.pce/annotations/modules/{module.slug}.md")
+            sections.append({
+                "name": module.display_name,
+                "slug": module.slug,
+                "file_paths": file_paths,
+                "body_lines": body_lines,
+            })
+            seen_slugs.add(module.slug)
+
+    return sections
+
+
+def _build_section_slug_aliases(
+    source_sections: list[dict[str, Any]],
+    target_sections: list[dict[str, Any]],
+) -> dict[str, str]:
+    """根据前后两轮 section 的覆盖文件建立 slug 别名映射。"""
+    target_by_files: dict[tuple[str, ...], str] = {}
+    for section in target_sections:
+        file_key = tuple(sorted(_dedupe_keep_order(section.get("file_paths", []))))
+        if file_key:
+            target_by_files[file_key] = section["slug"]
+
+    aliases: dict[str, str] = {}
+    for section in source_sections:
+        file_key = tuple(sorted(_dedupe_keep_order(section.get("file_paths", []))))
+        target_slug = target_by_files.get(file_key)
+        if file_key and target_slug and target_slug != section["slug"]:
+            aliases[section["slug"]] = target_slug
+    return aliases
+
+
+def _sync_tree_modules_from_sections(
+    tree: NavigationTree,
+    sections_by_slug: dict[str, dict[str, Any]],
+) -> NavigationTree:
+    """按 sections_by_slug 回填 tree 中的模块入口信息。"""
+    enriched_areas: list[AreaRecord] = []
+    for area in tree.areas:
+        modules = []
+        for slug in area.module_slugs:
+            section = sections_by_slug.get(slug)
+            if section is None:
+                continue
+            modules.append(ModuleNavRecord(
+                slug=slug,
+                display_name=section["name"],
+                summary=_extract_section_summary(section),
+                file_paths=list(section.get("file_paths", [])),
+            ))
+        enriched_areas.append(area.model_copy(update={"modules": modules}))
+    return tree.model_copy(update={"areas": enriched_areas})
+
+
+def _remap_navigation_tree_model_slugs(
+    tree: NavigationTree,
+    slug_aliases: dict[str, str],
+    sections_by_slug: dict[str, dict[str, Any]],
+) -> NavigationTree:
+    """将 tree 中的 module slug 统一映射为稳定 slug。"""
+    remapped_areas: list[AreaRecord] = []
+    for area in tree.areas:
+        module_slugs = _dedupe_keep_order([
+            slug_aliases.get(slug, slug) for slug in area.module_slugs
+        ])
+        recommended_order = _dedupe_keep_order([
+            slug_aliases.get(slug, slug) for slug in area.recommended_order
+        ])
+        remapped_areas.append(area.model_copy(update={
+            "module_slugs": module_slugs,
+            "recommended_order": recommended_order,
+        }))
+    remapped = tree.model_copy(update={"areas": remapped_areas})
+    return _sync_tree_modules_from_sections(remapped, sections_by_slug)
+
+
+def _remap_module_cognition_facts_model(
+    cognition_facts: ModuleCognitionFacts,
+    slug_aliases: dict[str, str],
+    sections_by_slug: dict[str, dict[str, Any]],
+) -> ModuleCognitionFacts:
+    """将模块认知事实统一映射为稳定 slug。"""
+    payload = _remap_module_cognition_payload_slugs(
+        cognition_facts.model_dump(mode="json"),
+        slug_aliases,
+    )
+    normalized = _coerce_module_cognition_facts(
+        payload,
+        expected_slugs=set(sections_by_slug),
+    )
+    modules = [
+        fact.model_copy(update={
+            "display_name": str(
+                sections_by_slug.get(fact.slug, {}).get("name") or fact.display_name
+            )
+        })
+        for fact in normalized.modules
+    ]
+    return ModuleCognitionFacts(modules=modules)
+
+
+def _coerce_topology_navigation_tree(
+    payload: dict[str, Any],
+    *,
+    facts: dict[str, Any],
+    active_slugs: set[str] | None,
+) -> NavigationTree:
+    def _listish_strings(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [
+                str(item).strip()
+                for item in value
+                if str(item).strip()
+            ]
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        return []
+
+    def _normalize_modules(value: Any) -> list[dict[str, Any]]:
+        normalized_modules: list[dict[str, Any]] = []
+        if not isinstance(value, list):
+            return normalized_modules
+        for raw_module in value:
+            if not isinstance(raw_module, dict):
+                continue
+            display_name = " ".join(str(raw_module.get("display_name") or "").split())
+            file_paths = _listish_strings(raw_module.get("file_paths"))
+            if not display_name or not file_paths:
+                continue
+            slug = " ".join(str(raw_module.get("slug") or "").split())
+            if not slug:
+                slug = ModuleRegistryManager.normalize_slug(
+                    display_name,
+                    file_paths=file_paths,
+                )
+            summary = " ".join(str(raw_module.get("summary") or "").split())
+            normalized_modules.append({
+                "slug": slug,
+                "display_name": display_name,
+                "summary": _truncate_sentence(summary, max_chars=160) if summary else "",
+                "file_paths": file_paths,
+            })
+        return normalized_modules
+
+    tree_payload = dict(payload)
+    raw_areas = payload.get("areas")
+    normalized_areas: list[dict[str, Any]] = []
+    if isinstance(raw_areas, list):
+        for raw_area in raw_areas:
+            if not isinstance(raw_area, dict):
+                continue
+            area = dict(raw_area)
+            modules = _normalize_modules(area.get("modules"))
+            area["modules"] = modules
+            area["module_slugs"] = (
+                [module["slug"] for module in modules]
+                if modules
+                else _listish_strings(area.get("module_slugs"))
+            )
+            recommended_order = area.get("recommended_order")
+            area["recommended_order"] = (
+                _listish_strings(recommended_order)
+                if isinstance(recommended_order, (list, str))
+                else []
+            )
+            if not area["recommended_order"] and area["module_slugs"]:
+                area["recommended_order"] = list(area["module_slugs"])
+            area["source_prefixes"] = _listish_strings(area.get("source_prefixes"))
+            normalized_areas.append(area)
+    tree_payload["areas"] = normalized_areas
+    tree_payload["source_digest"] = str(facts["source_digest"])
+    tree_payload["generated_at"] = datetime.now(UTC).isoformat()
+    tree = NavigationTree.model_validate(tree_payload)
+    effective_active_slugs = set(active_slugs or {
+        slug for area in tree.areas for slug in area.module_slugs
+    })
+    tree = _repair_navigation_tree(tree, effective_active_slugs)
+    errors = _validate_navigation_tree(tree, effective_active_slugs)
+    if errors:
+        raise ValueError(" | ".join(errors))
+    return tree
+
+
+def _remap_module_cognition_payload_slugs(
+    payload: dict[str, Any],
+    slug_aliases: dict[str, str],
+) -> dict[str, Any]:
+    """将 module_cognition_facts payload 中的旧 module slug 归一化到稳定 slug。"""
+    if not slug_aliases:
+        return payload
+    normalized = dict(payload)
+    raw_modules = payload.get("modules")
+    remapped_modules: list[dict[str, Any]] = []
+    if isinstance(raw_modules, list):
+        for raw_item in raw_modules:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            slug = str(item.get("slug") or "").strip()
+            if slug:
+                item["slug"] = slug_aliases.get(slug, slug)
+            remapped_modules.append(item)
+    normalized["modules"] = remapped_modules
+    return normalized
+
+
+def _coerce_module_cognition_facts(
+    payload: dict[str, Any],
+    *,
+    expected_slugs: set[str],
+) -> ModuleCognitionFacts:
+    def _listish(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        return []
+
+    def _normalize_lines(
+        items: list[str],
+        *,
+        limit: int,
+        max_chars: int | None = None,
+    ) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            text = " ".join(str(raw).strip().split())
+            if not text:
+                continue
+            if max_chars is not None and len(text) > max_chars:
+                text = text[: max_chars - 3].rstrip() + "..."
+            if text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    normalized_payload = dict(payload)
+    normalized_modules: list[dict[str, Any]] = []
+    for raw_item in payload.get("modules", []) if isinstance(payload.get("modules"), list) else []:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        for key in (
+            "core_responsibility",
+            "key_flow",
+            "external_collaboration",
+            "risks_constraints",
+            "key_anchors",
+        ):
+            item[key] = _listish(item.get(key))
+        normalized_modules.append(item)
+    normalized_payload["modules"] = normalized_modules
+
+    facts = ModuleCognitionFacts.model_validate(normalized_payload)
+    filtered = []
+    seen: set[str] = set()
+    for item in facts.modules:
+        if item.slug not in expected_slugs or item.slug in seen:
+            continue
+        seen.add(item.slug)
+        filtered.append(
+            item.model_copy(
+                update={
+                    "core_responsibility": _normalize_lines(
+                        list(item.core_responsibility), limit=3, max_chars=180
+                    ),
+                    "key_flow": _normalize_lines(
+                        list(item.key_flow), limit=3, max_chars=220
+                    ),
+                    "external_collaboration": _normalize_lines(
+                        list(item.external_collaboration), limit=3, max_chars=180
+                    ),
+                    "risks_constraints": _normalize_lines(
+                        list(item.risks_constraints), limit=3, max_chars=180
+                    ),
+                    "key_anchors": _normalize_lines(
+                        list(item.key_anchors), limit=2, max_chars=120
+                    ),
+                }
+            )
+        )
+    return ModuleCognitionFacts(modules=filtered)
+
+
+def _is_topology_default_core_area(area: AreaRecord) -> bool:
+    return (
+        not area.is_fallback
+        and area.display_name == "核心模块"
+        and area.summary == "模型未给出稳定区域划分时的默认主区域。"
+    )
+
+
+def _assert_navigation_tree_not_fallback_only(tree: NavigationTree) -> None:
+    non_fallback_areas = [area for area in tree.areas if not area.is_fallback]
+    if len(non_fallback_areas) == 1 and _is_topology_default_core_area(non_fallback_areas[0]):
+        raise ValueError("navigation_tree 退化为默认 core/fallback 结构，需重新生成")
+
+
+def _build_navigation_retry_feedback(exc: BaseException, *, attempt: int, max_attempts: int) -> str:
+    return "\n".join([
+        f"上一次 `navigation_tree` 输出未通过校验（第 {attempt}/{max_attempts} 次尝试）。",
+        f"错误信息：{_format_exception_brief(exc)}",
+        "请基于你已经收集到的证据修正导航树。",
+        "要求：给出真实的项目概括、稳定的 areas 划分、每个 area 下的 modules 划分，以及 area/module 摘要。",
+        "禁止退化为粗糙的 core/fallback 导航；若证据不足，请保持较粗但语义明确的区域划分。",
+    ])
+
+
+def _build_area_retry_feedback(
+    area: AreaRecord,
+    *,
+    attempt: int,
+    max_attempts: int,
+    pending_modules: list[str],
+    invalid_modules: dict[str, list[str]],
+    stage_error: BaseException | None,
+) -> str:
+    lines = [
+        f"当前 area `{area.slug}` / {area.display_name} 尚未完成（第 {attempt}/{max_attempts} 次尝试后）。",
+        "请继续处理当前 area，仅补齐未完成或无效的模块文档；已完成且有效的模块无需重写。",
+    ]
+    if stage_error is not None:
+        lines.append(f"本轮阶段错误：{_format_exception_brief(stage_error)}")
+    if pending_modules:
+        lines.append("缺失模块文档：" + ", ".join(pending_modules))
+    if invalid_modules:
+        lines.append("无效模块文档：")
+        for slug, errors in invalid_modules.items():
+            lines.append(f"- {slug}: {' | '.join(errors)}")
+    lines.extend([
+        "请根据错误提示修正文档，再次调用 write_module_annotation。",
+        "当前 area 全部完成后，再调用 mark_area_done(area_slug=..., note=...)。",
+    ])
+    return "\n".join(lines)
+
+
+def _collect_area_module_doc_status(
+    area: AreaRecord,
+    *,
+    modules_dir: Path,
+    module_specs_by_slug: dict[str, tuple[str, str, list[IndexEntry]]],
+    area_started_ns: int,
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    completed: list[str] = []
+    pending: list[str] = []
+    invalid: dict[str, list[str]] = {}
+
+    for slug in area.module_slugs:
+        path = modules_dir / f"{slug}.md"
+        if not path.exists():
+            pending.append(slug)
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            pending.append(slug)
+            continue
+        if stat.st_mtime_ns < area_started_ns:
+            pending.append(slug)
+            continue
+
+        _, _, module_entries = module_specs_by_slug[slug]
+        expected_paths = [str(entry.file_meta.path) for entry in module_entries]
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            invalid[slug] = [f"读取失败: {exc}"]
+            continue
+
+        errors = validate_module_annotation_markdown(
+            content,
+            expected_file_paths=expected_paths,
+            require_core_responsibility=True,
+        )
+        if errors:
+            invalid[slug] = errors
+            continue
+        completed.append(slug)
+
+    return completed, pending, invalid
+
+
+async def _write_area_fallback_modules(
+    area: AreaRecord,
+    *,
+    modules_dir: Path,
+    module_specs_by_slug: dict[str, tuple[str, str, list[IndexEntry]]],
+    target_slugs: list[str],
+) -> None:
+    for slug in target_slugs:
+        module_name, _, module_entries = module_specs_by_slug[slug]
+        await _atomic_write_text(
+            modules_dir / f"{slug}.md",
+            _build_fallback_module_md(module_name, module_entries),
+        )
+
+
+async def _write_annotations_via_topology_agent(
+    entries: list[IndexEntry],
+    project_meta: ProjectMeta,
+    root_path: Path,
+    *,
+    serena_client: SerenaClient,
+    model: str | None,
+) -> None:
+    """使用 topology cognition agent 生成轻量 init 认知。"""
+    if not entries:
+        await _write_empty_annotations(root_path)
+        return
+
+    modules_dir = _annotation_modules_dir(root_path)
+    entries_map = {str(entry.file_meta.path): entry for entry in entries}
+    discovery_facts = _build_topology_discovery_facts(entries_map, root_path)
+
+    agent = TopologyCognitionAgent(
+        project_root=root_path,
+        discovery_facts=discovery_facts,
+        model=model,
+    )
+    messages = agent.build_initial_messages()
+    raw_tree: NavigationTree | None = None
+    valid_sections: list[dict[str, Any]] | None = None
+    module_specs: list[tuple[str, str, list[IndexEntry]]] | None = None
+    stable_tree: NavigationTree | None = None
+    stable_sections_by_slug: dict[str, dict[str, Any]] | None = None
+
+    last_navigation_exc: BaseException | None = None
+    for attempt in range(1, _TOPOLOGY_STAGE_MAX_ATTEMPTS + 1):
+        logger.info(
+            "topology init stage start: navigation_tree attempt=%d/%d",
+            attempt,
+            _TOPOLOGY_STAGE_MAX_ATTEMPTS,
+        )
+        try:
+            navigation_payload = await agent.run_stage(
+                stage="navigation_tree",
+                messages=messages,
+                serena_client=serena_client,
+            )
+            if not isinstance(navigation_payload, dict):
+                raise ValueError("navigation_tree payload 必须为 object")
+            await _persist_topology_stage_debug(
+                root_path,
+                stage="navigation_tree",
+                payload=navigation_payload,
+                extra={"attempt": attempt},
+            )
+
+            raw_tree = _coerce_topology_navigation_tree(
+                navigation_payload,
+                facts={"source_digest": "topology-init"},
+                active_slugs=None,
+            )
+            _assert_navigation_tree_not_fallback_only(raw_tree)
+            raw_sections = _build_sections_from_navigation_tree(raw_tree)
+            valid_sections, raw_module_specs = _prepare_module_specs(raw_sections, entries_map)
+            if not valid_sections:
+                raise ValueError("navigation_tree 解析后未得到有效模块规格")
+
+            raw_sections_by_slug = {section["slug"]: section for section in valid_sections}
+            raw_active_slugs = {slug for _, slug, _ in raw_module_specs}
+            raw_tree = _repair_navigation_tree(
+                raw_tree.model_copy(update={
+                    "generated_at": datetime.now(UTC),
+                    "source_digest": _compute_source_digest(valid_sections),
+                }),
+                raw_active_slugs,
+            )
+            raw_tree = _sync_tree_modules_from_sections(raw_tree, raw_sections_by_slug)
+            _assert_navigation_tree_not_fallback_only(raw_tree)
+            tree_errors = _validate_navigation_tree(raw_tree, raw_active_slugs)
+            if tree_errors:
+                raise ValueError(" | ".join(tree_errors))
+
+            stabilized_sections = await _stabilize_sections_with_registry(
+                valid_sections,
+                root_path=root_path,
+                entries_map=entries_map,
+            )
+            stabilized_sections = _dedupe_sections_by_slug(stabilized_sections)
+            stabilized_sections, module_specs = _prepare_module_specs(
+                stabilized_sections,
+                entries_map,
+            )
+            if not stabilized_sections:
+                raise ValueError("registry 稳定化后未得到有效模块规格")
+
+            stable_sections_by_slug = {
+                section["slug"]: section for section in stabilized_sections
+            }
+            stable_active_slugs = {slug for _, slug, _ in module_specs}
+            slug_aliases = _build_section_slug_aliases(valid_sections, stabilized_sections)
+            if slug_aliases:
+                logger.info(
+                    "topology slug aliases stabilized: %s",
+                    ", ".join(
+                        f"{src}->{dst}" for src, dst in sorted(slug_aliases.items())
+                    ),
+                )
+            stable_tree = _remap_navigation_tree_model_slugs(
+                raw_tree,
+                slug_aliases,
+                stable_sections_by_slug,
+            )
+            stable_tree = _repair_navigation_tree(
+                stable_tree.model_copy(update={
+                    "generated_at": datetime.now(UTC),
+                    "source_digest": _compute_source_digest(stabilized_sections),
+                }),
+                stable_active_slugs,
+            )
+            stable_tree = _sync_tree_modules_from_sections(stable_tree, stable_sections_by_slug)
+            _assert_navigation_tree_not_fallback_only(stable_tree)
+            tree_errors = _validate_navigation_tree(stable_tree, stable_active_slugs)
+            if tree_errors:
+                raise ValueError(" | ".join(tree_errors))
+
+            logger.info("topology init stage ok: navigation_tree attempt=%d", attempt)
+            break
+        except Exception as exc:
+            last_navigation_exc = exc
+            await _persist_topology_debug_error(
+                root_path,
+                stage="navigation_tree",
+                message=_format_exception_brief(exc),
+                extra={"attempt": attempt},
+            )
+            if attempt >= _TOPOLOGY_STAGE_MAX_ATTEMPTS:
+                raise RuntimeError(f"navigation_tree stage failed after retries: {exc}") from exc
+            messages.append({
+                "role": "user",
+                "content": _build_navigation_retry_feedback(
+                    exc,
+                    attempt=attempt,
+                    max_attempts=_TOPOLOGY_STAGE_MAX_ATTEMPTS,
+                ),
+            })
+
+    if (
+        raw_tree is None
+        or valid_sections is None
+        or module_specs is None
+        or stable_tree is None
+        or stable_sections_by_slug is None
+    ):
+        raise RuntimeError(f"navigation_tree stage failed: {last_navigation_exc}")
+
+    await _persist_annotation_outputs(
+        root_path=root_path,
+        tree=stable_tree,
+        sections_by_slug=stable_sections_by_slug,
+        module_specs=module_specs,
+    )
+
+    module_specs_by_slug = {
+        slug: (module_name, slug, module_entries)
+        for module_name, slug, module_entries in module_specs
+    }
+    total_fallback_modules = 0
+
+    for area in stable_tree.areas:
+        if not area.module_slugs:
+            continue
+        area_context = {
+            "project_summary": stable_tree.project_summary,
+            "area_slug": area.slug,
+            "area_display_name": area.display_name,
+            "area_summary": area.summary,
+            "modules": [
+                {
+                    "slug": module.slug,
+                    "display_name": module.display_name,
+                    "summary": module.summary,
+                    "file_paths": list(module.file_paths),
+                }
+                for module in area.modules
+            ],
+        }
+        area_started_ns = time.time_ns()
+        pending_modules = list(area.module_slugs)
+        invalid_modules: dict[str, list[str]] = {}
+
+        for attempt in range(1, _TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS + 1):
+            logger.info(
+                "topology init stage start: write_area_modules area=%s attempt=%d/%d",
+                area.slug,
+                attempt,
+                _TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS,
+            )
+            stage_error: BaseException | None = None
+            try:
+                area_result = await agent.run_stage(
+                    stage="write_area_modules",
+                    messages=messages,
+                    serena_client=serena_client,
+                    stage_context=area_context,
+                )
+                await _persist_topology_stage_debug(
+                    root_path,
+                    stage=f"write_area_modules_{area.slug}",
+                    payload=area_result,
+                    extra={"attempt": attempt},
+                )
+            except Exception as exc:
+                stage_error = exc
+                await _persist_topology_debug_error(
+                    root_path,
+                    stage=f"write_area_modules_{area.slug}",
+                    message=_format_exception_brief(exc),
+                    extra={"attempt": attempt},
+                )
+
+            completed_modules, pending_modules, invalid_modules = _collect_area_module_doc_status(
+                area,
+                modules_dir=modules_dir,
+                module_specs_by_slug=module_specs_by_slug,
+                area_started_ns=area_started_ns,
+            )
+            if not pending_modules and not invalid_modules:
+                logger.info(
+                    "topology init stage ok: write_area_modules area=%s modules=%d",
+                    area.slug,
+                    len(completed_modules),
+                )
+                break
+
+            if attempt < _TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS:
+                messages.append({
+                    "role": "user",
+                    "content": _build_area_retry_feedback(
+                        area,
+                        attempt=attempt,
+                        max_attempts=_TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS,
+                        pending_modules=pending_modules,
+                        invalid_modules=invalid_modules,
+                        stage_error=stage_error,
+                    ),
+                })
+
+        if pending_modules or invalid_modules:
+            fallback_targets = sorted(set([*pending_modules, *invalid_modules]))
+            total_fallback_modules += len(fallback_targets)
+            logger.warning(
+                "area=%s 在多轮尝试后仍未补齐，改用逐模块 fallback: %s",
+                area.slug,
+                ", ".join(fallback_targets),
+            )
+            await _write_area_fallback_modules(
+                area,
+                modules_dir=modules_dir,
+                module_specs_by_slug=module_specs_by_slug,
+                target_slugs=fallback_targets,
+            )
+
+    logger.info(
+        "Topology agent 认知导航写入完成: %d 个区域, %d 个模块文档, fallback_modules=%d",
+        len(stable_tree.areas),
+        len(module_specs),
+        total_fallback_modules,
+    )
+
+
+async def _write_annotations_legacy(
+    entries: list[IndexEntry],
+    project_meta: ProjectMeta,
+    root_path: Path,
+    model: str | None = None,
+) -> None:
+    """全量生成并写入三层树状认知导航。"""
+    modules_dir = _annotation_modules_dir(root_path)
+
+    if not entries:
+        await _write_empty_annotations(root_path)
+        return
+
+    entries_map, valid_sections, module_specs = await _prepare_annotation_payload(
+        entries,
+        project_meta,
+        root_path,
+        model=model,
+    )
+
+    sections_by_slug = {section["slug"]: section for section in valid_sections}
+    active_slugs = {slug for _, slug, _ in module_specs}
+    facts = _build_navigation_facts(valid_sections, entries_map, root_path)
+
+    tree = await _generate_navigation_tree(facts, active_slugs, model=model)
+    if tree is None:
+        logger.warning("导航树生成失败，回退到确定性 fallback 方案")
+        tree = _build_fallback_navigation_tree(valid_sections, active_slugs)
+
+    tree = _repair_navigation_tree(
+        tree.model_copy(update={"source_digest": str(facts["source_digest"])}),
+        active_slugs,
+    )
+    tree_errors = _validate_navigation_tree(tree, active_slugs)
+    if tree_errors:
+        logger.warning(
+            "导航树校验失败，改用目录前缀 fallback: %s",
+            " | ".join(tree_errors),
+        )
+        tree = _build_fallback_navigation_tree(valid_sections, active_slugs)
+        tree = _repair_navigation_tree(tree, active_slugs)
+
+    injected_sections = _inject_section_summaries_from_cognition(
+        valid_sections,
+        ModuleCognitionFacts(),
+    )
+    injected_sections_by_slug = {
+        section["slug"]: section for section in injected_sections
+    }
+    enriched_tree = _enrich_tree_summaries_with_cognition(
+        tree,
+        sections_by_slug=injected_sections_by_slug,
+        cognition_facts=ModuleCognitionFacts(),
+    )
+
+    await _write_module_files(module_specs, modules_dir, model)
+    await _persist_annotation_outputs(
+        root_path=root_path,
+        tree=enriched_tree,
+        sections_by_slug=injected_sections_by_slug,
+        module_specs=module_specs,
+    )
+
     logger.info(
         "树状认知导航写入完成: %d 个区域, %d 个模块文档",
-        len(tree.areas),
+        len(enriched_tree.areas),
         len(module_specs),
+    )
+
+
+async def _write_annotations(
+    entries: list[IndexEntry],
+    project_meta: ProjectMeta,
+    root_path: Path,
+    model: str | None = None,
+    *,
+    serena_client: SerenaClient | None = None,
+) -> None:
+    """全量生成认知导航；有 Serena 时强制走 topology agent。"""
+    if serena_client is not None:
+        await _write_annotations_via_topology_agent(
+            entries,
+            project_meta,
+            root_path,
+            serena_client=serena_client,
+            model=model,
+        )
+        return
+
+    await _write_annotations_legacy(
+        entries,
+        project_meta,
+        root_path,
+        model=model,
     )
 
 
@@ -3243,6 +4369,7 @@ async def _update_annotations_incremental(
     changed_files: list[str],
     deleted_files: list[str],
     model: str | None = None,
+    serena_client: SerenaClient | None = None,
 ) -> None:
     """增量更新树状导航。
 
@@ -3259,12 +4386,35 @@ async def _update_annotations_incremental(
     tree_path = _navigation_tree_path(root_path)
     try:
         raw_tree = await asyncio.to_thread(tree_path.read_text, "utf-8")
-        tree = NavigationTree.model_validate(json.loads(raw_tree))
+        tree_payload = json.loads(raw_tree)
+        expected_version = str(NavigationTree.model_fields["version"].default)
+        actual_version = str(tree_payload.get("version") or "").strip()
+        if actual_version != expected_version:
+            logger.info(
+                "现有 navigation_tree 版本过期(current=%s, expected=%s)，降级为全量认知文档重建",
+                actual_version or "(missing)",
+                expected_version,
+            )
+            await _write_annotations(
+                entries,
+                project_meta,
+                root_path,
+                model=model,
+                serena_client=serena_client,
+            )
+            return
+        tree = NavigationTree.model_validate(tree_payload)
     except Exception:
         logger.info(
             "未找到可用 navigation_tree.json，降级为全量认知文档重建"
         )
-        await _write_annotations(entries, project_meta, root_path, model=model)
+        await _write_annotations(
+            entries,
+            project_meta,
+            root_path,
+            model=model,
+            serena_client=serena_client,
+        )
         return
 
     # 从 module_registry 确定 ownership（不再从 index.md 反查）
@@ -3301,7 +4451,13 @@ async def _update_annotations_incremental(
 
     if force_full:
         logger.info("增量 ownership 不完整，降级为全量认知文档重建")
-        await _write_annotations(entries, project_meta, root_path, model=model)
+        await _write_annotations(
+            entries,
+            project_meta,
+            root_path,
+            model=model,
+            serena_client=serena_client,
+        )
         return
 
     if not affected_slugs:
@@ -3314,7 +4470,13 @@ async def _update_annotations_incremental(
             "受影响模块数 %d 超出局部重渲染阈值，降级为全量认知文档重建",
             len(affected_slugs),
         )
-        await _write_annotations(entries, project_meta, root_path, model=model)
+        await _write_annotations(
+            entries,
+            project_meta,
+            root_path,
+            model=model,
+            serena_client=serena_client,
+        )
         return
 
     # 局部更新路径：重写受影响模块文档 + 重渲染导航入口
@@ -3360,7 +4522,13 @@ async def _update_annotations_incremental(
     ]
     if not affected_specs:
         logger.info("受影响模块无可写入规格，降级为全量认知文档重建")
-        await _write_annotations(entries, project_meta, root_path, model=model)
+        await _write_annotations(
+            entries,
+            project_meta,
+            root_path,
+            model=model,
+            serena_client=serena_client,
+        )
         return
 
     if scope_hint == "module":
@@ -3390,16 +4558,31 @@ async def _update_annotations_incremental(
             "现有导航树不再可信，降级为全量认知文档重建: %s",
             " | ".join(tree_errors),
         )
-        await _write_annotations(entries, project_meta, root_path, model=model)
+        await _write_annotations(
+            entries,
+            project_meta,
+            root_path,
+            model=model,
+            serena_client=serena_client,
+        )
         return
 
-    sections_by_slug = {s["slug"]: s for s in valid_sections}
+    injected_sections = _inject_section_summaries_from_cognition(
+        valid_sections,
+        ModuleCognitionFacts(),
+    )
+    sections_by_slug = {s["slug"]: s for s in injected_sections}
+    enriched_tree = _enrich_tree_summaries_with_cognition(
+        tree,
+        sections_by_slug=sections_by_slug,
+        cognition_facts=ModuleCognitionFacts(),
+    )
     await _atomic_write_text(
         index_path,
-        _render_hierarchical_index_md(tree, sections_by_slug),
+        _render_hierarchical_index_md(enriched_tree, sections_by_slug),
     )
     areas_dir.mkdir(parents=True, exist_ok=True)
-    for area in tree.areas:
+    for area in enriched_tree.areas:
         await _atomic_write_text(
             areas_dir / f"{area.slug}.md",
             _render_area_md(area, sections_by_slug),
@@ -3407,12 +4590,12 @@ async def _update_annotations_incremental(
     await _atomic_write_text(
         tree_path,
         json.dumps(
-            tree.model_dump(mode="json"), ensure_ascii=False, indent=2
+            enriched_tree.model_dump(mode="json"), ensure_ascii=False, indent=2
         )
         + "\n",
     )
-    await _persist_navigation_area_cache(root_path, tree)
-    await _cleanup_stale_area_docs(areas_dir, {a.slug for a in tree.areas})
+    await _persist_navigation_area_cache(root_path, enriched_tree)
+    await _cleanup_stale_area_docs(areas_dir, {a.slug for a in enriched_tree.areas})
 
     expected_files: set[Path] = {
         Path(ANNOTATIONS_INDEX_FILE),

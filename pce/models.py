@@ -438,12 +438,26 @@ class ModuleRegistry(BaseSchema):
 # ============================================================================
 
 
+class ModuleNavRecord(BaseSchema):
+    """导航树中的模块入口记录。"""
+
+    slug: NonEmptyStr = Field(..., description="模块稳定 slug")
+    display_name: NonEmptyStr = Field(..., description="模块展示名")
+    summary: str = Field(default="", description="模块一句话入口摘要")
+    file_paths: list[NonEmptyStr] = Field(
+        default_factory=list, description="该模块覆盖的真实文件路径"
+    )
+
+
 class AreaRecord(BaseSchema):
     """树状认知导航中的区域记录。"""
 
     slug: NonEmptyStr = Field(..., description="区域稳定 slug")
     display_name: NonEmptyStr = Field(..., description="区域展示名")
     summary: str = Field(default="", description="区域一句话摘要")
+    modules: list[ModuleNavRecord] = Field(
+        default_factory=list, description="该区域下的模块入口列表"
+    )
     module_slugs: list[NonEmptyStr] = Field(
         default_factory=list, description="挂载到该区域的模块 slug 列表"
     )
@@ -459,9 +473,46 @@ class AreaRecord(BaseSchema):
     @classmethod
     def _compat_title(cls, values: Any) -> Any:
         """兼容旧代码中使用 title= 创建 AreaRecord 的场景。"""
-        if isinstance(values, dict) and "title" in values and "display_name" not in values:
-            values["display_name"] = values.pop("title")
+        if isinstance(values, dict):
+            if "title" in values and "display_name" not in values:
+                values["display_name"] = values.pop("title")
+            raw_modules = values.get("modules")
+            if not values.get("module_slugs") and isinstance(raw_modules, list):
+                module_slugs: list[str] = []
+                for item in raw_modules:
+                    if isinstance(item, dict):
+                        slug = str(item.get("slug") or "").strip()
+                    else:
+                        slug = str(getattr(item, "slug", "") or "").strip()
+                    if slug:
+                        module_slugs.append(slug)
+                values["module_slugs"] = module_slugs
         return values
+
+    @model_validator(mode="after")
+    def _sync_modules(self) -> "AreaRecord":
+        """保证 modules 与 module_slugs 在模型内保持一致。"""
+        if not self.modules:
+            return self
+
+        modules_by_slug = {module.slug: module for module in self.modules}
+        ordered_slugs = list(self.module_slugs) or [module.slug for module in self.modules]
+        normalized_modules: list[ModuleNavRecord] = []
+        seen: set[str] = set()
+        for slug in ordered_slugs:
+            module = modules_by_slug.get(slug)
+            if module is None or slug in seen:
+                continue
+            normalized_modules.append(module)
+            seen.add(slug)
+        for module in self.modules:
+            if module.slug in seen:
+                continue
+            normalized_modules.append(module)
+            seen.add(module.slug)
+        self.modules = normalized_modules
+        self.module_slugs = [module.slug for module in normalized_modules]
+        return self
 
     @property
     def title(self) -> str:
@@ -472,7 +523,7 @@ class AreaRecord(BaseSchema):
 class NavigationTree(BaseSchema):
     """三层认知导航的结构树（项目→区域→模块）。"""
 
-    version: str = Field(default="2", description="结构树版本号")
+    version: str = Field(default="4", description="结构树版本号")
     generated_at: UTCDateTime = Field(..., description="最近生成时间（UTC）")
     project_summary: str = Field(default="", description="项目级一句话概览")
     fallback_area_slug: NonEmptyStr = Field(
@@ -499,6 +550,36 @@ class NavigationTree(BaseSchema):
 
 # 兼容旧引用
 AnnotationTree = NavigationTree
+
+
+class ModuleCognitionFact(BaseSchema):
+    """模块级轻量认知事实。"""
+
+    slug: NonEmptyStr = Field(..., description="模块稳定 slug")
+    display_name: NonEmptyStr = Field(..., description="模块展示名")
+    core_responsibility: list[NonEmptyStr] = Field(
+        default_factory=list, description="模块核心职责（1-3 行为宜）"
+    )
+    key_flow: list[NonEmptyStr] = Field(
+        default_factory=list, description="关键流程或主链路（可为空）"
+    )
+    external_collaboration: list[NonEmptyStr] = Field(
+        default_factory=list, description="外部协作边界（可为空）"
+    )
+    risks_constraints: list[NonEmptyStr] = Field(
+        default_factory=list, description="风险与约束（可为空）"
+    )
+    key_anchors: list[NonEmptyStr] = Field(
+        default_factory=list, description="少量稳定锚点（默认可为空）"
+    )
+
+
+class ModuleCognitionFacts(BaseSchema):
+    """模块级认知事实集合。"""
+
+    modules: list[ModuleCognitionFact] = Field(
+        default_factory=list, description="模块认知事实列表"
+    )
 
 
 # ============================================================================

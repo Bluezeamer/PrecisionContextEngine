@@ -600,32 +600,13 @@ class PCEContext:
                         len(digest_dirty.deleted),
                     )
 
-                    # 认知整合：将积累的 insight 和 dirty_files 内化到 annotation
-                    digest_start = time.monotonic()
-                    try:
-                        digest_result = await run_digest(
-                            project_root=project_path,
-                            serena_client=serena_client,
-                            insight_cache=self.insight_cache,
-                            dirty_state=digest_dirty,
-                        )
-                        for w in digest_result.get("warnings", []):
-                            warnings.append(f"Digest: {w}")
-                        logger.info(
-                            "Bootstrap Digest 完成: resolved=%d pending=%d deleted_insights=%d",
-                            digest_result.get("resolved_tasks", 0),
-                            digest_result.get("pending_tasks", 0),
-                            digest_result.get("deleted_insights", 0),
-                        )
-                    except Exception as e:
-                        warning = f"Bootstrap Digest 失败（不影响初始化）: {_format_exception_brief(e)}"
-                        warnings.append(warning)
-                        logger.warning(warning)
-                    finally:
-                        logger.info(
-                            "Bootstrap 阶段耗时: digest=%.2fs",
-                            time.monotonic() - digest_start,
-                        )
+                    # init 走轻量链路：暂时跳过 bootstrap digest，避免阻塞初始化。
+                    logger.info(
+                        "Bootstrap Digest 已跳过：init 阶段仅保留 topology/init 轻量认知链路 "
+                        "(changed=%d deleted=%d)",
+                        len(digest_dirty.changed),
+                        len(digest_dirty.deleted),
+                    )
 
             self._init_state = "initialized"
             self._bootstrap_warnings = list(warnings)
