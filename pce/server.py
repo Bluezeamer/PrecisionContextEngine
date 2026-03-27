@@ -32,7 +32,8 @@ from mcp.server import Server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from .agent import PCEAgent
-from .digest_agent import run_digest
+from .baseline_maintenance import seed_initial_file_baselines_if_missing
+from .digest_agent import run_digest, should_run_digest
 from .file_discovery import HARD_SKIP_DIRS, should_track_existing_file, should_track_deleted_path
 from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
@@ -600,13 +601,47 @@ class PCEContext:
                         len(digest_dirty.deleted),
                     )
 
-                    # init 走轻量链路：暂时跳过 bootstrap digest，避免阻塞初始化。
+                    baseline_seed_start = time.monotonic()
+                    await seed_initial_file_baselines_if_missing(project_root=project_path)
                     logger.info(
-                        "Bootstrap Digest 已跳过：init 阶段仅保留 topology/init 轻量认知链路 "
-                        "(changed=%d deleted=%d)",
-                        len(digest_dirty.changed),
-                        len(digest_dirty.deleted),
+                        "Bootstrap 阶段耗时: seed_initial_baselines=%.2fs",
+                        time.monotonic() - baseline_seed_start,
                     )
+
+                    should_digest, digest_reason = await should_run_digest(
+                        project_root=project_path,
+                        insight_cache=self.insight_cache,
+                        dirty_state=digest_dirty,
+                    )
+                    if should_digest:
+                        digest_start = time.monotonic()
+                        try:
+                            digest_result = await run_digest(
+                                project_root=project_path,
+                                serena_client=serena_client,
+                                insight_cache=self.insight_cache,
+                                dirty_state=digest_dirty,
+                                skip_initial_sweep=True,
+                            )
+                            for w in digest_result.get("warnings", []):
+                                warnings.append(f"Digest: {w}")
+                            logger.info(
+                                "Bootstrap Digest 完成: resolved=%d pending=%d deleted_insights=%d",
+                                digest_result.get("resolved_tasks", 0),
+                                digest_result.get("pending_tasks", 0),
+                                digest_result.get("deleted_insights", 0),
+                            )
+                        except Exception as e:
+                            warning = f"Bootstrap Digest 失败（不影响初始化）: {_format_exception_brief(e)}"
+                            warnings.append(warning)
+                            logger.warning(warning)
+                        finally:
+                            logger.info(
+                                "Bootstrap 阶段耗时: digest=%.2fs",
+                                time.monotonic() - digest_start,
+                            )
+                    else:
+                        logger.info("Bootstrap Digest 已跳过：%s", digest_reason)
 
             self._init_state = "initialized"
             self._bootstrap_warnings = list(warnings)
@@ -931,25 +966,41 @@ class PCEContext:
                     )
                     message = "Serena 已重连，PCE 索引增量更新完成"
 
-                # 认知整合：在 Serena 连接仍活跃时执行，复用当前连接
-                try:
-                    digest_result = await run_digest(
-                        project_root=self.project_path,
-                        serena_client=serena_client,
-                        insight_cache=self.insight_cache,
-                        dirty_state=dirty,
-                    )
-                    digest_warnings = [f"Digest: {w}" for w in digest_result.get("warnings", [])]
-                    logger.info(
-                        "pce_sync Digest 完成: resolved=%d pending=%d deleted_insights=%d",
-                        digest_result.get("resolved_tasks", 0),
-                        digest_result.get("pending_tasks", 0),
-                        digest_result.get("deleted_insights", 0),
-                    )
-                except Exception as e:
-                    w = f"pce_sync Digest 失败（不影响同步）: {e}"
-                    digest_warnings = [w]
-                    logger.warning(w)
+                seed_start = time.monotonic()
+                await seed_initial_file_baselines_if_missing(project_root=self.project_path)
+                logger.info(
+                    "pce_sync 阶段耗时: seed_initial_baselines=%.2fs",
+                    time.monotonic() - seed_start,
+                )
+
+                should_digest, digest_reason = await should_run_digest(
+                    project_root=self.project_path,
+                    insight_cache=self.insight_cache,
+                    dirty_state=dirty,
+                )
+                if should_digest:
+                    try:
+                        digest_result = await run_digest(
+                            project_root=self.project_path,
+                            serena_client=serena_client,
+                            insight_cache=self.insight_cache,
+                            dirty_state=dirty,
+                            skip_initial_sweep=True,
+                        )
+                        digest_warnings = [f"Digest: {w}" for w in digest_result.get("warnings", [])]
+                        logger.info(
+                            "pce_sync Digest 完成: resolved=%d pending=%d deleted_insights=%d",
+                            digest_result.get("resolved_tasks", 0),
+                            digest_result.get("pending_tasks", 0),
+                            digest_result.get("deleted_insights", 0),
+                        )
+                    except Exception as e:
+                        w = f"pce_sync Digest 失败（不影响同步）: {e}"
+                        digest_warnings = [w]
+                        logger.warning(w)
+                else:
+                    digest_warnings = []
+                    logger.info("pce_sync Digest 已跳过：%s", digest_reason)
 
             self._init_state = "initialized"
             logger.info(

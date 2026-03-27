@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -41,8 +40,9 @@ from .base_agent import (
 )
 from .digest_delta_builder import DigestDeltaBuilder
 from .insight_cache import InsightCache
-from .memory import delete_file_baseline, load_index, save_file_baseline
-from .models import ModuleDigestDelta, SymbolFact
+from .memory import delete_file_baseline, save_file_baseline
+from .models import ModuleDigestDelta
+from .module_registry import ModuleRegistryManager
 from .prompt_guard import build_prompt_budget, estimate_input_tokens
 from .serena_client import SerenaClient
 from .staging import DirtyState
@@ -1079,20 +1079,23 @@ async def run_digest(
     dirty_state: DirtyState,
     model: str | None = None,
     provider: str | None = None,
+    skip_initial_sweep: bool = False,
 ) -> dict[str, Any]:
     """Digest 外部入口，供 server._bootstrap 和 handle_sync 调用。
 
     失败时抛出异常，由调用方捕获并记录 warning；不影响 init/sync 主流程。
     """
     digest_start = time.monotonic()
-    # 先 sweep（标记 hash 过时的 insight），cleanup 在 digest 完成后执行
-    sweep_start = time.monotonic()
-    try:
-        await insight_cache.sweep_stale()
-    except Exception as e:
-        logger.warning("Digest 前 sweep_stale 失败（已忽略）: %s", e)
-    finally:
-        logger.info("Digest 阶段耗时: sweep_stale=%.2fs", time.monotonic() - sweep_start)
+    if skip_initial_sweep:
+        logger.info("Digest 初始 stale sweep 已由上层 gate 完成，直接复用结果")
+    else:
+        sweep_start = time.monotonic()
+        try:
+            await insight_cache.sweep_stale()
+        except Exception as e:
+            logger.warning("Digest 前 sweep_stale 失败（已忽略）: %s", e)
+        finally:
+            logger.info("Digest 阶段耗时: sweep_stale=%.2fs", time.monotonic() - sweep_start)
 
     planner_start = time.monotonic()
     planner = DigestPlanner(project_root=project_root, insight_cache=insight_cache)
@@ -1105,12 +1108,6 @@ async def run_digest(
 
     if not task_list.items:
         logger.info("Digest 跳过：当前无可执行的模块级 delta")
-        seed_start = time.monotonic()
-        await _seed_initial_file_baselines_if_missing(project_root=project_root)
-        logger.info(
-            "Digest 阶段耗时: seed_initial_baselines=%.2fs",
-            time.monotonic() - seed_start,
-        )
         # 仍然执行 cleanup 清除已 stale 的条目
         cleanup_start = time.monotonic()
         try:
@@ -1176,9 +1173,8 @@ async def run_digest(
 
     baseline_start = time.monotonic()
     await _advance_file_baselines(project_root=project_root, task_list=task_list)
-    await _seed_initial_file_baselines_if_missing(project_root=project_root)
     logger.info(
-        "Digest 阶段耗时: advance_and_seed_baselines=%.2fs",
+        "Digest 阶段耗时: advance_file_baselines=%.2fs",
         time.monotonic() - baseline_start,
     )
 
@@ -1201,6 +1197,38 @@ async def run_digest(
         "deleted_insights": deleted_count,
         "warnings": result["warnings"],
     }
+
+
+async def should_run_digest(
+    *,
+    project_root: Path,
+    insight_cache: InsightCache,
+    dirty_state: DirtyState,
+) -> tuple[bool, str]:
+    """判断当前是否应触发 digest。"""
+    if not dirty_state.empty:
+        return (
+            True,
+            f"dirty_files changed={len(dirty_state.changed)} deleted={len(dirty_state.deleted)}",
+        )
+
+    sweep_start = time.monotonic()
+    try:
+        await insight_cache.sweep_stale()
+    except Exception as exc:
+        logger.warning("digest gate sweep_stale 失败，继续检查 insights: %s", exc)
+    finally:
+        logger.info(
+            "Digest gate 阶段耗时: sweep_stale=%.2fs",
+            time.monotonic() - sweep_start,
+        )
+
+    if await _has_actionable_fresh_insights(
+        project_root=project_root,
+        insight_cache=insight_cache,
+    ):
+        return True, "actionable_fresh_insights"
+    return False, "no_dirty_or_actionable_insights"
 
 
 async def _run_module_tasks(
@@ -1311,42 +1339,24 @@ async def _advance_file_baselines(
                 root_path=project_root,
             )
 
+async def _has_actionable_fresh_insights(
+    *,
+    project_root: Path,
+    insight_cache: InsightCache,
+) -> bool:
+    manager = ModuleRegistryManager(project_root)
+    _, current_file_to_record, historical_file_to_record = (
+        await manager.build_file_owner_maps()
+    )
 
-async def _seed_initial_file_baselines_if_missing(*, project_root: Path) -> None:
-    """若当前不存在任何 baseline，则用现有索引建立初始 baseline。"""
-    baselines_dir = project_root / ".pce" / "baselines" / "files"
-    if baselines_dir.exists():
-        existing = list(baselines_dir.rglob("*.json"))
-        if existing:
-            return
-
-    snapshot = await load_index(root_path=project_root)
-    if snapshot is None:
-        return
-
-    for entry in snapshot.entries:
-        rel_path = str(entry.file_meta.path)
-        abs_path = project_root / rel_path
-        try:
-            content = await asyncio.to_thread(abs_path.read_text, "utf-8")
-        except Exception:
-            logger.warning("初始化 baseline 失败，跳过文件: %s", rel_path)
+    records = await insight_cache.get_all_records(include_stale=False)
+    for record in records:
+        scope = str(record.scope).strip()
+        if not scope:
             continue
-        await save_file_baseline(
-            rel_path,
-            content=content,
-            content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            symbols=[
-                SymbolFact(
-                    name=sym.name,
-                    kind=sym.kind,
-                    line_start=sym.line_start,
-                    line_end=sym.line_end,
-                )
-                for sym in entry.symbols
-            ],
-            root_path=project_root,
-        )
+        if scope in current_file_to_record or scope in historical_file_to_record:
+            return True
+    return False
 
 
 def _collect_consumed_insight_ids(task_list: DigestTaskList) -> list[str]:
