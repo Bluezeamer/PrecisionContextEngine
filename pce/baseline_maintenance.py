@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 
 from .memory import load_index, save_file_baseline
+from .models import SymbolFact
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,14 @@ async def seed_initial_file_baselines_if_missing(*, project_root: Path) -> None:
             rel_path,
             content=content,
             content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            symbols=entry.symbols,
+            symbols=[
+                SymbolFact(
+                    name=sym.name,
+                    kind=sym.kind,
+                    line_start=sym.line_start,
+                    line_end=sym.line_end,
+                )
+                for sym in entry.symbols
+            ],
             root_path=project_root,
         )

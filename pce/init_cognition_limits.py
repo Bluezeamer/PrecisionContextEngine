@@ -1,0 +1,8 @@
+"""init 认知阶段的统一预算与重试配置。"""
+
+from __future__ import annotations
+
+PCEIGNORE_STAGE_MAX_ATTEMPTS = 3
+PCEIGNORE_STAGE_TOOL_BUDGET = 5
+TOPOLOGY_STAGE_MAX_ATTEMPTS = 3
+TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS = 3

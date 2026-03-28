@@ -378,8 +378,8 @@ from .annotation_writer import (  # noqa: E402
     _write_annotations,
     _update_annotations_incremental,
     _write_structure_md,
-    _ensure_generated_pceignore,
 )
+from .pceignore_stage import run_pceignore_stage
 
 
 # ============================================================================
@@ -491,7 +491,7 @@ async def build_index(
 
     pceignore_start = time.monotonic()
     try:
-        await _ensure_generated_pceignore(root_path, serena_client, model=model)
+        await run_pceignore_stage(root_path, serena_client, model=model)
     except Exception as e:
         logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
     finally:
@@ -645,7 +645,7 @@ async def build_index_incremental(
     start_time = time.monotonic()
 
     try:
-        await _ensure_generated_pceignore(root_path, serena_client, model=model)
+        await run_pceignore_stage(root_path, serena_client, model=model)
     except Exception as e:
         logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
 

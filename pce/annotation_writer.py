@@ -28,6 +28,7 @@ import aiofiles
 import litellm
 
 from ._env import build_litellm_model, get_completion_overrides, get_env_text
+from .init_cognition_limits import TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS, TOPOLOGY_STAGE_MAX_ATTEMPTS
 from .memory import (
     ANNOTATIONS_DIR,
     ANNOTATIONS_AREAS_DIR,
@@ -52,8 +53,8 @@ from .serena_client import SerenaClient, SerenaClientError
 from .topology_cognition_agent import TopologyCognitionAgent
 
 logger = logging.getLogger(__name__)
-_TOPOLOGY_STAGE_MAX_ATTEMPTS = 3
-_TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS = 3
+_TOPOLOGY_STAGE_MAX_ATTEMPTS = TOPOLOGY_STAGE_MAX_ATTEMPTS
+_TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS = TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS
 
 # 常量（与 indexer.py 共享的导航路径常量）
 ANNOTATIONS_INDEX_FILE = "index.md"
@@ -135,6 +136,37 @@ _MODULE_PROMPT_SYMBOL_ANCHORS_PER_FILE = 2
 _MODULE_PROMPT_SYMBOL_ANCHORS_TOTAL = 6
 _MODULE_FALLBACK_SYMBOL_ANCHORS_TOTAL = 4
 _MISSING_COVERAGE_INDEX_BUDGET = 5000
+
+
+def _normalize_tool_result(value: Any) -> Any:
+    """将工具返回值统一化为 dict/list 结构。
+
+    Serena 工具返回值经过 _jsonable 处理后可能有多种形态：
+    1. 直接返回 dict/list（最理想）
+    2. 单元素列表包含 JSON 字符串（旧版兼容）
+    3. {'meta': ..., 'content': [{'type': 'text', 'text': <data>}]} 外壳（实测形态）
+    """
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            text_item = next(
+                (item for item in content if isinstance(item, dict) and item.get("type") == "text"),
+                None,
+            )
+            if text_item is not None:
+                inner = text_item["text"]
+                if isinstance(inner, str):
+                    try:
+                        return json.loads(inner)
+                    except (ValueError, json.JSONDecodeError):
+                        return inner
+                return inner
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+        try:
+            return json.loads(value[0])
+        except (ValueError, json.JSONDecodeError):
+            return value[0]
+    return value
 
 
 def _annotation_model_for_budget() -> str | None:

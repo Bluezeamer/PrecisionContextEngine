@@ -25,6 +25,7 @@ from .base_agent import (
     _get_tool_name,
     _safe_json_dumps,
 )
+from .init_cognition_limits import PCEIGNORE_STAGE_TOOL_BUDGET
 from .module_annotation_contract import validate_module_annotation_markdown
 from .prompt_guard import fit_text_to_budget
 from .serena_client import SerenaClient
@@ -32,14 +33,11 @@ from .serena_client import SerenaClient
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SECONDS = 180.0
-_ALLOWED_SERENA_TOOL_NAMES = frozenset({
-    "search_for_pattern",
-    "find_file",
-    "get_symbols_overview",
-    "find_symbol",
-    "find_referencing_symbols",
-    "read_file",
-})
+_ALLOWED_SERENA_TOOL_NAMES_BY_STAGE: dict[str, frozenset[str]] = {
+    "pceignore": frozenset({"read_file", "search_for_pattern"}),
+    "navigation_tree": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
+    "write_area_modules": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
+}
 _REACT_FAILURE_MESSAGES: dict[str, str] = {
     REACT_TIMEOUT_BUDGET: "TopologyCognitionAgent ReAct 循环超时，已达最大时间预算",
     REACT_NO_TOOL_EXHAUSTED: "TopologyCognitionAgent 连续未产生 tool_calls，已终止",
@@ -85,6 +83,9 @@ class TopologyCognitionAgent(BaseReActAgent):
         self._stage_context: dict[str, Any] = {}
         self._written_module_slugs_by_area: dict[str, set[str]] = {}
         self._virtual_tool_names_set: set[str] = set()
+        self._stage_tool_budget_total = 0
+        self._stage_tool_budget_used = 0
+        self._stage_budget_exhausted_notified = False
 
     def build_initial_messages(self) -> list[dict[str, Any]]:
         return [
@@ -106,6 +107,14 @@ class TopologyCognitionAgent(BaseReActAgent):
         self._stage_context = dict(stage_context or {})
         if stage != "write_area_modules":
             self._stage_context = {}
+        if stage == "pceignore":
+            self._stage_tool_budget_total = PCEIGNORE_STAGE_TOOL_BUDGET
+            self._stage_tool_budget_used = 0
+            self._stage_budget_exhausted_notified = False
+        else:
+            self._stage_tool_budget_total = 0
+            self._stage_tool_budget_used = 0
+            self._stage_budget_exhausted_notified = False
 
         prompt = user_prompt or self._build_stage_prompt(stage)
         messages.append({"role": "user", "content": prompt})
@@ -148,13 +157,21 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- 若需读取代码，先用 Serena 的搜索/符号工具定界，再按需 read_file，避免无界读取。",
                 "- 目标是形成稳定导航与轻量模块认知，不展开内部实现细节，不穷举符号。",
                 "- 若证据不足，宁可保持较粗但稳定的划分，也不要切出很多脆弱小模块。",
+                "- stage1 为 `pceignore` 阶段：允许有限探索后给出保守过滤规则，用于减少后续索引噪声。",
+                "- 每次工具调用后都会收到剩余预算提示；预算耗尽后必须基于现有证据强制收口。",
                 "- 第一阶段若未通过后处理校验，会收到错误反馈要求重试；请根据反馈修正，而不是退回粗糙 fallback。",
                 "- 第二阶段按 area 顺序写模块文档；允许多轮修正，直到 Python 侧确认当前 area 完成。",
                 "",
                 "## 阶段输出约束",
-                "- 第一阶段输出 `navigation_tree`：直接给出 project -> areas -> modules 的完整导航树。",
-                "- 第二阶段不再输出大 JSON；而是直接调用 `write_module_annotation` 写当前 area 下的模块文档。",
+                "- stage1 输出 `pceignore`：提交 `{ignore_patterns:[...]}`。",
+                "- stage2 输出 `navigation_tree`：直接给出 project -> areas -> modules 的完整导航树。",
+                "- stage3 不再输出大 JSON；而是直接调用 `write_module_annotation` 写当前 area 下的模块文档。",
                 "- 当当前 area 全部处理完后，调用 `mark_area_done`，再调用 `deliver(answer='stage done')`。",
+                "",
+                "## pceignore payload 要求",
+                "- 字段：`ignore_patterns`。",
+                "- `ignore_patterns` 必须是字符串数组，元素为 gitignore 风格路径/模式。",
+                "- 要保守；宁少勿错，不要误伤可能属于源码、配置、脚本、测试、关键文档的路径。",
                 "",
                 "## navigation_tree payload 要求",
                 "- 字段：`project_summary`, `fallback_area_slug`, `areas`。",
@@ -177,6 +194,16 @@ class TopologyCognitionAgent(BaseReActAgent):
         )
 
     def _build_stage_prompt(self, stage: str) -> str:
+        if stage == "pceignore":
+            return "\n".join(
+                [
+                    "当前阶段：`pceignore`。",
+                    "请基于已注入的目录结构、统计与 .gitignore 事实，必要时再做极少量探索，输出保守可用的 `.pce/pceignore` 规则。",
+                    "本阶段最多允许有限工具探索；每次调用工具后你会收到预算反馈。",
+                    "预算耗尽后必须停止探索，并基于当前证据提交结果。",
+                    "先提交 pceignore 阶段结果，再调用 deliver(answer=\"stage done\")。",
+                ]
+            )
         if stage == "navigation_tree":
             return "\n".join(
                 [
@@ -229,12 +256,14 @@ class TopologyCognitionAgent(BaseReActAgent):
         self, serena_client: SerenaClient, state: LoopState
     ) -> list[dict[str, Any]]:
         filtered = []
+        allowed_names = _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE.get(self._active_stage or "", frozenset())
+        allow_exploration = not (self._active_stage == "pceignore" and self._stage_tool_budget_used >= self._stage_tool_budget_total > 0)
         for schema in serena_client.tools_schema:
             try:
                 name = schema["function"]["name"]
             except Exception:
                 continue
-            if name in _ALLOWED_SERENA_TOOL_NAMES:
+            if allow_exploration and name in allowed_names:
                 filtered.append(schema)
         virtual_tools = self._build_virtual_tools()
         self._virtual_tool_names_set = {
@@ -257,6 +286,101 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "请先调用必要工具；阶段完成时必须先提交阶段完成标记，再调用 deliver。"
             ),
         }
+
+    async def on_before_round(self, state: LoopState) -> None:
+        if (
+            self._active_stage == "pceignore"
+            and self._stage_tool_budget_total > 0
+            and self._stage_tool_budget_used >= self._stage_tool_budget_total
+            and not self._stage_budget_exhausted_notified
+        ):
+            self._append(state, {
+                "role": "user",
+                "content": (
+                    "工具预算已耗尽，禁止继续探索。"
+                    "请基于当前已掌握的目录结构与证据，输出最保守可用的 `ignore_patterns`。"
+                    "不要误伤可能属于源码、配置、脚本、测试、关键文档的路径。"
+                ),
+            })
+            self._stage_budget_exhausted_notified = True
+
+    def _stage_budget_note(self) -> str:
+        if self._active_stage != "pceignore" or self._stage_tool_budget_total <= 0:
+            return ""
+        remaining = max(0, self._stage_tool_budget_total - self._stage_tool_budget_used)
+        return (
+            f"\n\n[预算提示] 你已使用 {self._stage_tool_budget_used}/{self._stage_tool_budget_total} 次工具预算，"
+            f"还剩 {remaining} 次。请优先确认最高价值路径。"
+        )
+
+    def _render_tree_snapshot(self, root: str, *, max_depth: int, max_lines: int) -> str:
+        base = self._project_root / Path(root)
+        try:
+            rel_base = base.resolve().relative_to(self._project_root)
+        except Exception:
+            return f"tree_snapshot 失败：路径越界或不存在：{root}"
+        if not base.exists() or not base.is_dir():
+            return f"tree_snapshot 失败：目录不存在：{root}"
+
+        from .file_discovery import is_ignored, is_probably_text_file
+
+        lines: list[str] = []
+        omitted = 0
+        root_parts = len(rel_base.parts) if str(rel_base) != "." else 0
+        for current_root, dirnames, filenames in os.walk(base, topdown=True):
+            current_path = Path(current_root)
+            rel = current_path.relative_to(self._project_root).as_posix()
+            depth = len(current_path.relative_to(base).parts)
+            keep_dirs: list[str] = []
+            for dirname in dirnames:
+                rel_dir = (current_path / dirname).relative_to(self._project_root).as_posix()
+                if is_ignored(self._project_root, rel_dir):
+                    continue
+                keep_dirs.append(dirname)
+            dirnames[:] = keep_dirs
+
+            if depth > max_depth:
+                dirnames[:] = []
+                continue
+
+            indent = "  " * max(0, len(Path(rel).parts) - root_parts - 1)
+            if str(rel_base) == ".":
+                if rel == ".":
+                    lines.append("- ./")
+                else:
+                    lines.append(f"{indent}- {Path(rel).name}/")
+            else:
+                if rel == rel_base.as_posix():
+                    lines.append(f"- {Path(rel).name}/")
+                else:
+                    lines.append(f"{indent}- {Path(rel).name}/")
+            if len(lines) >= max_lines:
+                omitted += 1
+                break
+
+            if depth == max_depth:
+                continue
+
+            for filename in sorted(filenames):
+                rel_file = (current_path / filename).relative_to(self._project_root).as_posix()
+                if is_ignored(self._project_root, rel_file):
+                    continue
+                kind = "text"
+                try:
+                    kind = "text" if is_probably_text_file(current_path / filename) else "binary"
+                except Exception:
+                    kind = "unknown"
+                tag = f" [{kind}]" if kind != "text" else ""
+                lines.append(f"{indent}  - {filename}{tag}")
+                if len(lines) >= max_lines:
+                    omitted += 1
+                    break
+            if len(lines) >= max_lines:
+                break
+
+        if omitted > 0:
+            lines.append(f"[truncated: omitted {omitted} lines]")
+        return "\n".join(lines)
 
     async def on_deliver(
         self, args: dict[str, Any] | None, state: LoopState
@@ -288,6 +412,15 @@ class TopologyCognitionAgent(BaseReActAgent):
 
         if name == "read_discovery_facts":
             return _ok(_safe_json_dumps(self._discovery_facts))
+
+        if name == "tree_snapshot":
+            if self._active_stage != "pceignore":
+                return _err("tree_snapshot 只能在 pceignore 阶段使用")
+            root = str(args.get("root") or ".").strip() or "."
+            max_depth = max(1, min(4, int(args.get("max_depth") or 2)))
+            max_lines = max(20, min(240, int(args.get("max_lines") or 120)))
+            self._stage_tool_budget_used += 1
+            return _ok(self._render_tree_snapshot(root, max_depth=max_depth, max_lines=max_lines) + self._stage_budget_note())
 
         if name == "deliver_stage_result":
             stage = str(args.get("stage") or "").strip()
@@ -323,7 +456,7 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "type": "function",
                 "function": {
                     "name": "deliver_stage_result",
-                    "description": "提交当前阶段的结构化结果。仅 navigation_tree 阶段使用。",
+                    "description": "提交当前阶段的结构化结果。pceignore/navigation_tree 阶段使用。",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -336,6 +469,24 @@ class TopologyCognitionAgent(BaseReActAgent):
                 },
             },
         ]
+        if self._active_stage == "pceignore":
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "tree_snapshot",
+                    "description": "按路径返回受控、可截断的目录树快照，用于有限目录探索。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "root": {"type": "string"},
+                            "max_depth": {"type": "integer"},
+                            "max_lines": {"type": "integer"},
+                        },
+                        "required": ["root"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
         if self._active_stage == "write_area_modules":
             tools.extend([
                 {
@@ -442,6 +593,23 @@ class TopologyCognitionAgent(BaseReActAgent):
             "note": note,
         }
         return ok_builder(f"当前 area 已标记完成: {area_slug}")
+
+    async def _invoke_serena(
+        self,
+        tool_call: Any,
+        serena_client: SerenaClient,
+        state: LoopState | None = None,
+    ) -> dict[str, Any]:
+        tool_name = _get_tool_name(tool_call) or "unknown"
+        result = await super()._invoke_serena(tool_call, serena_client, state=state)
+        if (
+            self._active_stage == "pceignore"
+            and tool_name in _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE["pceignore"]
+            and self._stage_tool_budget_total > 0
+        ):
+            self._stage_tool_budget_used += 1
+            result["content"] = str(result.get("content") or "") + self._stage_budget_note()
+        return result
 
     @staticmethod
     async def _write_text_atomic(path: Path, content: str) -> None:
