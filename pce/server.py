@@ -67,14 +67,17 @@ def _make_tool_description(
     best_practice: str,
     avoid_when: str | None = None,
 ) -> str:
-    """拼装面向 Agent 的工具描述。"""
+    """Assemble agent-facing tool description.
+
+    (原中文字段: 用途 / 适用时机 / 最佳实践 / 避免误用)
+    """
     parts = [
-        f"用途: {purpose}",
-        f"适用时机: {use_when}",
-        f"最佳实践: {best_practice}",
+        f"Purpose: {purpose}",
+        f"When to use: {use_when}",
+        f"Best practice: {best_practice}",
     ]
     if avoid_when:
-        parts.append(f"避免误用: {avoid_when}")
+        parts.append(f"Avoid: {avoid_when}")
     return "\n".join(parts)
 
 
@@ -215,41 +218,66 @@ def _build_tools(
     """
     # 始终可用：init 与 status 不依赖项目初始化
     always_available: list[Tool] = [
+        # pce_init 原中文描述:
+        #   用途: 绑定目标项目并初始化 PCE 运行时，为后续 query / impact / sync 建立索引与导航上下文。
+        #   适用时机: 进入一个新项目或会话首次使用 PCE 时调用。在它成功之前，不应调用 pce_query、pce_impact、pce_sync 或写工具。
+        #   最佳实践: 每个会话通常只需调用一次并等待成功。只有在需要切换项目或初始化失败后重试时，才再次调用。
+        #   避免误用: 不要把它当作代码查询工具使用；它负责建立上下文，不直接回答代码问题。
         Tool(
             name="pce_init",
             description=_make_tool_description(
-                purpose="绑定目标项目并初始化 PCE 运行时，为后续 query / impact / sync 建立索引与导航上下文。",
+                purpose=(
+                    "Bind a target project and initialize the PCE runtime, "
+                    "building the index and navigation context required by query / impact / sync."
+                ),
                 use_when=(
-                    "进入一个新项目或会话首次使用 PCE 时调用。"
-                    "在它成功之前，不应调用 pce_query、pce_impact、pce_sync 或写工具。"
+                    "Call this when entering a new project or the first time PCE is needed in a session. "
+                    "Do NOT call pce_query, pce_impact, pce_sync, or edit tools before pce_init succeeds."
                 ),
                 best_practice=(
-                    "每个会话通常只需调用一次并等待成功。"
-                    "只有在需要切换项目或初始化失败后重试时，才再次调用。"
+                    "Typically called once per session and awaited until success. "
+                    "Only call again when switching projects or retrying after a failure."
                 ),
-                avoid_when="不要把它当作代码查询工具使用；它负责建立上下文，不直接回答代码问题。",
+                avoid_when=(
+                    "Do not use this as a code query tool; "
+                    "it establishes context but does not directly answer code questions."
+                ),
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "project_path": {
                         "type": "string",
-                        "description": "目标项目根路径（绝对路径）",
+                        "description": "Absolute path to the target project root.",
                     },
                 },
                 "required": ["project_path"],
             },
         ),
+        # pce_status 原中文描述:
+        #   用途: 返回当前服务与项目状态，例如初始化阶段、索引统计、暂存区与 warning。
+        #   适用时机: 需要确认 PCE 是否可用、索引是否已建立，或排查 init / query / impact / sync 异常时使用。
+        #   最佳实践: 把它当作诊断工具使用。当不确定是否应先 init 或 sync 时，先查看 status。
+        #   避免误用: 不要把它当作代码理解工具使用；它不负责定位入口、调用链或影响边界。
         Tool(
             name="pce_status",
             description=_make_tool_description(
-                purpose="返回当前服务与项目状态，例如初始化阶段、索引统计、暂存区与 warning。",
-                use_when="需要确认 PCE 是否可用、索引是否已建立，或排查 init / query / impact / sync 异常时使用。",
-                best_practice=(
-                    "把它当作诊断工具使用。"
-                    "当不确定是否应先 init 或 sync 时，先查看 status。"
+                purpose=(
+                    "Return current service and project status, "
+                    "including initialization phase, index statistics, staging area, and warnings."
                 ),
-                avoid_when="不要把它当作代码理解工具使用；它不负责定位入口、调用链或影响边界。",
+                use_when=(
+                    "Use when you need to confirm whether PCE is available, "
+                    "whether the index has been built, or to diagnose init / query / impact / sync issues."
+                ),
+                best_practice=(
+                    "Treat this as a diagnostic tool. "
+                    "When unsure whether to call init or sync first, check status."
+                ),
+                avoid_when=(
+                    "Do not use this as a code understanding tool; "
+                    "it does not locate entry points, call chains, or impact boundaries."
+                ),
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
@@ -257,87 +285,131 @@ def _build_tools(
 
     # 始终暴露的核心查询/分析工具；未初始化时由 call_tool 返回 NOT_INITIALIZED 引导先调 pce_init
     post_init: list[Tool] = [
+        # pce_query 原中文描述:
+        #   用途: 用于代码库定位与理解，是高层代码搜索与建立任务认知的首选工具。
+        #         适合入口、主调用链、模块职责、候选文件范围和项目/模块整体理解。
+        #   适用时机: 当目标位置尚不明确时使用。当你不知道信息在哪个文件、需要先理解某个能力大致如何实现、
+        #             想找入口/主调用链/模块职责、或需要先缩小搜索范围时，应优先使用。不要先手工遍历目录或批量读文件。
+        #   最佳实践: 优先用自然语言描述你要理解的问题，而不是只给精确标识符。
+        #             可直接要求返回 file:line、name_path、候选文件列表、调用链摘要或按模块归纳的结果。
+        #   避免误用: 当你已经知道精确文件或精确标识符，只需要查看局部实现或做精确字符串匹配时，不必先调用 pce_query。
+        #             若 target 已明确且任务变成”改它会影响哪里”，应转用 pce_impact。
         Tool(
-            name="pce_query",
+            name=”pce_query”,
             description=_make_tool_description(
                 purpose=(
-                    "用于代码库定位与理解，是高层代码搜索与建立任务认知的首选工具。"
-                    "适合入口、主调用链、模块职责、候选文件范围和项目/模块整体理解。"
+                    “The primary tool for codebase navigation and understanding. “
+                    “Best suited for locating entry points, main call chains, module responsibilities, “
+                    “candidate file scopes, and overall project/module comprehension.”
                 ),
                 use_when=(
-                    "当目标位置尚不明确时使用。"
-                    "当你不知道信息在哪个文件、需要先理解某个能力大致如何实现、想找入口/主调用链/模块职责、或需要先缩小搜索范围时，应优先使用。"
-                    "不要先手工遍历目录或批量读文件。"
+                    “Use when the target location is unclear. “
+                    “When you don't know which file contains the information, “
+                    “need to understand how a capability is roughly implemented, “
+                    “want to find entry points / main call chains / module responsibilities, “
+                    “or need to narrow down the search scope — use this tool first. “
+                    “Do NOT manually traverse directories or batch-read files before trying pce_query.”
                 ),
                 best_practice=(
-                    "优先用自然语言描述你要理解的问题，而不是只给精确标识符。"
-                    "可直接要求返回 file:line、name_path、候选文件列表、调用链摘要或按模块归纳的结果。"
+                    “Prefer describing your question in natural language rather than just giving exact identifiers. “
+                    “You can request file:line references, name_path, candidate file lists, “
+                    “call chain summaries, or results grouped by module.”
                 ),
                 avoid_when=(
-                    "当你已经知道精确文件或精确标识符，只需要查看局部实现或做精确字符串匹配时，不必先调用 pce_query。"
-                    "若 target 已明确且任务变成“改它会影响哪里”，应转用 pce_impact。"
+                    “When you already know the exact file or exact identifier and only need to view “
+                    “local implementation or do exact string matching, pce_query is not necessary. “
+                    “If the target is already clear and the task becomes 'what will be affected by changing it', “
+                    “switch to pce_impact instead.”
                 ),
             ),
             inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "自然语言问题,例如: '认证逻辑的入口在哪里?'",
+                “type”: “object”,
+                “properties”: {
+                    “query”: {
+                        “type”: “string”,
+                        “description”: “Natural language question, e.g. 'Where is the entry point for authentication logic?'”,
                     },
                 },
-                "required": ["query"],
+                “required”: [“query”],
             },
         ),
+        # pce_impact 原中文描述:
+        #   用途: 用于分析已知变更目标的影响边界，是改动前理解波及面的首选工具。
+        #         重点输出直接调用点、直接消费者、主要传播链、风险与建议修改顺序。
+        #   适用时机: 当你已经明确要改哪个符号、字段、接口契约或文件，并想先了解它会影响哪里时，优先使用。
+        #   最佳实践: 尽量提供明确的 target；若已知符号所在文件，也一起提供 file 以加速定位。
+        #             优先把问题提成具体变更，例如”修改某字段””调整某函数签名””删除某文件后会影响哪里”。
+        #   避免误用: 如果 target 仍然模糊、还在多个候选之间摇摆，不要用 impact 代替定位步骤；应先使用 pce_query 收敛目标。
+        #             若只是想看局部实现或精确定义，也不必先调用 impact。
         Tool(
-            name="pce_impact",
+            name=”pce_impact”,
             description=_make_tool_description(
                 purpose=(
-                    "用于分析已知变更目标的影响边界，是改动前理解波及面的首选工具。"
-                    "重点输出直接调用点、直接消费者、主要传播链、风险与建议修改顺序。"
+                    “The primary tool for analyzing the impact boundary of a known change target. “
+                    “Outputs direct call sites, direct consumers, main propagation chains, “
+                    “risks, and suggested modification order.”
                 ),
                 use_when=(
-                    "当你已经明确要改哪个符号、字段、接口契约或文件，并想先了解它会影响哪里时，优先使用。"
+                    “Use when you already know which symbol, field, interface contract, or file to change, “
+                    “and want to understand what will be affected before making the change.”
                 ),
                 best_practice=(
-                    "尽量提供明确的 target；若已知符号所在文件，也一起提供 file 以加速定位。"
-                    "优先把问题提成具体变更，例如“修改某字段”“调整某函数签名”“删除某文件后会影响哪里”。"
+                    “Provide an explicit target; if you know the file containing the symbol, “
+                    “also provide the file parameter to speed up resolution. “
+                    “Frame the question as a concrete change, e.g. 'modify field X', “
+                    “'change function signature of Y', 'what breaks if file Z is deleted'.”
                 ),
                 avoid_when=(
-                    "如果 target 仍然模糊、还在多个候选之间摇摆，不要用 impact 代替定位步骤；应先使用 pce_query 收敛目标。"
-                    "若只是想看局部实现或精确定义，也不必先调用 impact。"
+                    “If the target is still ambiguous or you are choosing between multiple candidates, “
+                    “do not use impact as a substitute for the discovery step — use pce_query first to converge on the target. “
+                    “If you only want to view local implementation or exact definitions, impact is not necessary.”
                 ),
             ),
             inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "修改目标,可以是符号名(如 UserSession)或文件路径",
+                “type”: “object”,
+                “properties”: {
+                    “target”: {
+                        “type”: “string”,
+                        “description”: “The change target — a symbol name (e.g. UserSession) or file path.”,
                     },
-                    "change_type": {
-                        "type": "string",
-                        "description": "变更类型: modify | rename | delete | add_field | change_signature",
-                        "enum": ["modify", "rename", "delete", "add_field", "change_signature"],
+                    “change_type”: {
+                        “type”: “string”,
+                        “description”: “Type of change: modify | rename | delete | add_field | change_signature”,
+                        “enum”: [“modify”, “rename”, “delete”, “add_field”, “change_signature”],
                     },
-                    "file": {
-                        "type": "string",
-                        "description": "符号所在文件路径(可选,提供后可加速定位)",
+                    “file”: {
+                        “type”: “string”,
+                        “description”: “File path containing the symbol (optional, speeds up resolution if provided).”,
                     },
                 },
-                "required": ["target", "change_type"],
+                “required”: [“target”, “change_type”],
             },
         ),
+        # pce_sync 原中文描述:
+        #   用途: 在代码库修改后同步 Serena 与 PCE 的索引状态，使后续 query / impact 基于最新代码工作。
+        #   适用时机: 完成一批代码修改、文件删除、重命名或结构调整后使用。
+        #   最佳实践: 把它作为批量同步步骤使用；通常在完成一轮修改后再调用一次，而不是每改一小处就立刻同步。
+        #   避免误用: 不要把它当作代码理解工具使用；它负责刷新状态，不负责解释代码。
         Tool(
             name="pce_sync",
             description=_make_tool_description(
-                purpose="在代码库修改后同步 Serena 与 PCE 的索引状态，使后续 query / impact 基于最新代码工作。",
-                use_when="完成一批代码修改、文件删除、重命名或结构调整后使用。",
-                best_practice=(
-                    "把它作为批量同步步骤使用；"
-                    "通常在完成一轮修改后再调用一次，而不是每改一小处就立刻同步。"
+                purpose=(
+                    "Synchronize Serena and PCE index state after codebase modifications, "
+                    "so subsequent query / impact calls work against the latest code."
                 ),
-                avoid_when="不要把它当作代码理解工具使用；它负责刷新状态，不负责解释代码。",
+                use_when=(
+                    "Use after completing a batch of code modifications, file deletions, "
+                    "renames, or structural changes."
+                ),
+                best_practice=(
+                    "Use this as a batch synchronization step; "
+                    "typically call once after completing a round of changes, "
+                    "rather than after every small edit."
+                ),
+                avoid_when=(
+                    "Do not use this as a code understanding tool; "
+                    "it refreshes index state but does not explain code."
+                ),
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
@@ -785,22 +857,27 @@ class PCEContext:
         total = len(all_paths)
         cap = cls._DIRTY_INJECT_MAX_FILES
 
-        lines = ["[系统提示] 以下文件在上次索引后发生了变更，Memory 中对应信息可能不准确:"]
+        # 原中文提示文本:
+        #   [系统提示] 以下文件在上次索引后发生了变更，Memory 中对应信息可能不准确:
+        #   变更: / 删除:
+        #   ... 以及另外 N 个变更文件未列出。建议先调用 pce_sync 更新索引后再继续查询。
+        #   请使用 Serena 工具读取这些文件的最新内容进行验证，完成理解后调用 acknowledge_changes 确认认知。
+        lines = ["[System Notice] The following files have changed since the last index — Memory entries for them may be stale:"]
         for path in dirty.changed[:cap]:
-            lines.append(f"  - 变更: {path}")
+            lines.append(f"  - Changed: {path}")
         remaining = max(0, cap - len(dirty.changed))
         for path in dirty.deleted[:remaining]:
-            lines.append(f"  - 删除: {path}")
+            lines.append(f"  - Deleted: {path}")
 
         if total > cap:
             lines.append(
-                f"  ... 以及另外 {total - cap} 个变更文件未列出。"
-                "建议先调用 pce_sync 更新索引后再继续查询。"
+                f"  ... and {total - cap} more changed files not listed. "
+                "Consider calling pce_sync to update the index before continuing."
             )
 
         lines.append(
-            "请使用 Serena 工具读取这些文件的最新内容进行验证，"
-            "完成理解后调用 acknowledge_changes 确认认知。"
+            "Use Serena tools to read the latest content of these files for verification, "
+            "then call acknowledge_changes to confirm awareness."
         )
         return "\n".join(lines)
 
@@ -1053,12 +1130,20 @@ async def serve() -> None:
     logger.info("PCE Server 启动（等待 pce_init 绑定项目）")
     ctx = PCEContext()
 
+    # 原中文 instructions:
+    #   PCE 是面向代码库理解与定位的首选工具集。
+    #   当你不知道信息在哪、需要理解模块职责/入口/主调用链、或需要分析某个改动会影响哪里时，
+    #   应优先使用 PCE，而不是先手工遍历目录或批量读文件。
+    #   高层理解与未知位置定位优先使用 PCE；已知精确文件或标识符时，再使用底层读取或精确搜索工具。
     server = Server(
         "pce",
         instructions=(
-            "PCE 是面向代码库理解与定位的首选工具集。"
-            "当你不知道信息在哪、需要理解模块职责/入口/主调用链、或需要分析某个改动会影响哪里时，应优先使用 PCE，而不是先手工遍历目录或批量读文件。"
-            "高层理解与未知位置定位优先使用 PCE；已知精确文件或标识符时，再使用底层读取或精确搜索工具。\n"
+            "PCE is the preferred toolset for codebase understanding and navigation. "
+            "When you don't know where information resides, need to understand module responsibilities / "
+            "entry points / main call chains, or need to analyze what a change will affect, "
+            "use PCE first — do NOT manually traverse directories or batch-read files. "
+            "Use PCE for high-level understanding and unknown-location discovery; "
+            "use low-level read / exact-search tools only when you already know the precise file or identifier.\n"
         ),
     )
 
