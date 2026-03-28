@@ -17,7 +17,6 @@ import hashlib
 import json
 import logging
 import re
-import time
 import tomllib
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
@@ -28,7 +27,7 @@ import aiofiles
 import litellm
 
 from ._env import build_litellm_model, get_completion_overrides, get_env_text
-from .init_cognition_limits import TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS, TOPOLOGY_STAGE_MAX_ATTEMPTS
+from .init_cognition_limits import TOPOLOGY_STAGE_MAX_ATTEMPTS
 from .memory import (
     ANNOTATIONS_DIR,
     ANNOTATIONS_AREAS_DIR,
@@ -54,7 +53,6 @@ from .topology_cognition_agent import TopologyCognitionAgent
 
 logger = logging.getLogger(__name__)
 _TOPOLOGY_STAGE_MAX_ATTEMPTS = TOPOLOGY_STAGE_MAX_ATTEMPTS
-_TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS = TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS
 
 # 常量（与 indexer.py 共享的导航路径常量）
 ANNOTATIONS_INDEX_FILE = "index.md"
@@ -1806,6 +1804,34 @@ def _build_fallback_module_md(module_name: str, module_entries: list[IndexEntry]
             "",
             "## 风险与约束",
             "本文件由索引级回退逻辑生成，细粒度职责与边界仍应以 LLM 生成版本为准。",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _build_empty_module_skeleton_md(
+    module_name: str,
+    module_entries: list[IndexEntry],
+) -> str:
+    lines = [
+        f"# {module_name}",
+        "",
+        "## 覆盖文件",
+    ]
+    for entry in module_entries:
+        lines.append(f"- {entry.file_meta.path}")
+    lines.extend(
+        [
+            "",
+            "## 核心职责",
+            "",
+            "## 关键流程",
+            "",
+            "## 外部协作",
+            "",
+            "## 风险与约束",
+            "",
+            "## 关键符号",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -4031,6 +4057,17 @@ async def _write_area_fallback_modules(
         )
 
 
+async def _write_empty_module_skeletons(
+    module_specs: list[tuple[str, str, list[IndexEntry]]],
+    modules_dir: Path,
+) -> None:
+    for module_name, slug, module_entries in module_specs:
+        await _atomic_write_text(
+            modules_dir / f"{slug}.md",
+            _build_empty_module_skeleton_md(module_name, module_entries),
+        )
+
+
 async def _write_annotations_via_topology_agent(
     entries: list[IndexEntry],
     project_meta: ProjectMeta,
@@ -4187,112 +4224,11 @@ async def _write_annotations_via_topology_agent(
         sections_by_slug=stable_sections_by_slug,
         module_specs=module_specs,
     )
-
-    module_specs_by_slug = {
-        slug: (module_name, slug, module_entries)
-        for module_name, slug, module_entries in module_specs
-    }
-    total_fallback_modules = 0
-
-    for area in stable_tree.areas:
-        if not area.module_slugs:
-            continue
-        area_context = {
-            "project_summary": stable_tree.project_summary,
-            "area_slug": area.slug,
-            "area_display_name": area.display_name,
-            "area_summary": area.summary,
-            "modules": [
-                {
-                    "slug": module.slug,
-                    "display_name": module.display_name,
-                    "summary": module.summary,
-                    "file_paths": list(module.file_paths),
-                }
-                for module in area.modules
-            ],
-        }
-        area_started_ns = time.time_ns()
-        pending_modules = list(area.module_slugs)
-        invalid_modules: dict[str, list[str]] = {}
-
-        for attempt in range(1, _TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS + 1):
-            logger.info(
-                "topology init stage start: write_area_modules area=%s attempt=%d/%d",
-                area.slug,
-                attempt,
-                _TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS,
-            )
-            stage_error: BaseException | None = None
-            try:
-                area_result = await agent.run_stage(
-                    stage="write_area_modules",
-                    messages=messages,
-                    serena_client=serena_client,
-                    stage_context=area_context,
-                )
-                await _persist_topology_stage_debug(
-                    root_path,
-                    stage=f"write_area_modules_{area.slug}",
-                    payload=area_result,
-                    extra={"attempt": attempt},
-                )
-            except Exception as exc:
-                stage_error = exc
-                await _persist_topology_debug_error(
-                    root_path,
-                    stage=f"write_area_modules_{area.slug}",
-                    message=_format_exception_brief(exc),
-                    extra={"attempt": attempt},
-                )
-
-            completed_modules, pending_modules, invalid_modules = _collect_area_module_doc_status(
-                area,
-                modules_dir=modules_dir,
-                module_specs_by_slug=module_specs_by_slug,
-                area_started_ns=area_started_ns,
-            )
-            if not pending_modules and not invalid_modules:
-                logger.info(
-                    "topology init stage ok: write_area_modules area=%s modules=%d",
-                    area.slug,
-                    len(completed_modules),
-                )
-                break
-
-            if attempt < _TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS:
-                messages.append({
-                    "role": "user",
-                    "content": _build_area_retry_feedback(
-                        area,
-                        attempt=attempt,
-                        max_attempts=_TOPOLOGY_AREA_STAGE_MAX_ATTEMPTS,
-                        pending_modules=pending_modules,
-                        invalid_modules=invalid_modules,
-                        stage_error=stage_error,
-                    ),
-                })
-
-        if pending_modules or invalid_modules:
-            fallback_targets = sorted(set([*pending_modules, *invalid_modules]))
-            total_fallback_modules += len(fallback_targets)
-            logger.warning(
-                "area=%s 在多轮尝试后仍未补齐，改用逐模块 fallback: %s",
-                area.slug,
-                ", ".join(fallback_targets),
-            )
-            await _write_area_fallback_modules(
-                area,
-                modules_dir=modules_dir,
-                module_specs_by_slug=module_specs_by_slug,
-                target_slugs=fallback_targets,
-            )
-
+    await _write_empty_module_skeletons(module_specs, modules_dir)
     logger.info(
-        "Topology agent 认知导航写入完成: %d 个区域, %d 个模块文档, fallback_modules=%d",
+        "Topology agent 认知导航写入完成: %d 个区域, %d 个模块骨架文档",
         len(stable_tree.areas),
         len(module_specs),
-        total_fallback_modules,
     )
 
 
