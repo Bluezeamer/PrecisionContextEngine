@@ -293,44 +293,44 @@ def _build_tools(
         #   最佳实践: 优先用自然语言描述你要理解的问题，而不是只给精确标识符。
         #             可直接要求返回 file:line、name_path、候选文件列表、调用链摘要或按模块归纳的结果。
         #   避免误用: 当你已经知道精确文件或精确标识符，只需要查看局部实现或做精确字符串匹配时，不必先调用 pce_query。
-        #             若 target 已明确且任务变成”改它会影响哪里”，应转用 pce_impact。
+        #             若 target 已明确且任务变成"改它会影响哪里"，应转用 pce_impact。
         Tool(
-            name=”pce_query”,
+            name="pce_query",
             description=_make_tool_description(
                 purpose=(
-                    “The primary tool for codebase navigation and understanding. “
-                    “Best suited for locating entry points, main call chains, module responsibilities, “
-                    “candidate file scopes, and overall project/module comprehension.”
+                    "The primary tool for codebase navigation and understanding. "
+                    "Best suited for locating entry points, main call chains, module responsibilities, "
+                    "candidate file scopes, and overall project/module comprehension."
                 ),
                 use_when=(
-                    “Use when the target location is unclear. “
-                    “When you don't know which file contains the information, “
-                    “need to understand how a capability is roughly implemented, “
-                    “want to find entry points / main call chains / module responsibilities, “
-                    “or need to narrow down the search scope — use this tool first. “
-                    “Do NOT manually traverse directories or batch-read files before trying pce_query.”
+                    "Use when the target location is unclear. "
+                    "When you don't know which file contains the information, "
+                    "need to understand how a capability is roughly implemented, "
+                    "want to find entry points / main call chains / module responsibilities, "
+                    "or need to narrow down the search scope — use this tool first. "
+                    "Do NOT manually traverse directories or batch-read files before trying pce_query."
                 ),
                 best_practice=(
-                    “Prefer describing your question in natural language rather than just giving exact identifiers. “
-                    “You can request file:line references, name_path, candidate file lists, “
-                    “call chain summaries, or results grouped by module.”
+                    "Prefer describing your question in natural language rather than just giving exact identifiers. "
+                    "You can request file:line references, name_path, candidate file lists, "
+                    "call chain summaries, or results grouped by module."
                 ),
                 avoid_when=(
-                    “When you already know the exact file or exact identifier and only need to view “
-                    “local implementation or do exact string matching, pce_query is not necessary. “
-                    “If the target is already clear and the task becomes 'what will be affected by changing it', “
-                    “switch to pce_impact instead.”
+                    "When you already know the exact file or exact identifier and only need to view "
+                    "local implementation or do exact string matching, pce_query is not necessary. "
+                    "If the target is already clear and the task becomes 'what will be affected by changing it', "
+                    "switch to pce_impact instead."
                 ),
             ),
             inputSchema={
-                “type”: “object”,
-                “properties”: {
-                    “query”: {
-                        “type”: “string”,
-                        “description”: “Natural language question, e.g. 'Where is the entry point for authentication logic?'”,
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language question, e.g. 'Where is the entry point for authentication logic?'",
                     },
                 },
-                “required”: [“query”],
+                "required": ["query"],
             },
         ),
         # pce_impact 原中文描述:
@@ -338,51 +338,51 @@ def _build_tools(
         #         重点输出直接调用点、直接消费者、主要传播链、风险与建议修改顺序。
         #   适用时机: 当你已经明确要改哪个符号、字段、接口契约或文件，并想先了解它会影响哪里时，优先使用。
         #   最佳实践: 尽量提供明确的 target；若已知符号所在文件，也一起提供 file 以加速定位。
-        #             优先把问题提成具体变更，例如”修改某字段””调整某函数签名””删除某文件后会影响哪里”。
+        #             优先把问题提成具体变更，例如"修改某字段""调整某函数签名""删除某文件后会影响哪里"。
         #   避免误用: 如果 target 仍然模糊、还在多个候选之间摇摆，不要用 impact 代替定位步骤；应先使用 pce_query 收敛目标。
         #             若只是想看局部实现或精确定义，也不必先调用 impact。
         Tool(
-            name=”pce_impact”,
+            name="pce_impact",
             description=_make_tool_description(
                 purpose=(
-                    “The primary tool for analyzing the impact boundary of a known change target. “
-                    “Outputs direct call sites, direct consumers, main propagation chains, “
-                    “risks, and suggested modification order.”
+                    "The primary tool for analyzing the impact boundary of a known change target. "
+                    "Outputs direct call sites, direct consumers, main propagation chains, "
+                    "risks, and suggested modification order."
                 ),
                 use_when=(
-                    “Use when you already know which symbol, field, interface contract, or file to change, “
-                    “and want to understand what will be affected before making the change.”
+                    "Use when you already know which symbol, field, interface contract, or file to change, "
+                    "and want to understand what will be affected before making the change."
                 ),
                 best_practice=(
-                    “Provide an explicit target; if you know the file containing the symbol, “
-                    “also provide the file parameter to speed up resolution. “
-                    “Frame the question as a concrete change, e.g. 'modify field X', “
-                    “'change function signature of Y', 'what breaks if file Z is deleted'.”
+                    "Provide an explicit target; if you know the file containing the symbol, "
+                    "also provide the file parameter to speed up resolution. "
+                    "Frame the question as a concrete change, e.g. 'modify field X', "
+                    "'change function signature of Y', 'what breaks if file Z is deleted'."
                 ),
                 avoid_when=(
-                    “If the target is still ambiguous or you are choosing between multiple candidates, “
-                    “do not use impact as a substitute for the discovery step — use pce_query first to converge on the target. “
-                    “If you only want to view local implementation or exact definitions, impact is not necessary.”
+                    "If the target is still ambiguous or you are choosing between multiple candidates, "
+                    "do not use impact as a substitute for the discovery step — use pce_query first to converge on the target. "
+                    "If you only want to view local implementation or exact definitions, impact is not necessary."
                 ),
             ),
             inputSchema={
-                “type”: “object”,
-                “properties”: {
-                    “target”: {
-                        “type”: “string”,
-                        “description”: “The change target — a symbol name (e.g. UserSession) or file path.”,
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "The change target — a symbol name (e.g. UserSession) or file path.",
                     },
-                    “change_type”: {
-                        “type”: “string”,
-                        “description”: “Type of change: modify | rename | delete | add_field | change_signature”,
-                        “enum”: [“modify”, “rename”, “delete”, “add_field”, “change_signature”],
+                    "change_type": {
+                        "type": "string",
+                        "description": "Type of change: modify | rename | delete | add_field | change_signature",
+                        "enum": ["modify", "rename", "delete", "add_field", "change_signature"],
                     },
-                    “file”: {
-                        “type”: “string”,
-                        “description”: “File path containing the symbol (optional, speeds up resolution if provided).”,
+                    "file": {
+                        "type": "string",
+                        "description": "File path containing the symbol (optional, speeds up resolution if provided).",
                     },
                 },
-                “required”: [“target”, “change_type”],
+                "required": ["target", "change_type"],
             },
         ),
         # pce_sync 原中文描述:
