@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,8 @@ _MAX_FACT_TREE_DEPTH = 2
 _MAX_FACT_TREE_LINES = 160
 _MAX_STATS_ROWS = 48
 _MAX_BINARY_ROWS = 24
+_MAX_DIRTY_PATHS = 80
+_MAX_DIRTY_GROUPS = 32
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:
@@ -51,6 +53,25 @@ def _read_gitignore_patterns(project_root: Path) -> list[str]:
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
+            continue
+        patterns.append(line)
+    return _dedupe_keep_order(patterns)
+
+
+def _read_existing_pceignore_patterns(project_root: Path) -> list[str]:
+    path = project_root / ".pce" / "pceignore"
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text("utf-8")
+    except Exception:
+        return []
+    patterns: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line in _HARD_PATTERNS:
             continue
         patterns.append(line)
     return _dedupe_keep_order(patterns)
@@ -226,6 +247,47 @@ def _build_pceignore_facts(project_root: Path) -> dict[str, Any]:
     }
 
 
+def _build_dirty_parent_groups(project_root: Path, dirty_paths: list[str]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for rel_path in dirty_paths:
+        normalized = str(rel_path).strip().lstrip("./")
+        if not normalized:
+            continue
+        parent = Path(normalized).parent.as_posix()
+        if parent == ".":
+            parent = "."
+        grouped[parent].append(normalized)
+    rows = [
+        {
+            "path": path,
+            "dirty_count": len(paths),
+            "sample_files": sorted(paths)[:5],
+        }
+        for path, paths in grouped.items()
+    ]
+    rows.sort(key=lambda item: (-item["dirty_count"], item["path"]))
+    return rows[:_MAX_DIRTY_GROUPS]
+
+
+def _build_pceignore_refresh_facts(
+    project_root: Path,
+    *,
+    changed_files: list[str],
+    deleted_files: list[str],
+) -> dict[str, Any]:
+    base = _build_pceignore_facts(project_root)
+    dirty_changed = _dedupe_keep_order([str(item).strip() for item in changed_files if str(item).strip()])
+    dirty_deleted = _dedupe_keep_order([str(item).strip() for item in deleted_files if str(item).strip()])
+    base.update({
+        "mode": "refresh",
+        "current_pceignore_patterns": _read_existing_pceignore_patterns(project_root),
+        "dirty_changed_files": dirty_changed[:_MAX_DIRTY_PATHS],
+        "dirty_deleted_files": dirty_deleted[:_MAX_DIRTY_PATHS],
+        "dirty_parent_groups": _build_dirty_parent_groups(project_root, dirty_changed),
+    })
+    return base
+
+
 def _normalize_ignore_patterns(payload: dict[str, Any]) -> list[str]:
     raw = payload.get("ignore_patterns")
     if not isinstance(raw, list):
@@ -263,6 +325,28 @@ async def _write_pceignore(project_root: Path, ignore_patterns: list[str]) -> No
         "",
     ])
     await _atomic_write_text(project_root / ".pce" / "pceignore", content)
+
+
+def _normalize_refresh_payload(payload: dict[str, Any]) -> tuple[str, list[str], str]:
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in {"no_update", "append_patterns"}:
+        raise ValueError("refresh payload.action 必须是 no_update 或 append_patterns")
+    rationale = " ".join(str(payload.get("rationale") or "").strip().split())
+    patterns = _normalize_ignore_patterns(payload)
+    if action == "no_update" and patterns:
+        raise ValueError("action=no_update 时 ignore_patterns 必须为空")
+    if action == "append_patterns" and not patterns:
+        raise ValueError("action=append_patterns 时 ignore_patterns 不能为空")
+    return action, patterns, rationale
+
+
+def _build_refresh_retry_feedback(exc: Exception, *, attempt: int, max_attempts: int) -> str:
+    return "\n".join([
+        f"上一次 `pceignore_refresh` 输出未通过校验（第 {attempt}/{max_attempts} 次尝试）。",
+        f"错误：{type(exc).__name__}: {exc}",
+        "若无需更新，请输出 `{action:\"no_update\", ignore_patterns:[], rationale:\"...\"}`。",
+        "若需要更新，请输出 `{action:\"append_patterns\", ignore_patterns:[...], rationale:\"...\"}`，且 ignore_patterns 必须是最小增量。",
+    ])
 
 
 async def run_pceignore_stage(
@@ -316,3 +400,76 @@ async def run_pceignore_stage(
 
     logger.warning("pceignore stage 失败，降级写入最小规则: %s", last_exc)
     await _write_pceignore(project_root, [])
+
+
+async def run_pceignore_refresh_stage(
+    project_root: Path,
+    serena_client: SerenaClient,
+    *,
+    changed_files: list[str],
+    deleted_files: list[str] | None = None,
+    model: str | None = None,
+) -> str:
+    target = project_root / ".pce" / "pceignore"
+    if not target.exists():
+        await run_pceignore_stage(project_root, serena_client, model=model)
+        return "rebuilt_missing"
+    dirty_changed = _dedupe_keep_order(changed_files)
+    dirty_deleted = _dedupe_keep_order(deleted_files or [])
+    if not dirty_changed and not dirty_deleted:
+        return "no_dirty"
+
+    facts = _build_pceignore_refresh_facts(
+        project_root,
+        changed_files=dirty_changed,
+        deleted_files=dirty_deleted,
+    )
+    agent = TopologyCognitionAgent(
+        project_root=project_root,
+        discovery_facts=facts,
+        model=model,
+        max_seconds=120.0,
+    )
+    messages = agent.build_initial_messages()
+
+    last_exc: Exception | None = None
+    for attempt in range(1, PCEIGNORE_STAGE_MAX_ATTEMPTS + 1):
+        logger.info(
+            "pceignore refresh stage start: attempt=%d/%d changed=%d deleted=%d",
+            attempt,
+            PCEIGNORE_STAGE_MAX_ATTEMPTS,
+            len(dirty_changed),
+            len(dirty_deleted),
+        )
+        try:
+            payload = await agent.run_stage(
+                stage="pceignore_refresh",
+                messages=messages,
+                serena_client=serena_client,
+            )
+            action, patterns, rationale = _normalize_refresh_payload(payload)
+            if action == "no_update":
+                logger.info("pceignore refresh: no_update%s", f" ({rationale})" if rationale else "")
+                return "no_update"
+            await _write_pceignore(project_root, patterns)
+            logger.info(
+                "pceignore refresh: appended %d patterns%s",
+                len(patterns),
+                f" ({rationale})" if rationale else "",
+            )
+            return "updated"
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= PCEIGNORE_STAGE_MAX_ATTEMPTS:
+                break
+            messages.append({
+                "role": "user",
+                "content": _build_refresh_retry_feedback(
+                    exc,
+                    attempt=attempt,
+                    max_attempts=PCEIGNORE_STAGE_MAX_ATTEMPTS,
+                ),
+            })
+
+    logger.warning("pceignore refresh stage 失败，保持现有规则不变: %s", last_exc)
+    return "failed_no_change"

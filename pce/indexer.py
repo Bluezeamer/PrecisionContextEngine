@@ -379,7 +379,7 @@ from .annotation_writer import (  # noqa: E402
     _update_annotations_incremental,
     _write_structure_md,
 )
-from .pceignore_stage import run_pceignore_stage
+from .pceignore_stage import run_pceignore_refresh_stage, run_pceignore_stage
 
 
 # ============================================================================
@@ -491,7 +491,16 @@ async def build_index(
 
     pceignore_start = time.monotonic()
     try:
-        await run_pceignore_stage(root_path, serena_client, model=model)
+        if changed_files or (deleted_files or []):
+            await run_pceignore_refresh_stage(
+                root_path,
+                serena_client,
+                changed_files=changed_files,
+                deleted_files=deleted_files or [],
+                model=model,
+            )
+        else:
+            await run_pceignore_stage(root_path, serena_client, model=model)
     except Exception as e:
         logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
     finally:
@@ -645,7 +654,16 @@ async def build_index_incremental(
     start_time = time.monotonic()
 
     try:
-        await run_pceignore_stage(root_path, serena_client, model=model)
+        if changed_files or (deleted_files or []):
+            await run_pceignore_refresh_stage(
+                root_path,
+                serena_client,
+                changed_files=changed_files,
+                deleted_files=deleted_files or [],
+                model=model,
+            )
+        else:
+            await run_pceignore_stage(root_path, serena_client, model=model)
     except Exception as e:
         logger.warning(f"生成 .pce/pceignore 失败（已忽略）: {e}")
 

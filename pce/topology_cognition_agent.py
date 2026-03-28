@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_SECONDS = 180.0
 _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE: dict[str, frozenset[str]] = {
     "pceignore": frozenset({"read_file", "search_for_pattern"}),
+    "pceignore_refresh": frozenset({"read_file", "search_for_pattern"}),
     "navigation_tree": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
     "write_area_modules": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
 }
@@ -107,7 +108,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         self._stage_context = dict(stage_context or {})
         if stage != "write_area_modules":
             self._stage_context = {}
-        if stage == "pceignore":
+        if stage in {"pceignore", "pceignore_refresh"}:
             self._stage_tool_budget_total = PCEIGNORE_STAGE_TOOL_BUDGET
             self._stage_tool_budget_used = 0
             self._stage_budget_exhausted_notified = False
@@ -158,12 +159,14 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- 目标是形成稳定导航与轻量模块认知，不展开内部实现细节，不穷举符号。",
                 "- 若证据不足，宁可保持较粗但稳定的划分，也不要切出很多脆弱小模块。",
                 "- stage1 为 `pceignore` 阶段：允许有限探索后给出保守过滤规则，用于减少后续索引噪声。",
+                "- `pceignore_refresh` 阶段沿用相同的轻量探索与预算机制，但目标是判断当前 ignore 边界是否需要增量修正。",
                 "- 每次工具调用后都会收到剩余预算提示；预算耗尽后必须基于现有证据强制收口。",
                 "- 第一阶段若未通过后处理校验，会收到错误反馈要求重试；请根据反馈修正，而不是退回粗糙 fallback。",
                 "- 第二阶段按 area 顺序写模块文档；允许多轮修正，直到 Python 侧确认当前 area 完成。",
                 "",
                 "## 阶段输出约束",
                 "- stage1 输出 `pceignore`：提交 `{ignore_patterns:[...]}`。",
+                "- `pceignore_refresh` 输出 `{action, ignore_patterns, rationale}`，其中 `action` 只能是 `no_update` 或 `append_patterns`。",
                 "- stage2 输出 `navigation_tree`：直接给出 project -> areas -> modules 的完整导航树。",
                 "- stage3 不再输出大 JSON；而是直接调用 `write_module_annotation` 写当前 area 下的模块文档。",
                 "- 当当前 area 全部处理完后，调用 `mark_area_done`，再调用 `deliver(answer='stage done')`。",
@@ -202,6 +205,18 @@ class TopologyCognitionAgent(BaseReActAgent):
                     "本阶段最多允许有限工具探索；每次调用工具后你会收到预算反馈。",
                     "预算耗尽后必须停止探索，并基于当前证据提交结果。",
                     "先提交 pceignore 阶段结果，再调用 deliver(answer=\"stage done\")。",
+                ]
+            )
+        if stage == "pceignore_refresh":
+            return "\n".join(
+                [
+                    "当前阶段：`pceignore_refresh`。",
+                    "请基于已注入的 dirty files、当前 `.pce/pceignore`、目录摘要与统计事实，判断当前 ignore 边界是否需要增量更新。",
+                    "若当前规则仍然足够，请输出 `action=no_update` 并直接结束。",
+                    "若需要更新，请仅输出最小增量 ignore patterns，避免重建整份 `.pce/pceignore`。",
+                    "本阶段允许有限工具探索；每次调用工具后你会收到预算反馈。",
+                    "预算耗尽后必须停止探索，并基于当前证据提交结果。",
+                    "先提交 refresh 阶段结果，再调用 deliver(answer=\"stage done\")。",
                 ]
             )
         if stage == "navigation_tree":
@@ -257,7 +272,10 @@ class TopologyCognitionAgent(BaseReActAgent):
     ) -> list[dict[str, Any]]:
         filtered = []
         allowed_names = _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE.get(self._active_stage or "", frozenset())
-        allow_exploration = not (self._active_stage == "pceignore" and self._stage_tool_budget_used >= self._stage_tool_budget_total > 0)
+        allow_exploration = not (
+            self._active_stage in {"pceignore", "pceignore_refresh"}
+            and self._stage_tool_budget_used >= self._stage_tool_budget_total > 0
+        )
         for schema in serena_client.tools_schema:
             try:
                 name = schema["function"]["name"]
@@ -289,7 +307,7 @@ class TopologyCognitionAgent(BaseReActAgent):
 
     async def on_before_round(self, state: LoopState) -> None:
         if (
-            self._active_stage == "pceignore"
+            self._active_stage in {"pceignore", "pceignore_refresh"}
             and self._stage_tool_budget_total > 0
             and self._stage_tool_budget_used >= self._stage_tool_budget_total
             and not self._stage_budget_exhausted_notified
@@ -298,14 +316,14 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "role": "user",
                 "content": (
                     "工具预算已耗尽，禁止继续探索。"
-                    "请基于当前已掌握的目录结构与证据，输出最保守可用的 `ignore_patterns`。"
+                    "请基于当前已掌握的目录结构与证据，输出最保守可用的结果。"
                     "不要误伤可能属于源码、配置、脚本、测试、关键文档的路径。"
                 ),
             })
             self._stage_budget_exhausted_notified = True
 
     def _stage_budget_note(self) -> str:
-        if self._active_stage != "pceignore" or self._stage_tool_budget_total <= 0:
+        if self._active_stage not in {"pceignore", "pceignore_refresh"} or self._stage_tool_budget_total <= 0:
             return ""
         remaining = max(0, self._stage_tool_budget_total - self._stage_tool_budget_used)
         return (
@@ -414,8 +432,8 @@ class TopologyCognitionAgent(BaseReActAgent):
             return _ok(_safe_json_dumps(self._discovery_facts))
 
         if name == "tree_snapshot":
-            if self._active_stage != "pceignore":
-                return _err("tree_snapshot 只能在 pceignore 阶段使用")
+            if self._active_stage not in {"pceignore", "pceignore_refresh"}:
+                return _err("tree_snapshot 只能在 pceignore / pceignore_refresh 阶段使用")
             root = str(args.get("root") or ".").strip() or "."
             max_depth = max(1, min(4, int(args.get("max_depth") or 2)))
             max_lines = max(20, min(240, int(args.get("max_lines") or 120)))
@@ -469,7 +487,7 @@ class TopologyCognitionAgent(BaseReActAgent):
                 },
             },
         ]
-        if self._active_stage == "pceignore":
+        if self._active_stage in {"pceignore", "pceignore_refresh"}:
             tools.append({
                 "type": "function",
                 "function": {
@@ -603,8 +621,8 @@ class TopologyCognitionAgent(BaseReActAgent):
         tool_name = _get_tool_name(tool_call) or "unknown"
         result = await super()._invoke_serena(tool_call, serena_client, state=state)
         if (
-            self._active_stage == "pceignore"
-            and tool_name in _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE["pceignore"]
+            self._active_stage in {"pceignore", "pceignore_refresh"}
+            and tool_name in _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE[self._active_stage]
             and self._stage_tool_budget_total > 0
         ):
             self._stage_tool_budget_used += 1
