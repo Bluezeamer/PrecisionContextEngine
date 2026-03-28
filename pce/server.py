@@ -299,21 +299,22 @@ def _build_tools(
             description=_make_tool_description(
                 purpose=(
                     "The primary tool for codebase navigation and understanding. "
-                    "Best suited for locating entry points, main call chains, module responsibilities, "
-                    "candidate file scopes, and overall project/module comprehension."
+                    "Best suited for project-level understanding, architecture overviews, major module responsibilities, "
+                    "entry points, main call chains, candidate file scopes, and overall project/module comprehension."
                 ),
                 use_when=(
                     "Use when the target location is unclear. "
-                    "When you don't know which file contains the information, "
-                    "need to understand how a capability is roughly implemented, "
+                    "When you do not know which file contains the information, "
+                    "need to understand what the project or a subsystem does, "
+                    "need a rough architecture or module-level picture, "
                     "want to find entry points / main call chains / module responsibilities, "
                     "or need to narrow down the search scope — use this tool first. "
-                    "Do NOT manually traverse directories or batch-read files before trying pce_query."
+                    "Do NOT manually traverse directories, broadly inspect the repo, or batch-read files before trying pce_query."
                 ),
                 best_practice=(
                     "Prefer describing your question in natural language rather than just giving exact identifiers. "
-                    "You can request file:line references, name_path, candidate file lists, "
-                    "call chain summaries, or results grouped by module."
+                    "This tool is especially appropriate for questions like what the project does, how a subsystem is organized, where a feature lives, or which modules participate in a workflow. "
+                    "You can request file:line references, name_path, candidate file lists, call chain summaries, or results grouped by module."
                 ),
                 avoid_when=(
                     "When you already know the exact file or exact identifier and only need to view "
