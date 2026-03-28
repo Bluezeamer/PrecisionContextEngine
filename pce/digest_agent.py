@@ -38,6 +38,15 @@ from .base_agent import (
     _get_tool_name,
     _safe_json_dumps,
 )
+from .digest_cognition_agent import run_digest_router, run_digest_worker
+from .digest_router import (
+    DigestPlanResult,
+    DigestPlannerV2,
+    DigestRouteDecision,
+    DigestTaskV2,
+    refresh_digest_navigation,
+    route_digest_task,
+)
 from .digest_delta_builder import DigestDeltaBuilder
 from .insight_cache import InsightCache
 from .memory import delete_file_baseline, save_file_baseline
@@ -70,6 +79,13 @@ ALLOWED_EXTENSION_SECTION_PREFIXES: tuple[str, ...] = (
 _DIGEST_TASKS_REL = Path(".pce") / "digest_tasks.json"
 _DEFAULT_MAX_SECONDS = 300.0
 _DEFAULT_DIGEST_BATCH_SIZE = 4
+_DIGEST_ROUTER_ALLOWED_SERENA_TOOL_NAMES = frozenset(
+    {"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}
+)
+_DIGEST_WORKER_BUDGET_MIN = 10
+_DIGEST_WORKER_BUDGET_MAX = 60
+_DIGEST_WORKER_BUDGET_FACTOR = 3
+_DIGEST_WORKER_MAX_ATTEMPTS = 3
 
 _REACT_FAILURE_MESSAGES: dict[str, str] = {
     REACT_TIMEOUT_BUDGET: "DigestAgent ReAct 循环超时，已达最大时间预算",
@@ -299,14 +315,21 @@ class DigestAgent(BaseReActAgent):
             schema["function"]["name"] for schema in self._virtual_tools
         }
         self._task_list: DigestTaskList | None = None
+        self._tool_budget_total = 0
+        self._tool_budget_used = 0
+        self._budget_exhausted_notified = False
 
     async def run(
         self,
         *,
         task_list: DigestTaskList,
         serena_client: SerenaClient,
+        retry_feedback: str | None = None,
     ) -> dict[str, Any]:
         self._task_list = task_list
+        self._tool_budget_total = self._compute_tool_budget(task_list)
+        self._tool_budget_used = 0
+        self._budget_exhausted_notified = False
 
         if not task_list.items:
             return {
@@ -329,6 +352,8 @@ class DigestAgent(BaseReActAgent):
                 ),
             },
         ]
+        if retry_feedback:
+            messages.append({"role": "user", "content": retry_feedback})
 
         summary, _ = await self.run_loop(messages, serena_client)
         # 检查是否为异常终止
@@ -421,6 +446,7 @@ class DigestAgent(BaseReActAgent):
                 "- 优先消化 digest_delta 中的 annotation_baseline、related_insights、changed_files、patch_blocks。",
                 "- 若 changed_files_count=0 且 related_insights_count>0，默认先基于 annotation_baseline 和 related_insights 直接修正文档，不要先调用 Serena。",
                 "- 若 digest_delta 已足够支撑认知修正，尽量直接 deliver 或 write_annotation_and_mark_done，不要无谓探索。",
+                "- 探索预算有限，优先高价值、窄范围探索；目标是沉淀增量认知，而不是重建全量认知。",
                 "- 若 `change_scope_hint=route`，默认视为导航/挂载变化；尽量少改模块正文，只在覆盖文件或明显失真时做最小修正。",
                 "- 若 `change_scope_hint=module`，默认优先更新该模块正文，不要为了求完整而扩散到其它模块。",
                 "- 若 `change_scope_hint=agent_decide`，先基于事实判断影响层级，再决定是否需要实质改写模块正文。",
@@ -429,6 +455,7 @@ class DigestAgent(BaseReActAgent):
                 "- 同一 module_slug 的多个任务尽量连续处理，减少重复探索与重复写入。",
                 "- 一旦证据足够，立即调用 write_annotation_and_mark_done 或 mark_task_done 收尾，不要把收尾拖到最后。",
                 "- 若时间预算所剩不多且证据仍不足，调用 mark_task_skipped 写清原因，不要继续扩散探索。",
+                "- 若探索预算耗尽，必须基于当前证据直接收口：能更新就最小更新，不能确认就 mark_task_skipped。",
                 "",
                 "## 输入说明",
                 "- `changed_paths_preview` 是当前模块改动文件的预览，优先据此定位需要核对的 patch blocks。",
@@ -529,7 +556,18 @@ class DigestAgent(BaseReActAgent):
                 },
             },
         }
-        return serena_client.tools_schema + self._virtual_tools + [digest_deliver]
+        filtered_serena_tools = []
+        for schema in serena_client.tools_schema:
+            try:
+                name = schema["function"]["name"]
+            except Exception:
+                continue
+            if (
+                name in _DIGEST_ROUTER_ALLOWED_SERENA_TOOL_NAMES
+                and self._tool_budget_used < self._tool_budget_total
+            ):
+                filtered_serena_tools.append(schema)
+        return filtered_serena_tools + self._virtual_tools + [digest_deliver]
 
     @property
     def virtual_tool_names(self) -> set[str]:
@@ -542,6 +580,20 @@ class DigestAgent(BaseReActAgent):
             state.elapsed,
             len(self._task_list.pending_items()) if self._task_list else -1,
         )
+        if (
+            self._tool_budget_total > 0
+            and self._tool_budget_used >= self._tool_budget_total
+            and not self._budget_exhausted_notified
+        ):
+            self._append(state, {
+                "role": "user",
+                "content": (
+                    "探索预算已耗尽。请停止继续 Serena 探索，"
+                    "基于当前 digest facts、annotation 基线与已掌握代码证据直接收口。"
+                    "目标是沉淀增量认知，不是补齐全量认知。"
+                ),
+            })
+            self._budget_exhausted_notified = True
 
     async def on_budget_warning(self, state: LoopState) -> None:
         self._append(state, {
@@ -719,6 +771,25 @@ class DigestAgent(BaseReActAgent):
 
         return _err(f"未知虚拟工具: {name}")
 
+    def _compute_tool_budget(self, task_list: DigestTaskList) -> int:
+        insight_count = 0
+        dirty_count = 0
+        for item in task_list.items:
+            delta = item.digest_delta
+            if delta is None:
+                continue
+            insight_count += len(delta.related_insights)
+            dirty_count += len(delta.changed_files)
+        raw = _DIGEST_WORKER_BUDGET_FACTOR * (insight_count + dirty_count)
+        return max(_DIGEST_WORKER_BUDGET_MIN, min(_DIGEST_WORKER_BUDGET_MAX, raw))
+
+    def _budget_note(self) -> str:
+        remaining = max(0, self._tool_budget_total - self._tool_budget_used)
+        return (
+            f"\n\n[预算提示] 已使用 {self._tool_budget_used}/{self._tool_budget_total} 次探索预算，"
+            f"剩余 {remaining} 次。请优先高价值、窄范围探索。"
+        )
+
     # ── 私有方法 ─────────────────────────────────────────────────────────
 
     def _build_virtual_tools(self) -> list[dict[str, Any]]:
@@ -870,6 +941,22 @@ class DigestAgent(BaseReActAgent):
     def _find_task(self, task_id: str) -> DigestTaskItem | None:
         assert self._task_list is not None
         return next((item for item in self._task_list.items if item.id == task_id), None)
+
+    async def _invoke_serena(
+        self,
+        tool_call: Any,
+        serena_client: SerenaClient,
+        state: LoopState | None = None,
+    ) -> dict[str, Any]:
+        result = await super()._invoke_serena(tool_call, serena_client, state=state)
+        tool_name = _get_tool_name(tool_call) or ""
+        if (
+            tool_name in _DIGEST_ROUTER_ALLOWED_SERENA_TOOL_NAMES
+            and self._tool_budget_used < self._tool_budget_total
+        ):
+            self._tool_budget_used += 1
+            result["content"] = str(result.get("content") or "") + self._budget_note()
+        return result
 
     async def _update_task_status(
         self,
@@ -1098,15 +1185,17 @@ async def run_digest(
             logger.info("Digest 阶段耗时: sweep_stale=%.2fs", time.monotonic() - sweep_start)
 
     planner_start = time.monotonic()
-    planner = DigestPlanner(project_root=project_root, insight_cache=insight_cache)
-    task_list = await planner.build(dirty_state)
+    plan = await DigestPlannerV2(
+        project_root=project_root,
+        insight_cache=insight_cache,
+    ).build(dirty_state)
     logger.info(
         "Digest 阶段耗时: planner_build=%.2fs (tasks=%d)",
         time.monotonic() - planner_start,
-        len(task_list.items),
+        len(plan.tasks),
     )
 
-    if not task_list.items:
+    if not plan.tasks:
         logger.info("Digest 跳过：当前无可执行的模块级 delta")
         # 仍然执行 cleanup 清除已 stale 的条目
         cleanup_start = time.monotonic()
@@ -1128,65 +1217,52 @@ async def run_digest(
             "resolved_tasks": 0,
             "pending_tasks": 0,
             "deleted_insights": 0,
-            "warnings": task_list.warnings,
+            "warnings": plan.warnings,
         }
 
-    task_list_path = project_root.resolve() / _DIGEST_TASKS_REL
     run_tasks_start = time.monotonic()
-    try:
-        result = await _run_module_tasks(
-            task_list=task_list,
-            task_list_path=task_list_path,
-            project_root=project_root,
-            serena_client=serena_client,
-            model=model,
-            provider=provider,
-        )
-        logger.info(
-            "Digest 阶段耗时: run_module_tasks=%.2fs",
-            time.monotonic() - run_tasks_start,
-        )
-    finally:
-        # 无论成功失败，都尝试清理临时任务文件和 stale insight（各自独立兜底，不覆盖原始异常）
-        task_file_cleanup_start = time.monotonic()
-        try:
-            await task_list.delete(task_list_path)
-        except Exception as e:
-            logger.warning("Digest 清理任务文件失败（已忽略）: %s", e)
-        finally:
-            logger.info(
-                "Digest 阶段耗时: cleanup_task_file=%.2fs",
-                time.monotonic() - task_file_cleanup_start,
-            )
-        cleanup_start = time.monotonic()
-        try:
-            removed = await insight_cache.cleanup_stale()
-            if removed:
-                logger.info("Digest cleanup_stale: 删除 %d 条", removed)
-        except Exception as e:
-            logger.warning("Digest cleanup_stale 失败（已忽略）: %s", e)
-        finally:
-            logger.info(
-                "Digest 阶段耗时: cleanup_stale=%.2fs",
-                time.monotonic() - cleanup_start,
-            )
+    result = await _run_digest_plan_v2(
+        plan=plan,
+        project_root=project_root,
+        serena_client=serena_client,
+        model=model,
+        provider=provider,
+    )
+    logger.info(
+        "Digest 阶段耗时: run_router_and_workers=%.2fs",
+        time.monotonic() - run_tasks_start,
+    )
 
     baseline_start = time.monotonic()
-    await _advance_file_baselines(project_root=project_root, task_list=task_list)
+    await _advance_file_baselines(
+        project_root=project_root,
+        task_list=result["baseline_task_list"],
+    )
     logger.info(
         "Digest 阶段耗时: advance_file_baselines=%.2fs",
         time.monotonic() - baseline_start,
     )
 
-    # 只删除已被内化（done）的 insight；skipped 说明缺乏证据暂缓处理，保留供后续重试
     delete_insights_start = time.monotonic()
-    consumed_ids = _collect_consumed_insight_ids(task_list)
+    consumed_ids = _collect_consumed_insight_ids(result["consumed_task_list"])
     deleted_count = await insight_cache.delete_by_ids(consumed_ids)
     logger.info(
         "Digest 阶段耗时: delete_consumed_insights=%.2fs (deleted=%d)",
         time.monotonic() - delete_insights_start,
         deleted_count,
     )
+    cleanup_start = time.monotonic()
+    try:
+        removed = await insight_cache.cleanup_stale()
+        if removed:
+            logger.info("Digest cleanup_stale: 删除 %d 条", removed)
+    except Exception as e:
+        logger.warning("Digest cleanup_stale 失败（已忽略）: %s", e)
+    finally:
+        logger.info(
+            "Digest 阶段耗时: cleanup_stale=%.2fs",
+            time.monotonic() - cleanup_start,
+        )
     logger.info("Digest 总耗时: %.2fs", time.monotonic() - digest_start)
 
     return {
@@ -1196,6 +1272,199 @@ async def run_digest(
         "pending_tasks": result["pending_tasks"],
         "deleted_insights": deleted_count,
         "warnings": result["warnings"],
+    }
+
+
+def _to_legacy_done_task_list(deltas: list[ModuleDigestDelta]) -> DigestTaskList:
+    return DigestTaskList(
+        items=[
+            DigestTaskItem(
+                id=f"module:{delta.module_slug}",
+                kind="module",
+                status="done",
+                module_slug=delta.module_slug,
+                digest_delta=delta,
+            )
+            for delta in deltas
+        ],
+        warnings=[],
+        created_at=_utc_now(),
+    )
+
+
+def _to_legacy_pending_task_list(deltas: list[ModuleDigestDelta]) -> DigestTaskList:
+    return DigestTaskList(
+        items=[
+            DigestTaskItem(
+                id=f"module:{delta.module_slug}",
+                kind="module",
+                status="pending",
+                module_slug=delta.module_slug,
+                digest_delta=delta,
+            )
+            for delta in deltas
+        ],
+        warnings=[],
+        created_at=_utc_now(),
+    )
+
+
+def _select_module_deltas_for_plans(
+    task: DigestTaskV2,
+    decision: DigestRouteDecision,
+) -> list[ModuleDigestDelta]:
+    selected: list[ModuleDigestDelta] = []
+    selected_slugs = {
+        plan.module_slug
+        for plan in decision.module_update_plans
+        if plan.action != "no_change"
+    }
+    for delta in task.deltas:
+        if delta.module_slug in selected_slugs:
+            selected.append(delta)
+    return selected
+
+
+async def _run_digest_plan_v2(
+    *,
+    plan: DigestPlanResult,
+    project_root: Path,
+    serena_client: SerenaClient,
+    model: str | None,
+    provider: str | None,
+) -> dict[str, Any]:
+    warnings: list[str] = list(plan.warnings)
+    summaries: list[str] = []
+    baseline_done = DigestTaskList(items=[], warnings=[], created_at=_utc_now())
+    consumed_done = DigestTaskList(items=[], warnings=[], created_at=_utc_now())
+    resolved_tasks = 0
+    pending_tasks = 0
+
+    for task in plan.tasks:
+        logger.info(
+            "Digest Router start: id=%s level=%s kind=%s modules=%d dirty=%d insights=%d",
+            task.id,
+            task.task_level,
+            task.task_kind,
+            len(task.affected_module_slugs),
+            len(task.dirty_files),
+            len(task.related_insight_ids),
+        )
+        try:
+            decision = await run_digest_router(
+                project_root=project_root,
+                task=task,
+                serena_client=serena_client,
+                model=model,
+                provider=provider,
+            )
+        except Exception as exc:
+            pending_tasks += 1
+            warnings.append(f"Digest 路由失败: {task.id}: {exc}")
+            continue
+
+        logger.info(
+            "Digest Router decision: id=%s decision=%s nav=%s modules=%d",
+            task.id,
+            decision.decision,
+            decision.requires_navigation_update,
+            len(decision.module_update_plans),
+        )
+
+        if decision.decision == "unresolved":
+            pending_tasks += 1
+            warnings.append(
+                f"Digest unresolved: {task.id}: {decision.unresolved_reason or decision.rationale or '证据不足'}"
+            )
+            continue
+
+        if decision.requires_navigation_update:
+            try:
+                nav_result = await refresh_digest_navigation(
+                    project_root=project_root,
+                    serena_client=serena_client,
+                    model=model,
+                )
+                summaries.append(
+                    f"[{task.id}] navigation refreshed: {nav_result.get('areas', 0)} areas / {nav_result.get('modules', 0)} modules"
+                )
+            except Exception as exc:
+                pending_tasks += 1
+                warnings.append(f"Digest navigation 刷新失败: {task.id}: {exc}")
+                continue
+
+        if decision.decision == "no_update" or decision.decision == "update_navigation_only":
+            done_list = _to_legacy_done_task_list(task.deltas)
+            baseline_done.items.extend(done_list.items)
+            consumed_done.items.extend(done_list.items)
+            resolved_tasks += 1
+            rationale = decision.rationale or "无需修改认知文档"
+            summaries.append(f"[{task.id}] {decision.decision}: {rationale}")
+            continue
+
+        selected_deltas = _select_module_deltas_for_plans(task, decision)
+        if not selected_deltas:
+            done_list = _to_legacy_done_task_list(task.deltas)
+            baseline_done.items.extend(done_list.items)
+            consumed_done.items.extend(done_list.items)
+            resolved_tasks += 1
+            summaries.append(f"[{task.id}] no module delta selected")
+            continue
+
+        plan_by_slug = {
+            plan.module_slug: plan
+            for plan in decision.module_update_plans
+            if plan.action != "no_change"
+        }
+        task_pending = False
+        handled_slugs = {delta.module_slug for delta in selected_deltas}
+        for delta in selected_deltas:
+            plan_item = plan_by_slug.get(delta.module_slug)
+            if plan_item is None:
+                continue
+            try:
+                worker_result = await run_digest_worker(
+                    project_root=project_root,
+                    task=task,
+                    delta=delta,
+                    plan=plan_item,
+                    serena_client=serena_client,
+                    model=model,
+                    provider=provider,
+                )
+            except Exception as exc:
+                task_pending = True
+                warnings.append(f"任务执行失败: module:{delta.module_slug}: {exc}")
+                continue
+
+            if worker_result.status == "done":
+                done_item = _to_legacy_done_task_list([delta]).items[0]
+                baseline_done.items.append(done_item)
+                consumed_done.items.append(done_item)
+                summaries.append(f"[{delta.module_slug}] {worker_result.note}")
+            else:
+                task_pending = True
+                warnings.append(f"模块跳过: {delta.module_slug}: {worker_result.note}")
+
+        omitted_deltas = [
+            delta for delta in task.deltas if delta.module_slug not in handled_slugs
+        ]
+        if omitted_deltas:
+            omitted_done = _to_legacy_done_task_list(omitted_deltas)
+            baseline_done.items.extend(omitted_done.items)
+            consumed_done.items.extend(omitted_done.items)
+        if task_pending:
+            pending_tasks += 1
+        else:
+            resolved_tasks += 1
+
+    return {
+        "summary": "\n\n".join(item for item in summaries if item).strip(),
+        "resolved_tasks": resolved_tasks,
+        "pending_tasks": pending_tasks,
+        "warnings": warnings,
+        "baseline_task_list": baseline_done,
+        "consumed_task_list": consumed_done,
     }
 
 
@@ -1247,34 +1516,70 @@ async def _run_module_tasks(
     batches = _chunk_digest_items(pending_items, batch_size=batch_size)
 
     async def _run_one(index: int, item: DigestTaskItem) -> tuple[int, str, list[str]]:
-        sub_task_path = _module_task_list_path(task_list_path, item)
-        sub_task_list = DigestTaskList(
-            items=[item],
-            warnings=[],
-            created_at=_utc_now(),
-        )
-        await sub_task_list.save(sub_task_path)
-        try:
-            agent = DigestAgent(
-                project_root=project_root,
-                task_list_path=sub_task_path,
-                model=model,
-                provider=provider,
+        feedback: str | None = None
+        last_exc: Exception | None = None
+        for attempt in range(1, _DIGEST_WORKER_MAX_ATTEMPTS + 1):
+            sub_task_path = _module_task_list_path(task_list_path, item)
+            sub_item = DigestTaskItem(
+                id=item.id,
+                kind=item.kind,
+                status="pending",
+                note=None,
+                module_slug=item.module_slug,
+                digest_delta=item.digest_delta,
             )
-            result = await agent.run(task_list=sub_task_list, serena_client=serena_client)
-        except Exception as exc:
-            return index, "", [f"任务执行失败: {item.id}: {exc}"]
-        finally:
+            sub_task_list = DigestTaskList(
+                items=[sub_item],
+                warnings=[],
+                created_at=_utc_now(),
+            )
+            await sub_task_list.save(sub_task_path)
             try:
-                await sub_task_list.delete(sub_task_path)
+                agent = DigestAgent(
+                    project_root=project_root,
+                    task_list_path=sub_task_path,
+                    model=model,
+                    provider=provider,
+                )
+                if feedback:
+                    result = await agent.run(
+                        task_list=sub_task_list,
+                        serena_client=serena_client,
+                        retry_feedback=feedback,
+                    )
+                else:
+                    result = await agent.run(
+                        task_list=sub_task_list,
+                        serena_client=serena_client,
+                    )
+                task_warnings = list(result.get("warnings", []))
+                if sub_item.status == "pending":
+                    task_warnings.append(f"任务未完成: {item.id}")
+                    if attempt < _DIGEST_WORKER_MAX_ATTEMPTS:
+                        feedback = (
+                            f"上一次 worker 尝试后任务仍未完成（第 {attempt}/{_DIGEST_WORKER_MAX_ATTEMPTS} 次）。\n"
+                            "请停止无效探索，直接收口：能更新就用最小改动写回，否则 mark_task_skipped。"
+                        )
+                        continue
+                item.status = sub_item.status
+                item.note = sub_item.note
+                summary = str(result.get("summary") or "").strip()
+                return index, summary, task_warnings
             except Exception as exc:
-                logger.warning("Digest 清理模块任务文件失败（已忽略）: %s", exc)
+                last_exc = exc
+                if attempt >= _DIGEST_WORKER_MAX_ATTEMPTS:
+                    break
+                feedback = (
+                    f"上一次 worker 尝试失败（第 {attempt}/{_DIGEST_WORKER_MAX_ATTEMPTS} 次）：{exc}\n"
+                    "请根据错误反馈修正工具调用或输出，并继续以最小必要探索完成认知沉淀。"
+                )
+            finally:
+                try:
+                    await sub_task_list.delete(sub_task_path)
+                except Exception as exc:
+                    logger.warning("Digest 清理模块任务文件失败（已忽略）: %s", exc)
 
-        task_warnings = list(result.get("warnings", []))
-        if item.status == "pending":
-            task_warnings.append(f"任务未完成: {item.id}")
-        summary = str(result.get("summary") or "").strip()
-        return index, summary, task_warnings
+        return index, "", [f"任务执行失败: {item.id}: {last_exc or '未知错误'}"]
 
     ordered_summaries: list[str] = [""] * len(pending_items)
     for batch_no, batch in enumerate(batches, start=1):

@@ -35,6 +35,7 @@ from .memory import (
     NAVIGATION_TREE_FILE,
     _atomic_write_text,
     load_file_baseline,
+    load_index,
 )
 from .module_annotation_contract import validate_module_annotation_markdown
 from .models import (
@@ -4082,6 +4083,34 @@ async def _write_annotations_via_topology_agent(
         return
 
     modules_dir = _annotation_modules_dir(root_path)
+    stable_tree, stable_sections_by_slug, module_specs = await _build_topology_navigation_bundle(
+        entries=entries,
+        root_path=root_path,
+        serena_client=serena_client,
+        model=model,
+    )
+
+    await _persist_annotation_outputs(
+        root_path=root_path,
+        tree=stable_tree,
+        sections_by_slug=stable_sections_by_slug,
+        module_specs=module_specs,
+    )
+    await _write_empty_module_skeletons(module_specs, modules_dir)
+    logger.info(
+        "Topology agent 认知导航写入完成: %d 个区域, %d 个模块骨架文档",
+        len(stable_tree.areas),
+        len(module_specs),
+    )
+
+
+async def _build_topology_navigation_bundle(
+    *,
+    entries: list[IndexEntry],
+    root_path: Path,
+    serena_client: SerenaClient,
+    model: str | None,
+) -> tuple[NavigationTree, dict[str, dict[str, Any]], list[tuple[str, str, list[IndexEntry]]]]:
     entries_map = {str(entry.file_meta.path): entry for entry in entries}
     discovery_facts = _build_topology_discovery_facts(entries_map, root_path)
 
@@ -4218,18 +4247,7 @@ async def _write_annotations_via_topology_agent(
     ):
         raise RuntimeError(f"navigation_tree stage failed: {last_navigation_exc}")
 
-    await _persist_annotation_outputs(
-        root_path=root_path,
-        tree=stable_tree,
-        sections_by_slug=stable_sections_by_slug,
-        module_specs=module_specs,
-    )
-    await _write_empty_module_skeletons(module_specs, modules_dir)
-    logger.info(
-        "Topology agent 认知导航写入完成: %d 个区域, %d 个模块骨架文档",
-        len(stable_tree.areas),
-        len(module_specs),
-    )
+    return stable_tree, stable_sections_by_slug, module_specs
 
 
 async def _write_annotations_legacy(
@@ -4327,6 +4345,39 @@ async def _write_annotations(
         root_path,
         model=model,
     )
+
+
+async def refresh_navigation_from_snapshot(
+    *,
+    root_path: Path,
+    serena_client: SerenaClient,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """基于当前 index snapshot 重建 navigation_tree，并重渲染 index/areas。
+
+    不触碰现有 modules 文档正文。
+    """
+    snapshot = await load_index(root_path=root_path)
+    if snapshot is None:
+        raise RuntimeError("当前无可用 index snapshot，无法刷新 navigation")
+    entries = list(snapshot.entries)
+    if not entries:
+        await _write_empty_annotations(root_path)
+        return {"areas": 0, "modules": 0}
+
+    stable_tree, stable_sections_by_slug, module_specs = await _build_topology_navigation_bundle(
+        entries=entries,
+        root_path=root_path,
+        serena_client=serena_client,
+        model=model,
+    )
+    await _persist_annotation_outputs(
+        root_path=root_path,
+        tree=stable_tree,
+        sections_by_slug=stable_sections_by_slug,
+        module_specs=module_specs,
+    )
+    return {"areas": len(stable_tree.areas), "modules": len(module_specs)}
 
 
 async def _update_annotations_incremental(
