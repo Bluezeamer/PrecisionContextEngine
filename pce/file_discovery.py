@@ -31,10 +31,16 @@ HARD_SKIP_DIRS = frozenset(
 
 PCE_IGNORE_REL_PATH = Path(".pce/pceignore")
 _TEXT_SNIFF_BYTES = 8192
+_VIRTUAL_ONLY_PREFIXES = (
+    ".pce/annotations",
+)
 
 
 def _normalize_rel_path(path: str | Path) -> str:
-    return Path(path).as_posix().lstrip("./")
+    text = Path(path).as_posix().replace("\\", "/").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    return text
 
 
 def is_hard_skipped(path: str | Path) -> bool:
@@ -137,6 +143,34 @@ def is_ignored(project_root: Path, rel_path: str | Path) -> bool:
     return False
 
 
+def is_virtual_only_path(rel_path: str | Path) -> bool:
+    """是否属于仅允许通过受控虚拟工具访问的内部路径。"""
+    normalized = _normalize_rel_path(rel_path)
+    if not normalized:
+        return False
+    return any(
+        normalized == prefix or normalized.startswith(f"{prefix}/")
+        for prefix in _VIRTUAL_ONLY_PREFIXES
+    )
+
+
+def classify_agent_path_access(project_root: Path, rel_path: str | Path) -> str:
+    """返回路径对 Agent 的访问级别。
+
+    - `hidden`: 不应暴露给 Agent
+    - `virtual_only`: Agent 可知，但只能经虚拟工具访问
+    - `serena`: 可通过 Serena 正常访问
+    """
+    normalized = _normalize_rel_path(rel_path)
+    if not normalized:
+        return "hidden"
+    if is_virtual_only_path(normalized):
+        return "virtual_only"
+    if is_ignored(project_root, normalized):
+        return "hidden"
+    return "serena"
+
+
 def is_visible_to_agent(project_root: Path, rel_path: str | Path) -> bool:
     """该路径是否应暴露给受控 Agent 读取/感知。
 
@@ -145,10 +179,62 @@ def is_visible_to_agent(project_root: Path, rel_path: str | Path) -> bool:
     - 命中 `.gitignore` 不可见
     - 命中 `.pce/pceignore` 不可见
     """
-    normalized = _normalize_rel_path(rel_path)
-    if not normalized:
-        return False
-    return not is_ignored(project_root, normalized)
+    return classify_agent_path_access(project_root, rel_path) != "hidden"
+
+
+def is_serena_accessible_path(project_root: Path, rel_path: str | Path) -> bool:
+    """该路径是否允许通过 Serena 直接访问。"""
+    return classify_agent_path_access(project_root, rel_path) == "serena"
+
+
+def iter_tool_path_hints(args: dict[str, object] | None) -> list[str]:
+    """从工具参数中提取可能带路径语义的提示字符串。"""
+    if not args:
+        return []
+
+    def _split_candidates(text: str) -> list[str]:
+        parts: list[str] = []
+        for chunk in text.replace("\n", ",").split(","):
+            item = chunk.strip()
+            if item:
+                parts.append(item)
+        return parts
+
+    candidates: list[str] = []
+    for key in ("relative_path", "paths_include_glob", "paths_exclude_glob", "file_mask", "path"):
+        value = args.get(key)
+        if isinstance(value, str):
+            candidates.extend(_split_candidates(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    candidates.extend(_split_candidates(item))
+    return candidates
+
+
+def _literal_glob_prefix(pattern: str) -> str:
+    prefix_chars: list[str] = []
+    for char in pattern:
+        if char in "*?[]{}":
+            break
+        prefix_chars.append(char)
+    prefix = "".join(prefix_chars).strip()
+    return _normalize_rel_path(prefix) if prefix else ""
+
+
+def first_blocked_tool_path(
+    project_root: Path,
+    args: dict[str, object] | None,
+) -> tuple[str, str] | None:
+    """返回工具参数中首个不允许经 Serena 访问的路径提示。"""
+    for candidate in iter_tool_path_hints(args):
+        normalized = _literal_glob_prefix(candidate) or _normalize_rel_path(candidate)
+        if not normalized:
+            continue
+        access = classify_agent_path_access(project_root, normalized)
+        if access != "serena":
+            return normalized, access
+    return None
 
 
 def is_probably_text_file(path: Path) -> bool:

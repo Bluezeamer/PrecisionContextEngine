@@ -331,7 +331,7 @@ class InsightCache:
     async def get_all_records(
         self, *, include_stale: bool = True
     ) -> list[InsightIndexRecord]:
-        """返回全部索引记录，默认包含 stale 条目。DigestAgent 用于构建任务清单。"""
+        """返回全部索引记录，默认包含 stale 条目。digest 流程用于构建输入批次。"""
         index = await self._load_index_safe()
         records = list(index.records.values())
         if not include_stale:

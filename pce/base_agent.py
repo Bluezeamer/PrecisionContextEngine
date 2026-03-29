@@ -1,6 +1,6 @@
 """BaseReActAgent — PCE 所有 Agent 的 ReAct 循环骨架。
 
-提取 PCEAgent / DigestAgent 共享的 ReAct 循环、模型降级与工具分拣逻辑，
+提取 PCEAgent / digest 特化 Agent 共享的 ReAct 循环、模型降级与工具分拣逻辑，
 将子类差异通过钩子方法注入。
 
 公共机制：

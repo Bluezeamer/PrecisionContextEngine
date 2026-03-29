@@ -210,38 +210,38 @@ async def main() -> None:
         ))
 
         # ================================================================
-        # 5. digest smoke（验证 DigestPlanner 能跑通）
+        # 5. digest smoke（验证 digest gate 能跑通）
         # ================================================================
         _banner("5. digest smoke")
         t0 = time.perf_counter()
         try:
-            from pce.digest_agent import DigestPlanner
+            from pce.digest_agent import should_run_digest
             from pce.insight_cache import InsightCache
             from pce.staging import StagingArea
 
             staging = StagingArea(project_path)
             insight_cache = InsightCache(project_path)
             dirty = await staging.list_pending_reindex()
-            planner = DigestPlanner(
+            should_digest, reason = await should_run_digest(
                 project_root=project_path,
                 insight_cache=insight_cache,
+                dirty_state=dirty,
             )
-            task_list = await planner.build(dirty)
             elapsed = round(time.perf_counter() - t0, 2)
             timings["digest_plan"] = elapsed
 
-            _pprint(f"digest plan 完成 ({elapsed}s)", {
+            _pprint(f"digest gate 完成 ({elapsed}s)", {
                 "dirty_changed": len(dirty.changed),
                 "dirty_deleted": len(dirty.deleted),
-                "task_count": len(task_list.items),
-                "warnings": list(task_list.warnings)[:5],
+                "should_digest": should_digest,
+                "reason": reason,
             })
-            checks.append(_quality_check("digest planner 不报错", True))
+            checks.append(_quality_check("digest gate 不报错", True))
         except Exception as exc:
             elapsed = round(time.perf_counter() - t0, 2)
             timings["digest_plan"] = elapsed
             checks.append(_quality_check(
-                "digest planner 不报错", False, str(exc),
+                "digest gate 不报错", False, str(exc),
             ))
             errors.append({"stage": "digest", "error": traceback.format_exc()})
 

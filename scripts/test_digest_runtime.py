@@ -2,7 +2,7 @@
 Digest 真实场景验证脚本。
 
 用途：
-1. 查看当前项目 dirty state / insight / DigestPlanner 任务规划；
+1. 查看当前项目 dirty state / insight / digest 分批情况；
 2. 可选执行一次真实 run_digest，直接观察 resolved/pending/warnings；
 3. 为 hicolors 等复杂项目提供专门的 Digest 验证入口，而不是混在 query/impact e2e 中。
 
@@ -23,8 +23,9 @@ from typing import Any
 from dotenv import load_dotenv
 
 from pce._env import configure_litellm_runtime, get_completion_overrides, get_env_text
-from pce.digest_agent import DigestPlanner, run_digest
+from pce.digest_agent import run_digest
 from pce.insight_cache import InsightCache
+from pce.models import InsightFact
 from pce.serena_client import SerenaClient
 from pce.staging import StagingArea
 
@@ -65,6 +66,43 @@ async def _count_annotation_modules(project_root: Path) -> int:
     return len(list(modules_dir.glob("*.md")))
 
 
+async def _load_active_insights(insight_cache: InsightCache) -> list[InsightFact]:
+    records = await insight_cache.get_all_records(include_stale=False)
+    results: list[InsightFact] = []
+    for record in records:
+        content = await insight_cache.get_entry_content(record.id)
+        if not content:
+            continue
+        results.append(
+            InsightFact(
+                id=record.id,
+                scope=record.scope,
+                content=content,
+                confidence=record.confidence,
+                created_at=record.created_at,
+            )
+        )
+    return results
+
+
+def _estimate_insight_chars(insight: InsightFact) -> int:
+    return len(insight.id) + len(insight.scope) + len(insight.content) + 64
+
+
+def _count_batches(insights: list[InsightFact], *, max_chars: int = 32000) -> int:
+    if not insights:
+        return 0
+    count = 1
+    used = 0
+    for insight in insights:
+        size = _estimate_insight_chars(insight)
+        if used and used + size > max_chars:
+            count += 1
+            used = 0
+        used += size
+    return count
+
+
 async def main() -> None:
     args = _parse_args()
     root = _root()
@@ -82,9 +120,7 @@ async def main() -> None:
 
     dirty = await staging.list_pending_reindex()
     insight_stats = await insight_cache.stats()
-    planner = DigestPlanner(project_root=project_path, insight_cache=insight_cache)
-    task_list = await planner.build(dirty)
-    summary = task_list.to_summary_dict()
+    active_insights = await _load_active_insights(insight_cache)
 
     payload: dict[str, Any] = {
         "project_path": str(project_path),
@@ -95,12 +131,20 @@ async def main() -> None:
             "deleted_preview": dirty.deleted[: args.max_items],
         },
         "insight_stats": insight_stats.model_dump(mode="json"),
+        "active_insight_count": len(active_insights),
+        "stageA_batch_count": _count_batches(active_insights),
         "annotation_modules_count": await _count_annotation_modules(project_path),
         "baseline_file_count": await _count_baselines(project_path),
-        "planner": {
-            "warnings": list(task_list.warnings),
-            "task_count": len(task_list.items),
-            "task_preview": summary["items"][: args.max_items],
+        "digest_preview": {
+            "dirty_files_preview": (dirty.changed + dirty.deleted)[: args.max_items],
+            "insight_preview": [
+                {
+                    "id": item.id,
+                    "scope": item.scope,
+                    "confidence": str(item.confidence),
+                }
+                for item in active_insights[: args.max_items]
+            ],
         },
     }
 

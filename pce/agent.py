@@ -51,7 +51,9 @@ from .base_agent import (
     _get_tool_name,
     _safe_json_dumps,
 )
-from .file_discovery import is_visible_to_agent
+from .file_discovery import (
+    first_blocked_tool_path,
+)
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse
 from .prompt_guard import build_prompt_budget, estimate_input_tokens, fit_text_to_budget
@@ -256,6 +258,25 @@ ACKNOWLEDGE_TOOL: dict[str, Any] = {
     },
 }
 
+READ_ANNOTATION_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_annotation",
+        "description": "读取指定 annotation 文档。annotation 只能通过该工具读取，不能通过 Serena 访问。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "annotation 相对路径，仅允许 `.pce/annotations/index.md`、`areas/*.md`、`modules/*.md`。",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 # 无 tool_calls 时的最大纠正次数(超出后强制终止,视为异常)
 _MAX_NO_TOOL_RETRIES = 3
 # finish_reason=length 时最大续写次数
@@ -278,6 +299,23 @@ _SYSTEM_PROMPT_PLACEHOLDER = "(内容因 system prompt token 超限未注入，�
 _INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
 # 从文本中提取形如 pce/agent.py 或 ./src/foo.py:123 的路径
 _PATH_RE = re.compile(r"(?<![\w./-])(?:\./)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::\d+)?")
+
+
+def _normalize_rel_path(path: str) -> str:
+    text = Path(path).as_posix().replace("\\", "/").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _annotation_path_allowed(path: str) -> bool:
+    normalized = _normalize_rel_path(path)
+    if normalized == ".pce/annotations/index.md":
+        return True
+    return (
+        normalized.startswith(".pce/annotations/areas/")
+        or normalized.startswith(".pce/annotations/modules/")
+    ) and normalized.endswith(".md")
 
 
 # ---------------------------------------------------------------------------
@@ -1473,7 +1511,7 @@ class PCEAgent(BaseReActAgent):
         serena_client: SerenaClient,
         state: LoopState,
     ) -> list[dict[str, Any]]:
-        tools = [*serena_client.tools_schema, self._deliver_tool]
+        tools = [*serena_client.tools_schema, READ_ANNOTATION_TOOL, self._deliver_tool]
         if state.extra.get("depth", 0) == 0:
             tools.append(SPAWN_AGENT_TOOL)
         if state.extra.get("acknowledge_cb") is not None:
@@ -1482,7 +1520,7 @@ class PCEAgent(BaseReActAgent):
 
     @property
     def virtual_tool_names(self) -> set[str]:
-        return {"spawn_agent", "acknowledge_changes"}
+        return {"spawn_agent", "acknowledge_changes", "read_annotation"}
 
     async def handle_virtual_tool(
         self,
@@ -1493,6 +1531,24 @@ class PCEAgent(BaseReActAgent):
         tc_id = _get_tool_call_id(tool_call)
         args = _extract_tool_call_args(tool_call)
         req_id = _req_id_var.get()
+
+        if name == "read_annotation":
+            path = str((args or {}).get("path") or "").strip()
+            if not _annotation_path_allowed(path):
+                content = "annotation path 不合法"
+            else:
+                serena_client: SerenaClient = state.extra["serena_client"]
+                content = await self._read_pce_file(
+                    serena_client.project_path / _normalize_rel_path(path)
+                )
+            logger.info(
+                "[req=%s] round=%d -> read_annotation path=%s %dchars",
+                req_id,
+                state.round_num,
+                path,
+                len(content),
+            )
+            return {"tool_call_id": tc_id, "name": "read_annotation", "content": content}
 
         # ── acknowledge_changes ──
         if name == "acknowledge_changes":
@@ -1686,14 +1742,15 @@ class PCEAgent(BaseReActAgent):
         project_root: Path,
     ) -> str | None:
         del tool_name
-        relative_path = args.get("relative_path")
-        if not isinstance(relative_path, str):
+        blocked = first_blocked_tool_path(project_root, args)
+        if blocked is None:
             return None
-        normalized = relative_path.strip()
-        if not normalized:
-            return None
-        if is_visible_to_agent(project_root, normalized):
-            return None
+        normalized, access = blocked
+        if access == "virtual_only":
+            return (
+                f"路径 `{normalized}` 属于受控内部认知路径。"
+                "这类 annotation / 内部认知文件不能通过 Serena 访问，请改用 `read_annotation`。"
+            )
         return (
             f"路径 `{normalized}` 不在当前 PCE Agent 的可读边界内。"
             "该路径命中了项目 ignore / PCE ignore / 安全围栏，因此不可通过 Serena 读取或搜索。"
@@ -1848,6 +1905,7 @@ class PCEAgent(BaseReActAgent):
             annotations_index_md.strip(),
             "",
             "## 认知导航路由说明",
+            "- `annotations/*.md` 属于受控认知文件；如需继续读取，只能使用 `read_annotation`，不能通过 Serena 搜索或读取。",
             "- 若 index.md 只给出区域入口，先读取对应的 `annotations/areas/{area}.md`。",
             "- 在区域文档中根据模块列表继续下钻到 `annotations/modules/{module}.md`。",
             "- 若当前仓库仍是旧布局、找不到 `areas/*.md`，再直接进入 `annotations/modules/*.md`。",

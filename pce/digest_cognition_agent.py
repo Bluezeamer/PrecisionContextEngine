@@ -1,19 +1,9 @@
-"""Digest 特化认知 Agent。
-
-保留 router + worker 分层，但执行骨架参考 TopologyCognitionAgent：
-- facts 默认直接注入
-- 仅保留 read_facts 作为超限兜底
-- 有限工具预算 + 强制收口
-- 结构化阶段结果 + Python 侧重试校验
-"""
+"""Digest 两阶段轻量特化 Agent。"""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
 import os
-import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,26 +24,19 @@ from .base_agent import (
     _get_tool_name,
     _safe_json_dumps,
 )
-from .digest_router import DigestRouteDecision, DigestTaskV2, ModuleUpdatePlan
-from .file_discovery import is_visible_to_agent
-from .memory import NAVIGATION_TREE_FILE
-from .models import ChangedFileFact, ModuleDigestDelta
-from .module_annotation_contract import (
-    extract_coverage_file_paths,
-    validate_module_annotation_markdown,
-)
+from .file_discovery import first_blocked_tool_path
+from .models import ChangedFileFact, InsightFact
 from .prompt_guard import fit_text_to_budget
 from .serena_client import SerenaClient
 
-logger = logging.getLogger(__name__)
-
 _DEFAULT_MAX_SECONDS = 180.0
-_ROUTER_TOOL_BUDGET = 5
-_ROUTER_MAX_ATTEMPTS = 3
-_WORKER_MIN_BUDGET = 10
-_WORKER_MAX_BUDGET = 60
-_WORKER_FACTOR = 3
-_WORKER_MAX_ATTEMPTS = 3
+_FILTER_MIN_BUDGET = 3
+_FILTER_MAX_BUDGET = 50
+_FILTER_FACTOR = 3
+_ASSIMILATION_MIN_BUDGET = 10
+_ASSIMILATION_MAX_BUDGET = 75
+_ASSIMILATION_FACTOR = 5
+_FACTS_NOTICE = "\n... [facts 已截断，可调用 read_facts 读取完整版本] ...\n"
 _ALLOWED_SERENA_TOOLS = frozenset(
     {"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}
 )
@@ -64,23 +47,52 @@ _FAILURE_MESSAGES: dict[str, str] = {
     REACT_TIMEOUT: "Digest 特化 Agent 模型调用超时，重试次数耗尽",
     REACT_LLM_EXHAUSTED: "Digest 特化 Agent 模型降级链耗尽，已终止",
 }
-_FACTS_NOTICE = "\n... [facts 已截断，可调用 read_facts 读取完整版本] ...\n"
 
 
-def _annotation_modules_dir(root: Path) -> Path:
-    return root / ".pce" / "annotations" / "modules"
-
-
-def _annotation_areas_dir(root: Path) -> Path:
-    return root / ".pce" / "annotations" / "areas"
+def _annotation_root_dir(root: Path) -> Path:
+    return root / ".pce" / "annotations"
 
 
 def _annotation_index_path(root: Path) -> Path:
-    return root / ".pce" / "annotations" / "index.md"
+    return _annotation_root_dir(root) / "index.md"
 
 
-def _navigation_tree_path(root: Path) -> Path:
-    return root / ".pce" / "annotations" / NAVIGATION_TREE_FILE
+def _annotation_areas_dir(root: Path) -> Path:
+    return _annotation_root_dir(root) / "areas"
+
+
+def _annotation_modules_dir(root: Path) -> Path:
+    return _annotation_root_dir(root) / "modules"
+
+
+def _normalize_rel_path(path: str) -> str:
+    text = Path(path).as_posix().replace("\\", "/").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _annotation_path_allowed(path: str) -> bool:
+    normalized = _normalize_rel_path(path)
+    if normalized == ".pce/annotations/index.md":
+        return True
+    return (
+        normalized.startswith(".pce/annotations/areas/")
+        or normalized.startswith(".pce/annotations/modules/")
+    ) and normalized.endswith(".md")
+
+
+def _iter_available_annotation_paths(project_root: Path) -> list[str]:
+    paths: list[str] = []
+    index_path = _annotation_index_path(project_root)
+    if index_path.exists():
+        paths.append(".pce/annotations/index.md")
+    for base in (_annotation_areas_dir(project_root), _annotation_modules_dir(project_root)):
+        if not base.exists():
+            continue
+        for path in sorted(base.glob("*.md")):
+            paths.append(path.relative_to(project_root).as_posix())
+    return paths
 
 
 async def _read_text_if_exists(path: Path) -> str:
@@ -110,16 +122,15 @@ def _truncate_block(text: str, *, max_chars: int = 1200) -> str:
     return f"{text[:head].rstrip()}\n... [truncated] ...\n{text[-tail:].lstrip()}".strip()
 
 
-def _annotation_rel_module(slug: str) -> str:
-    return f".pce/annotations/modules/{slug}.md"
-
-
-def _annotation_rel_area(slug: str) -> str:
-    return f".pce/annotations/areas/{slug}.md"
-
-
-def _annotation_rel_index() -> str:
-    return ".pce/annotations/index.md"
+def _render_insight(insight: InsightFact) -> str:
+    return "\n".join(
+        [
+            f"- id: `{insight.id}`",
+            f"  - scope: `{insight.scope}`",
+            f"  - confidence: `{insight.confidence}`",
+            f"  - content: {_truncate_block(insight.content, max_chars=800)}",
+        ]
+    )
 
 
 def _format_patch_blocks(file_fact: ChangedFileFact, *, limit: int = 3) -> str:
@@ -135,7 +146,10 @@ def _format_patch_blocks(file_fact: ChangedFileFact, *, limit: int = 3) -> str:
         new = _truncate_block(block.new_snippet or "", max_chars=500)
         lines = ["```diff"]
         if block.old_start and block.new_start:
-            lines.append(f"@@ -{block.old_start},{(block.old_end or block.old_start) - block.old_start + 1} +{block.new_start},{(block.new_end or block.new_start) - block.new_start + 1} @@")
+            lines.append(
+                f"@@ -{block.old_start},{(block.old_end or block.old_start) - block.old_start + 1} "
+                f"+{block.new_start},{(block.new_end or block.new_start) - block.new_start + 1} @@"
+            )
         if old:
             lines.extend(f"- {line}" for line in old.splitlines())
         if new:
@@ -145,153 +159,95 @@ def _format_patch_blocks(file_fact: ChangedFileFact, *, limit: int = 3) -> str:
     return "\n\n".join(chunks)
 
 
-def _render_changed_file_fact(file_fact: ChangedFileFact) -> str:
-    header = f"- `{file_fact.path}` [{file_fact.status}]"
+def _render_patch_fact(file_fact: ChangedFileFact) -> str:
     patch = _format_patch_blocks(file_fact)
     if not patch:
-        return header
-    return f"{header}\n{patch}"
+        return f"### `{file_fact.path}` [{file_fact.status}]"
+    return f"### `{file_fact.path}` [{file_fact.status}]\n{patch}"
 
 
-def _render_insights(delta: ModuleDigestDelta) -> list[str]:
-    lines: list[str] = []
-    for insight in delta.related_insights:
-        lines.append(
-            "\n".join(
-                [
-                    f"- scope: `{insight.scope}`",
-                    f"  - confidence: `{insight.confidence}`",
-                    f"  - content: {_truncate_block(insight.content, max_chars=600)}",
-                ]
-            )
-        )
-    return lines
-
-
-def _render_task_standalone_insights(task: DigestTaskV2) -> list[str]:
-    lines: list[str] = []
-    for insight in task.standalone_insights:
-        lines.append(
-            "\n".join(
-                [
-                    f"- scope: `{insight.scope}`",
-                    f"  - confidence: `{insight.confidence}`",
-                    f"  - content: {_truncate_block(insight.content, max_chars=600)}",
-                ]
-            )
-        )
-    return lines
-
-
-def _render_delta_block(delta: ModuleDigestDelta) -> str:
+def build_filter_facts_text(
+    *,
+    insights: list[InsightFact],
+    annotation_paths: list[str],
+    model: str,
+) -> tuple[str, bool]:
     lines = [
-        f"### 模块 `{delta.module_slug}` / {delta.module_name}",
-        f"- `change_scope_hint`: `{delta.change_scope_hint}`",
+        "以下是 digest stageA 直接注入的 insights。你的任务只是筛选哪些值得进入下一阶段。",
         "",
-        "#### 当前 annotation baseline",
-        delta.annotation_baseline.strip() or "(empty)",
-        "",
-        "#### 变化说明",
+        "## Insights",
     ]
-    if delta.changed_files:
-        for file_fact in delta.changed_files:
-            lines.append(_render_changed_file_fact(file_fact))
+    lines.extend(_render_insight(item) for item in insights)
+    lines.extend([
+        "",
+        "## Readable Annotations",
+    ])
+    lines.extend([f"- `{item}`" for item in annotation_paths] or ["- (none)"])
+    full = "\n".join(lines).strip()
+    fitted = fit_text_to_budget(
+        model,
+        full,
+        token_budget=32000,
+        notice=_FACTS_NOTICE,
+        min_chars=4000,
+    )
+    return fitted, fitted != full
+
+
+def build_assimilation_facts_text(
+    *,
+    insights: list[InsightFact],
+    dirty_files: list[str],
+    patch_facts: list[ChangedFileFact],
+    annotation_paths: list[str],
+    model: str,
+) -> tuple[str, bool]:
+    lines = [
+        "以下是 digest stageB 直接注入的 facts。目标是在有限预算下尽量完成认知内化。",
+        "",
+        "## Insights",
+    ]
+    lines.extend(_render_insight(item) for item in insights)
+    lines.extend(["", "## Dirty Files"])
+    lines.extend([f"- `{item}`" for item in dirty_files] or ["- (none)"])
+    lines.extend(["", "## Patch Evidence"])
+    if patch_facts:
+        lines.extend(_render_patch_fact(item) for item in patch_facts)
     else:
-        lines.append("- 当前无 dirty file，仅有 insight 待沉淀。")
-    lines.extend(["", "#### 相关 insight"])
-    insight_lines = _render_insights(delta)
-    lines.extend(insight_lines or ["- 当前无相关 insight。"])
-    return "\n".join(lines).strip()
-
-
-def build_router_facts_text(
-    *,
-    task: DigestTaskV2,
-    project_annotation: str,
-    area_annotations: dict[str, str],
-    module_annotations: dict[str, str],
-    navigation_tree_text: str,
-    model: str,
-) -> tuple[str, bool]:
-    lines = [
-        "以下是直接注入的 digest router facts。优先基于这些事实判断哪些 insight 值得沉淀，以及是否存在陈旧风险。",
-        "",
-        "## 任务概览",
-        f"- task_id: `{task.id}`",
-        f"- task_level: `{task.task_level}`",
-        f"- task_kind: `{task.task_kind}`",
-        f"- affected_areas: {', '.join(f'`{item}`' for item in task.affected_area_slugs) or '(none)'}",
-        f"- affected_modules: {', '.join(f'`{item}`' for item in task.affected_module_slugs) or '(none)'}",
-        f"- dirty_files_count: {len(task.dirty_files)}",
-        f"- related_insights_count: {len(task.related_insight_ids)}",
-    ]
-    if task.warnings:
-        lines.extend(["", "## warnings", *[f"- {item}" for item in task.warnings]])
-    if task.dirty_files:
-        lines.extend(["", "## dirty files", *[f"- `{item}`" for item in task.dirty_files]])
-    for delta in task.deltas:
-        lines.extend(["", _render_delta_block(delta)])
-    standalone_insights = _render_task_standalone_insights(task)
-    if standalone_insights:
-        lines.extend(["", "## unresolved insights", *standalone_insights])
-
+        lines.append("- (none)")
+    lines.extend(["", "## Readable Annotations"])
+    lines.extend([f"- `{item}`" for item in annotation_paths] or ["- (none)"])
     full = "\n".join(lines).strip()
     fitted = fit_text_to_budget(
         model,
         full,
-        token_budget=12000,
+        token_budget=32000,
         notice=_FACTS_NOTICE,
-        min_chars=2400,
+        min_chars=5000,
     )
     return fitted, fitted != full
 
 
-def build_worker_facts_text(
-    *,
-    task: DigestTaskV2,
-    delta: ModuleDigestDelta,
-    plan: ModuleUpdatePlan,
-    navigation_tree_text: str,
-    project_annotation: str,
-    area_annotations: dict[str, str],
-    model: str,
-) -> tuple[str, bool]:
-    lines = [
-        "以下是直接注入的 digest worker facts。目标是基于 insight 做增量认知沉淀，而不是重建全量认知。",
-        "",
-        "## 任务概览",
-        f"- task_id: `{task.id}`",
-        f"- task_level: `{task.task_level}`",
-        f"- task_kind: `{task.task_kind}`",
-        f"- target_module: `{delta.module_slug}` / {delta.module_name}",
-        f"- worker_action: `{plan.action}`",
-        f"- rationale: {plan.rationale or '(none)'}",
-    ]
-    if task.dirty_files:
-        lines.extend(["", "## dirty files", *[f"- `{item}`" for item in task.dirty_files]])
-    lines.extend(["", _render_delta_block(delta)])
-
-    full = "\n".join(lines).strip()
-    fitted = fit_text_to_budget(
-        model,
-        full,
-        token_budget=14000,
-        notice=_FACTS_NOTICE,
-        min_chars=2600,
-    )
-    return fitted, fitted != full
+def _compute_filter_budget(insight_count: int) -> int:
+    raw = insight_count * _FILTER_FACTOR
+    return max(_FILTER_MIN_BUDGET, min(_FILTER_MAX_BUDGET, raw))
 
 
-def _compute_worker_budget(delta: ModuleDigestDelta) -> int:
-    raw = _WORKER_FACTOR * (len(delta.related_insights) + len(delta.changed_files))
-    return max(_WORKER_MIN_BUDGET, min(_WORKER_MAX_BUDGET, raw))
+def _compute_assimilation_budget(insight_count: int) -> int:
+    raw = insight_count * _ASSIMILATION_FACTOR
+    return max(_ASSIMILATION_MIN_BUDGET, min(_ASSIMILATION_MAX_BUDGET, raw))
 
 
 @dataclass
-class WorkerResult:
-    status: str
-    note: str
-    module_slug: str
+class FilterDecision:
+    keep_insight_ids: list[str]
+    drop_insight_ids: list[str]
+    notes: list[str]
+
+
+@dataclass
+class AssimilationResult:
+    summary: str
 
 
 class _DigestStageAgent(BaseReActAgent):
@@ -305,6 +261,8 @@ class _DigestStageAgent(BaseReActAgent):
         facts_text: str,
         facts_truncated: bool,
         tool_budget: int,
+        allow_serena: bool,
+        allow_write_annotation: bool,
         model: str | None = None,
         provider: str | None = None,
         max_seconds: float = _DEFAULT_MAX_SECONDS,
@@ -318,10 +276,9 @@ class _DigestStageAgent(BaseReActAgent):
         self._budget_exhausted_notified = False
         self._deliver_tool = DELIVER_TOOL
         self._virtual_tool_names_set: set[str] = set()
-        self._injected_context_paths: set[str] = set()
-        self._readable_module_contexts: dict[str, str] = {}
-        self._readable_area_contexts: dict[str, str] = {}
-        self._project_index_context: str = ""
+        self._allow_serena = allow_serena
+        self._allow_write_annotation = allow_write_annotation
+        self._annotation_paths = _iter_available_annotation_paths(self._project_root)
 
     def _budget_note(self) -> str:
         remaining = max(0, self._tool_budget_total - self._tool_budget_used)
@@ -336,24 +293,22 @@ class _DigestStageAgent(BaseReActAgent):
             and self._tool_budget_used >= self._tool_budget_total
             and not self._budget_exhausted_notified
         ):
-            self._append(state, {
-                "role": "user",
-                "content": self._build_budget_exhausted_prompt(),
-            })
+            self._append(state, {"role": "user", "content": self._build_budget_exhausted_prompt()})
             self._budget_exhausted_notified = True
 
     def build_tools_schema(self, serena_client: SerenaClient, state: LoopState) -> list[dict[str, Any]]:
-        filtered = []
-        for schema in serena_client.tools_schema:
-            try:
-                name = schema["function"]["name"]
-            except Exception:
-                continue
-            if name in _ALLOWED_SERENA_TOOLS and self._tool_budget_used < self._tool_budget_total:
-                filtered.append(schema)
+        tools: list[dict[str, Any]] = []
+        if self._allow_serena and self._tool_budget_used < self._tool_budget_total:
+            for schema in serena_client.tools_schema:
+                try:
+                    name = schema["function"]["name"]
+                except Exception:
+                    continue
+                if name in _ALLOWED_SERENA_TOOLS:
+                    tools.append(schema)
         virtual = self._build_virtual_tools()
         self._virtual_tool_names_set = {schema["function"]["name"] for schema in virtual}
-        return filtered + virtual + [self._deliver_tool]
+        return tools + virtual + [self._deliver_tool]
 
     @property
     def virtual_tool_names(self) -> set[str]:
@@ -374,26 +329,23 @@ class _DigestStageAgent(BaseReActAgent):
                 "name": tool_name or "unknown",
                 "content": blocked_reason,
             }
-
         result = await super()._invoke_serena(tool_call, serena_client, state=state)
         if tool_name in _ALLOWED_SERENA_TOOLS and self._tool_budget_used < self._tool_budget_total:
             self._tool_budget_used += 1
             result["content"] = str(result.get("content") or "") + self._budget_note()
         return result
 
-    def _blocked_serena_access_reason(
-        self,
-        tool_name: str,
-        tool_args: dict[str, Any],
-    ) -> str | None:
-        relative_path = tool_args.get("relative_path")
-        if not isinstance(relative_path, str):
+    def _blocked_serena_access_reason(self, tool_name: str, tool_args: dict[str, Any]) -> str | None:
+        del tool_name
+        blocked = first_blocked_tool_path(self._project_root, tool_args)
+        if blocked is None:
             return None
-        normalized = relative_path.strip()
-        if not normalized:
-            return None
-        if is_visible_to_agent(self._project_root, normalized):
-            return None
+        normalized, access = blocked
+        if access == "virtual_only":
+            return (
+                f"路径 `{normalized}` 属于受控内部认知路径。"
+                "这类路径不能通过 Serena 访问；如需读取 annotation，请使用 `read_annotation`。"
+            )
         return (
             f"路径 `{normalized}` 不在当前 digest agent 的可读边界内。"
             "该路径命中了项目 ignore / PCE ignore / 安全围栏，因此不可通过 Serena 读取。"
@@ -406,8 +358,18 @@ class _DigestStageAgent(BaseReActAgent):
             {"role": "system", "content": self._facts_text},
         ]
 
+    def _build_context_boundary_prompt(self) -> str:
+        lines = [
+            "## 认知读取边界",
+            "- `Readable Annotations` 中列出的 annotation 只能通过 `read_annotation` 访问。",
+            "- stageA 不允许读取代码，只允许读取 annotation。",
+            "- stageB 可在预算内做少量代码探索，但 annotation 仍只能通过受控工具访问。",
+            "- 若已注入 facts 足够，请不要为了完整性继续探索。",
+        ]
+        return "\n".join(lines)
+
     def _build_virtual_tools(self) -> list[dict[str, Any]]:
-        tools = []
+        tools: list[dict[str, Any]] = []
         if self._facts_truncated:
             tools.append({
                 "type": "function",
@@ -417,7 +379,36 @@ class _DigestStageAgent(BaseReActAgent):
                     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
                 },
             })
-        tools.extend(self._build_context_read_tools())
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "read_annotation",
+                "description": "读取指定 annotation 文档。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            },
+        })
+        if self._allow_write_annotation:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "write_annotation",
+                    "description": "直接写入指定 annotation 文档。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "markdown": {"type": "string"},
+                        },
+                        "required": ["path", "markdown"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
         tools.extend(self._extra_virtual_tools())
         return tools
 
@@ -434,29 +425,31 @@ class _DigestStageAgent(BaseReActAgent):
 
         if name == "read_facts":
             return _ok(self._facts_text.replace(_FACTS_NOTICE, ""))
-        if name == "read_project_index":
-            return _ok(self._project_index_context)
-        if name == "read_area_annotation":
-            area_slug = str(args.get("area_slug") or "").strip()
-            if not area_slug:
-                return _err("area_slug 不能为空")
-            if area_slug not in self._readable_area_contexts:
-                return _err(f"当前不可读取 area 认知: {area_slug}")
-            return _ok(self._readable_area_contexts[area_slug])
-        if name == "read_module_annotation":
-            module_slug = str(args.get("module_slug") or "").strip()
-            if not module_slug:
-                return _err("module_slug 不能为空")
-            if module_slug not in self._readable_module_contexts:
-                return _err(f"当前不可读取模块认知: {module_slug}")
-            return _ok(self._readable_module_contexts[module_slug])
+        if name == "read_annotation":
+            path = str(args.get("path") or "").strip()
+            if not _annotation_path_allowed(path):
+                return _err("annotation path 不合法")
+            return _ok(await _read_text_if_exists(self._project_root / _normalize_rel_path(path)))
+        if name == "write_annotation":
+            path = str(args.get("path") or "").strip()
+            markdown = str(args.get("markdown") or "").strip()
+            if not self._allow_write_annotation:
+                return _err("当前阶段不允许写 annotation")
+            if not _annotation_path_allowed(path):
+                return _err("annotation path 不合法")
+            if not markdown:
+                return _err("markdown 不能为空")
+            await _write_text_atomic(
+                self._project_root / _normalize_rel_path(path),
+                markdown.rstrip() + "\n",
+            )
+            if path not in self._annotation_paths:
+                self._annotation_paths.append(path)
+            return _ok(f"annotation 已写入: {path}")
         return await self._handle_stage_virtual_tool(name, args, _ok, _err)
 
     def build_no_tool_correction(self, state: LoopState, finish_reason: str) -> dict[str, Any]:
-        return {
-            "role": "user",
-            "content": self._build_no_tool_prompt(),
-        }
+        return {"role": "user", "content": self._build_no_tool_prompt()}
 
     def _extra_virtual_tools(self) -> list[dict[str, Any]]:
         return []
@@ -479,76 +472,13 @@ class _DigestStageAgent(BaseReActAgent):
     def _build_system_prompt(self) -> str:
         raise NotImplementedError
 
-    def _build_context_boundary_prompt(self) -> str:
-        injected = sorted(self._injected_context_paths)
-        readable_modules = sorted(_annotation_rel_module(slug) for slug in self._readable_module_contexts)
-        readable_areas = sorted(_annotation_rel_area(slug) for slug in self._readable_area_contexts)
-        readable_index = [_annotation_rel_index()] if self._project_index_context and _annotation_rel_index() not in self._injected_context_paths else []
-        lines = [
-            "## 认知读取边界",
-            "- 以下认知已直接注入，无需再次读取：",
-        ]
-        lines.extend([f"  - `{item}`" for item in injected] or ["  - (none)"])
-        lines.extend([
-            "- 以下认知可通过受控 read 工具再次读取：",
-        ])
-        readable = [*readable_index, *readable_areas, *readable_modules]
-        lines.extend([f"  - `{item}`" for item in readable] or ["  - (none)"])
-        lines.extend([
-            "- `.pce/annotations/*` 不可通过 Serena / 通用代码读取工具访问。",
-            "- 若需要补充认知，只能调用受控的 `read_project_index` / `read_area_annotation` / `read_module_annotation`。",
-            "- Serena 工具只用于读取代码事实，不用于读取认知文档。",
-        ])
-        return "\n".join(lines)
 
-    def _build_context_read_tools(self) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        if self._project_index_context and _annotation_rel_index() not in self._injected_context_paths:
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "read_project_index",
-                    "description": "读取项目级 `index.md` 认知（仅当未直接注入时可用）。",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-                },
-            })
-        if self._readable_area_contexts:
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "read_area_annotation",
-                    "description": "读取指定 area 认知文档。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"area_slug": {"type": "string"}},
-                        "required": ["area_slug"],
-                        "additionalProperties": False,
-                    },
-                },
-            })
-        if self._readable_module_contexts:
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "read_module_annotation",
-                    "description": "读取指定模块认知文档。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"module_slug": {"type": "string"}},
-                        "required": ["module_slug"],
-                        "additionalProperties": False,
-                    },
-                },
-            })
-        return tools
-
-
-class DigestRouterStageAgent(_DigestStageAgent):
+class DigestFilterStageAgent(_DigestStageAgent):
     def __init__(
         self,
         *,
         project_root: Path,
-        task: DigestTaskV2,
+        insights: list[InsightFact],
         facts_text: str,
         facts_truncated: bool,
         model: str | None = None,
@@ -558,21 +488,21 @@ class DigestRouterStageAgent(_DigestStageAgent):
             project_root=project_root,
             facts_text=facts_text,
             facts_truncated=facts_truncated,
-            tool_budget=_ROUTER_TOOL_BUDGET,
+            tool_budget=_compute_filter_budget(len(insights)),
+            allow_serena=False,
+            allow_write_annotation=False,
             model=model,
             provider=provider,
         )
-        self._task = task
-        self._stage_payload: dict[str, Any] | None = None
+        self._decision: FilterDecision | None = None
 
-    async def run(self, *, serena_client: SerenaClient, retry_feedback: str | None = None) -> DigestRouteDecision:
+    async def run(self, *, serena_client: SerenaClient, retry_feedback: str | None = None) -> FilterDecision:
         messages = self._build_base_messages()
         messages.append({
             "role": "user",
             "content": (
-                "当前阶段是 digest router。请基于已注入 facts 判断："
-                "哪些 insight 值得沉淀、哪些可能因 dirty file 而存在陈旧风险、以及哪些 module 需要最小认知修正。"
-                "优先使用 facts；仅在明显不足时再做少量探索。"
+                "当前是 digest stageA。请筛选哪些 insight 值得进入下一阶段。"
+                "若需要核对是否与现有认知重复，可读取 annotation。不要读代码，不要判断写入目标层级。"
             ),
         })
         if retry_feedback:
@@ -581,51 +511,52 @@ class DigestRouterStageAgent(_DigestStageAgent):
         failure = _FAILURE_MESSAGES.get(summary)
         if failure is not None:
             raise RuntimeError(failure)
-        if self._stage_payload is None:
-            raise RuntimeError("router 未提交阶段结果")
-        return DigestRouteDecision.from_payload(self._stage_payload)
+        if self._decision is None:
+            raise RuntimeError("stageA 未提交筛选结果")
+        return self._decision
 
     def _build_system_prompt(self) -> str:
         return "\n".join(
             [
-                "你是 PCE 的 DigestRouterAgent，负责对单个 digest task 做轻量路由，不直接写文档。",
+                "你是 PCE 的 DigestFilterAgent，负责轻量筛选哪些 insight 值得进入认知沉淀阶段。",
                 "",
                 "## 目标",
-                "- 判断哪些 insight 值得沉淀，哪些可以直接跳过。",
-                "- 判断哪些 insight 可能因 dirty file 而存在陈旧风险。",
-                "- 若需要模块更新，指出需要更新的 module slug 以及更新强度。",
+                "- 保留真正有新增认知价值的 insight。",
+                "- 过滤低价值、明显重复、或明显不值得沉淀的 insight。",
                 "",
                 "## 约束",
-                "- 代码事实优先，文档只能参考。",
-                "- 优先依赖直接注入的 facts；只有在 facts 不足时才调用 Serena。",
-                "- 探索预算很小，只做高价值、窄范围探索。",
-                "- 目标是 insight 路由和边界判断，不是重建全量认知。",
-                "- 低价值、明显重复、或对既有认知没有新增信息的 insight，可直接 `no_update`。",
-                "- dirty file 只是辅助判断 insight 是否可能陈旧，不是独立认知沉淀触发源。",
-                "- 最终必须先调用 `deliver_stage_result(payload)`，再调用 `deliver(answer='stage done')`。",
-                "- `decision` 只能是 `no_update` / `update_module_only` / `unresolved`。",
-                "- `module_update_plans[*].action` 只能是 `light_update` / `rewrite` / `create_if_missing` / `no_change`。",
+                "- 本阶段不读代码，只允许读取 annotation。",
+                "- 本阶段不判断应写入哪个认知文件，也不做写入操作。",
+                "- 默认优先依赖直接注入的 insights；只有在需要判断是否与现有认知重复时才读取 annotation。",
+                "- 工具预算有限，应优先高价值核对。",
+                "- 最终必须先调用 `deliver_stage_result`，再调用 `deliver(answer='stage done')`。",
             ]
         )
 
     def _build_no_tool_prompt(self) -> str:
         return (
-            "你刚才没有调用工具。若当前 facts 已足够，请直接调用 `deliver_stage_result` 提交路由结果；"
-            "若仍需补证据，先调用 Serena 工具。不要直接输出自然语言结论。"
+            "你刚才没有调用工具。若当前 injected insights 已足够，请直接调用 `deliver_stage_result` 提交筛选结果；"
+            "若确需核对重复性，只能读取 annotation。不要自然语言总结。"
         )
 
     def _build_budget_exhausted_prompt(self) -> str:
-        return (
-            "router 阶段工具预算已耗尽。请停止探索，直接基于当前 facts 和已掌握证据输出最保守可用的 route decision。"
-        )
+        return "stageA 工具预算已耗尽。请停止探索，直接提交当前最保守可用的筛选结果。"
 
     async def on_deliver(self, args: dict[str, Any] | None, state: LoopState) -> DeliverDecision:
-        if self._stage_payload is None:
+        if self._decision is None:
             return DeliverDecision.continue_with({
                 "role": "user",
-                "content": "你尚未调用 `deliver_stage_result`。请先提交结构化路由结果，再 deliver。",
+                "content": "你尚未调用 `deliver_stage_result`。请先提交筛选结果，再 deliver。",
             })
-        return DeliverDecision.finish(_safe_json_dumps(self._stage_payload))
+        return DeliverDecision.finish(
+            _safe_json_dumps(
+                {
+                    "keep_insight_ids": self._decision.keep_insight_ids,
+                    "drop_insight_ids": self._decision.drop_insight_ids,
+                    "notes": self._decision.notes,
+                }
+            )
+        )
 
     def _extra_virtual_tools(self) -> list[dict[str, Any]]:
         return [
@@ -633,15 +564,19 @@ class DigestRouterStageAgent(_DigestStageAgent):
                 "type": "function",
                 "function": {
                     "name": "deliver_stage_result",
-                    "description": "提交 router 阶段的结构化结果。",
+                    "description": "提交 stageA 的筛选结果。",
                     "parameters": {
                         "type": "object",
-                        "properties": {"payload": {"type": "object"}},
-                        "required": ["payload"],
+                        "properties": {
+                            "keep_insight_ids": {"type": "array", "items": {"type": "string"}},
+                            "drop_insight_ids": {"type": "array", "items": {"type": "string"}},
+                            "notes": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["keep_insight_ids", "drop_insight_ids"],
                         "additionalProperties": False,
                     },
                 },
-            },
+            }
         ]
 
     async def _handle_stage_virtual_tool(
@@ -653,21 +588,29 @@ class DigestRouterStageAgent(_DigestStageAgent):
     ) -> dict[str, Any]:
         if name != "deliver_stage_result":
             return err_builder(f"未知虚拟工具: {name}")
-        payload = args.get("payload")
-        if not isinstance(payload, dict):
-            return err_builder("payload 必须是 object")
-        self._stage_payload = payload
-        return ok_builder("router 阶段结果已接收")
+        keep_ids = args.get("keep_insight_ids")
+        drop_ids = args.get("drop_insight_ids")
+        notes = args.get("notes") or []
+        if not isinstance(keep_ids, list) or not all(isinstance(item, str) for item in keep_ids):
+            return err_builder("keep_insight_ids 必须是字符串数组")
+        if not isinstance(drop_ids, list) or not all(isinstance(item, str) for item in drop_ids):
+            return err_builder("drop_insight_ids 必须是字符串数组")
+        if not isinstance(notes, list) or not all(isinstance(item, str) for item in notes):
+            return err_builder("notes 必须是字符串数组")
+        self._decision = FilterDecision(
+            keep_insight_ids=list(dict.fromkeys(item.strip() for item in keep_ids if item.strip())),
+            drop_insight_ids=list(dict.fromkeys(item.strip() for item in drop_ids if item.strip())),
+            notes=[item.strip() for item in notes if item.strip()],
+        )
+        return ok_builder("stageA 结果已接收")
 
 
-class DigestWorkerStageAgent(_DigestStageAgent):
+class DigestAssimilationStageAgent(_DigestStageAgent):
     def __init__(
         self,
         *,
         project_root: Path,
-        task: DigestTaskV2,
-        delta: ModuleDigestDelta,
-        plan: ModuleUpdatePlan,
+        insight_count: int,
         facts_text: str,
         facts_truncated: bool,
         model: str | None = None,
@@ -677,24 +620,21 @@ class DigestWorkerStageAgent(_DigestStageAgent):
             project_root=project_root,
             facts_text=facts_text,
             facts_truncated=facts_truncated,
-            tool_budget=_compute_worker_budget(delta),
+            tool_budget=_compute_assimilation_budget(insight_count),
+            allow_serena=True,
+            allow_write_annotation=True,
             model=model,
             provider=provider,
         )
-        self._task = task
-        self._delta = delta
-        self._plan = plan
-        self._result: WorkerResult | None = None
+        self._result: AssimilationResult | None = None
 
-    async def run(self, *, serena_client: SerenaClient, retry_feedback: str | None = None) -> WorkerResult:
+    async def run(self, *, serena_client: SerenaClient, retry_feedback: str | None = None) -> AssimilationResult:
         messages = self._build_base_messages()
         messages.append({
             "role": "user",
             "content": (
-                f"当前阶段是 digest worker，目标模块是 `{self._delta.module_slug}`。"
-                "请基于已注入的 insight 与 dirty file 事实，"
-                "判断当前 insight 是否可能陈旧，并做最小必要的认知修正。若证据不足，可在预算内做少量探索。"
-                "目标是沉淀增量认知，不是重建全量认知。"
+                "当前是 digest stageB。请基于保留下来的 insights、dirty files 和 patch evidence，"
+                "在有限预算下尽量完成认知内化。你可以读取/写入 annotation，必要时做少量高价值代码探索。"
             ),
         })
         if retry_feedback:
@@ -704,86 +644,60 @@ class DigestWorkerStageAgent(_DigestStageAgent):
         if failure is not None:
             raise RuntimeError(failure)
         if self._result is None:
-            raise RuntimeError("worker 未提交模块结果")
+            raise RuntimeError("stageB 未提交结果")
         return self._result
 
     def _build_system_prompt(self) -> str:
         return "\n".join(
             [
-                "你是 PCE 的 DigestWorkerAgent，负责对单个模块做增量认知沉淀。",
+                "你是 PCE 的 DigestAssimilationAgent，负责将已筛选保留的 insight 做尽量内化。",
                 "",
                 "## 目标",
-                "- 对当前模块做最小必要的 annotation 更新。",
-                "- 若确认当前模块无需更新，也应明确跳过并说明原因。",
+                "- 在有限预算下尽量把 insight 沉淀进合适的 annotation 文档。",
+                "- 若核验后认为无需改动，也可以直接结束本轮。",
                 "",
                 "## 约束",
-                "- 代码事实优先，文档只能参考。",
-                "- 优先依赖直接注入的 insight / dirty file 事实；只有在 facts 不足时才调用 Serena。",
-                "- 探索预算有限，应做高价值、窄范围探索。",
-                "- 目标是围绕 insight 修正现有认知，不是重写整个项目认知。",
-                "- 若当前 insight 低价值、重复、或不足以改变现有认知，可直接 `mark_module_skipped`。",
-                "- dirty file 仅用于辅助判断该 insight 是否可能过期，不应把任务扩展成全量变更调查。",
-                "- 文档必须保留固定章节：`## 覆盖文件` `## 核心职责` `## 关键流程` `## 外部协作` `## 风险与约束`。",
-                "- `## 关键符号` 可选，且只能保留少量稳定锚点。",
-                "- 最终必须调用 `write_module_annotation_and_finish` 或 `mark_module_skipped`，再 `deliver(answer='stage done')`。",
+                "- 优先依赖直接注入的 insights、dirty files、patch evidence。",
+                "- 先基于已注入 facts 判断；若仍不足，优先读取 `Readable Annotations` 中的 annotation。",
+                "- 只有 annotation 与已注入 facts 仍不足时，才做少量高价值、窄范围代码探索。",
+                "- 由你自行判断应修改哪些 annotation 文件；Python 不会预先决定层级。",
+                "- 最终必须先调用 `deliver_stage_result`，再调用 `deliver(answer='stage done')`。",
             ]
         )
 
     def _build_no_tool_prompt(self) -> str:
         return (
-            "你刚才没有调用工具。若当前证据已足够，请直接调用 `write_module_annotation_and_finish` 或 `mark_module_skipped` 收口；"
-            "若仍需补证据，再调用 Serena 工具。不要直接输出自然语言结论。"
+            "你刚才没有调用工具。若当前 facts 已足够，请直接写入 annotation（如需要）并调用 `deliver_stage_result` 收口；"
+            "若仍需补证据，再做少量高价值探索。不要自然语言总结。"
         )
 
     def _build_budget_exhausted_prompt(self) -> str:
-        return (
-            "worker 阶段工具预算已耗尽。请停止探索，直接基于当前 facts 和已掌握证据收口："
-            "能做最小更新就写回，不能确认就 mark skipped。"
-        )
+        return "stageB 工具预算已耗尽。请停止探索，基于当前证据直接收口。"
 
     async def on_deliver(self, args: dict[str, Any] | None, state: LoopState) -> DeliverDecision:
         if self._result is None:
             return DeliverDecision.continue_with({
                 "role": "user",
-                "content": "你尚未调用 `write_module_annotation_and_finish` 或 `mark_module_skipped`。请先提交模块结果。",
+                "content": "你尚未调用 `deliver_stage_result`。请先提交极简结果，再 deliver。",
             })
-        return DeliverDecision.finish(_safe_json_dumps({
-            "module_slug": self._result.module_slug,
-            "status": self._result.status,
-            "note": self._result.note,
-        }))
+        return DeliverDecision.finish(_safe_json_dumps({"summary": self._result.summary}))
 
     def _extra_virtual_tools(self) -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",
                 "function": {
-                    "name": "write_module_annotation_and_finish",
-                    "description": "写入完整模块 annotation，并标记该模块处理完成。",
+                    "name": "deliver_stage_result",
+                    "description": "提交 stageB 的极简完成说明。",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "markdown": {"type": "string"},
-                            "note": {"type": "string"},
+                            "summary": {"type": "string"},
                         },
-                        "required": ["markdown", "note"],
                         "additionalProperties": False,
                     },
                 },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "mark_module_skipped",
-                    "description": "当前模块暂不更新 annotation，但要明确写明原因。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"note": {"type": "string"}},
-                        "required": ["note"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
+            }
         ]
 
     async def _handle_stage_virtual_tool(
@@ -793,164 +707,89 @@ class DigestWorkerStageAgent(_DigestStageAgent):
         ok_builder: Any,
         err_builder: Any,
     ) -> dict[str, Any]:
-        if name == "write_module_annotation_and_finish":
-            markdown = str(args.get("markdown") or "").strip()
-            note = str(args.get("note") or "").strip()
-            if not markdown:
-                return err_builder("markdown 不能为空")
-            if not note:
-                return err_builder("note 不能为空")
-            expected_paths = extract_coverage_file_paths(self._delta.annotation_baseline)
-            if not expected_paths:
-                expected_paths = [str(item.path) for item in self._delta.changed_files]
-            errors = validate_module_annotation_markdown(
-                markdown,
-                expected_file_paths=expected_paths,
-                require_core_responsibility=True,
-            )
-            if errors:
-                return err_builder("写入校验失败: " + " | ".join(errors))
-            await _write_text_atomic(
-                _annotation_modules_dir(self._project_root) / f"{self._delta.module_slug}.md",
-                markdown.rstrip() + "\n",
-            )
-            self._result = WorkerResult(
-                status="done",
-                note=note,
-                module_slug=self._delta.module_slug,
-            )
-            return ok_builder(f"模块文档已写入并完成: {self._delta.module_slug}")
-        if name == "mark_module_skipped":
-            note = str(args.get("note") or "").strip()
-            if not note:
-                return err_builder("note 不能为空")
-            self._result = WorkerResult(
-                status="skipped",
-                note=note,
-                module_slug=self._delta.module_slug,
-            )
-            return ok_builder(f"模块已标记跳过: {self._delta.module_slug}")
-        return err_builder(f"未知虚拟工具: {name}")
+        if name != "deliver_stage_result":
+            return err_builder(f"未知虚拟工具: {name}")
+        self._result = AssimilationResult(summary=str(args.get("summary") or "").strip())
+        return ok_builder("stageB 结果已接收")
 
 
-async def run_digest_router(
+async def run_digest_filter(
     *,
     project_root: Path,
-    task: DigestTaskV2,
+    insights: list[InsightFact],
     model: str | None,
     provider: str | None,
     serena_client: SerenaClient,
-) -> DigestRouteDecision:
-    project_annotation = await _read_text_if_exists(_annotation_index_path(project_root))
-    area_annotations = {
-        slug: await _read_text_if_exists(_annotation_areas_dir(project_root) / f"{slug}.md")
-        for slug in task.affected_area_slugs
-    }
-    module_annotations = {
-        slug: await _read_text_if_exists(_annotation_modules_dir(project_root) / f"{slug}.md")
-        for slug in task.affected_module_slugs
-    }
-    navigation_tree_text = await _read_text_if_exists(_navigation_tree_path(project_root))
-    facts_text, truncated = build_router_facts_text(
-        task=task,
-        project_annotation=project_annotation,
-        area_annotations=area_annotations,
-        module_annotations=module_annotations,
-        navigation_tree_text=navigation_tree_text,
+) -> FilterDecision:
+    annotation_paths = _iter_available_annotation_paths(project_root)
+    facts_text, truncated = build_filter_facts_text(
+        insights=insights,
+        annotation_paths=annotation_paths,
         model=model or "gpt-4o-mini",
     )
     feedback: str | None = None
     last_exc: Exception | None = None
-    for attempt in range(1, _ROUTER_MAX_ATTEMPTS + 1):
-        agent = DigestRouterStageAgent(
+    for attempt in range(1, 4):
+        agent = DigestFilterStageAgent(
             project_root=project_root,
-            task=task,
+            insights=insights,
             facts_text=facts_text,
             facts_truncated=truncated,
             model=model,
             provider=provider,
         )
-        agent._project_index_context = project_annotation
-        agent._readable_area_contexts = {
-            slug: content for slug, content in area_annotations.items() if content.strip()
-        }
-        agent._readable_module_contexts = {
-            slug: content for slug, content in module_annotations.items() if content.strip()
-        }
         try:
             return await agent.run(serena_client=serena_client, retry_feedback=feedback)
         except Exception as exc:
             last_exc = exc
-            if attempt >= _ROUTER_MAX_ATTEMPTS:
+            if attempt >= 3:
                 break
             feedback = (
-                f"上一次 router 尝试失败（第 {attempt}/{_ROUTER_MAX_ATTEMPTS} 次）：{exc}\n"
-                "请修正工具调用或结构化结果；若事实已足够，应直接收口，不要自然语言回答。"
+                f"上一次 stageA 尝试失败（第 {attempt}/3 次）：{exc}\n"
+                "请修正工具调用或结果格式；若当前信息已足够，应直接提交筛选结果。"
             )
     assert last_exc is not None
     raise last_exc
 
 
-async def run_digest_worker(
+async def run_digest_assimilation(
     *,
     project_root: Path,
-    task: DigestTaskV2,
-    delta: ModuleDigestDelta,
-    plan: ModuleUpdatePlan,
+    insights: list[InsightFact],
+    dirty_files: list[str],
+    patch_facts: list[ChangedFileFact],
     model: str | None,
     provider: str | None,
     serena_client: SerenaClient,
-) -> WorkerResult:
-    project_annotation = await _read_text_if_exists(_annotation_index_path(project_root))
-    area_annotations = {
-        slug: await _read_text_if_exists(_annotation_areas_dir(project_root) / f"{slug}.md")
-        for slug in task.affected_area_slugs
-    }
-    navigation_tree_text = await _read_text_if_exists(_navigation_tree_path(project_root))
-    all_candidate_module_slugs = sorted(set(task.affected_module_slugs))
-    extra_module_annotations = {
-        slug: await _read_text_if_exists(_annotation_modules_dir(project_root) / f"{slug}.md")
-        for slug in all_candidate_module_slugs
-        if slug != delta.module_slug
-    }
-    facts_text, truncated = build_worker_facts_text(
-        task=task,
-        delta=delta,
-        plan=plan,
-        navigation_tree_text=navigation_tree_text,
-        project_annotation=project_annotation,
-        area_annotations=area_annotations,
+) -> AssimilationResult:
+    annotation_paths = _iter_available_annotation_paths(project_root)
+    facts_text, truncated = build_assimilation_facts_text(
+        insights=insights,
+        dirty_files=dirty_files,
+        patch_facts=patch_facts,
+        annotation_paths=annotation_paths,
         model=model or "gpt-4o-mini",
     )
     feedback: str | None = None
     last_exc: Exception | None = None
-    for attempt in range(1, _WORKER_MAX_ATTEMPTS + 1):
-        agent = DigestWorkerStageAgent(
+    for attempt in range(1, 4):
+        agent = DigestAssimilationStageAgent(
             project_root=project_root,
-            task=task,
-            delta=delta,
-            plan=plan,
+            insight_count=len(insights),
             facts_text=facts_text,
             facts_truncated=truncated,
             model=model,
             provider=provider,
         )
-        agent._project_index_context = project_annotation
-        agent._readable_area_contexts = {
-            slug: content for slug, content in area_annotations.items() if content.strip()
-        }
-        agent._readable_module_contexts = {
-            slug: content for slug, content in extra_module_annotations.items() if content.strip()
-        }
         try:
             return await agent.run(serena_client=serena_client, retry_feedback=feedback)
         except Exception as exc:
             last_exc = exc
-            if attempt >= _WORKER_MAX_ATTEMPTS:
+            if attempt >= 3:
                 break
             feedback = (
-                f"上一次 worker 尝试失败（第 {attempt}/{_WORKER_MAX_ATTEMPTS} 次）：{exc}\n"
-                "请不要自然语言总结；若证据已足够，直接写回或 skip。若事实不足，再做极少量高价值探索。"
+                f"上一次 stageB 尝试失败（第 {attempt}/3 次）：{exc}\n"
+                "请修正工具调用；若当前证据已足够，应直接完成内化并提交结果。"
             )
     assert last_exc is not None
     raise last_exc

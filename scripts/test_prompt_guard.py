@@ -16,8 +16,10 @@ import asyncio
 import json
 import logging
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pce.agent as agent_module
 import pce.annotation_writer as annotation_writer_module
@@ -27,8 +29,8 @@ from pce.annotation_writer import (
     _build_missing_coverage_repair_prompt,
     _llm_complete_text,
 )
-from pce.digest_agent import DigestAgent, DigestTaskItem, DigestTaskList
-from pce.models import FileMeta, IndexEntry
+from pce.digest_cognition_agent import build_assimilation_facts_text, build_filter_facts_text
+from pce.models import ChangedFileFact, FileMeta, IndexEntry, InsightConfidence, InsightFact
 from pce.prompt_guard import build_prompt_budget, estimate_input_tokens
 
 
@@ -74,35 +76,39 @@ async def _test_query_guard() -> None:
 
 
 async def _test_digest_guard() -> None:
-    items = [
-        DigestTaskItem(
-            id=f"module:mod-{idx}",
-            kind="module",
-            status="pending",
-            module_slug=f"mod-{idx}",
+    insights = [
+        InsightFact(
+            id=str(uuid.uuid4()),
+            scope=f"pkg/file_{idx}.py",
+            content="X" * 1200,
+            confidence=InsightConfidence.MEDIUM,
+            created_at=datetime.now(UTC),
         )
-        for idx in range(40)
+        for idx in range(20)
     ]
-    task_list = DigestTaskList(
-        items=items,
-        warnings=["warn"] * 20,
-        created_at=datetime.now(UTC),
-    )
-
-    class _FakeSerena:
-        tools_schema: list[dict[str, object]] = []
-
-    with tempfile.TemporaryDirectory() as tmp:
-        agent = DigestAgent(
-            project_root=Path(tmp),
-            task_list_path=Path(tmp) / ".pce" / "digest_tasks.json",
+    patch_facts = [
+        ChangedFileFact(path=Path("pkg/demo.py"), status="modified")
+    ]
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / ".pce" / "annotations" / "modules").mkdir(parents=True, exist_ok=True)
+        (root / ".pce" / "annotations" / "index.md").write_text("# Index\n", "utf-8")
+        filter_text, _ = build_filter_facts_text(
+            insights=insights,
+            annotation_paths=[".pce/annotations/index.md"],
             model="gpt-4o-mini",
-            provider="openai",
         )
-        full_prompt = agent._build_system_prompt(task_list, detail="full")
-        guarded = agent._guard_system_prompt(task_list, _FakeSerena(), full_prompt)
-        _assert(guarded, "digest guard 不应返回空 prompt")
-        _assert("## 当前任务" in guarded or "## 当前任务概览" in guarded, "digest guard 输出缺少任务区块")
+        assimilation_text, _ = build_assimilation_facts_text(
+            insights=insights[:3],
+            dirty_files=["pkg/demo.py"],
+            patch_facts=patch_facts,
+            annotation_paths=[".pce/annotations/index.md"],
+            model="gpt-4o-mini",
+        )
+        _assert(filter_text, "stageA facts 不应为空")
+        _assert("## Insights" in filter_text, "stageA facts 缺少 insight 区块")
+        _assert(assimilation_text, "stageB facts 不应为空")
+        _assert("## Patch Evidence" in assimilation_text, "stageB facts 缺少 patch 区块")
 
 
 async def _test_annotation_prompt_compaction() -> None:
