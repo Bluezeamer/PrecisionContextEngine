@@ -17,10 +17,9 @@ from .topology_cognition_agent import TopologyCognitionAgent
 logger = logging.getLogger(__name__)
 
 _HARD_PATTERNS = [".pce/", ".serena/"]
-_MAX_FACT_TREE_DEPTH = 2
-_MAX_FACT_TREE_LINES = 160
-_MAX_STATS_ROWS = 48
-_MAX_BINARY_ROWS = 24
+_MAX_FACT_TREE_DEPTH = 4
+_MAX_CHILDREN_PER_DIR = 10
+_MAX_TREE_NODES = 500
 _MAX_DIRTY_PATHS = 80
 _MAX_DIRTY_GROUPS = 32
 
@@ -100,47 +99,6 @@ def _iter_visible_files(project_root: Path) -> tuple[list[str], list[str]]:
     return sorted(visible_dirs), sorted(visible_files)
 
 
-def _build_tree_lines(
-    visible_dirs: list[str],
-    visible_files: list[str],
-    *,
-    max_depth: int,
-    max_lines: int,
-) -> list[str]:
-    lines: list[str] = []
-    omitted = 0
-
-    for rel_dir in visible_dirs:
-        parts = Path(rel_dir).parts
-        if len(parts) > max_depth:
-            continue
-        indent = "  " * (len(parts) - 1)
-        lines.append(f"{indent}- {parts[-1]}/")
-        if len(lines) >= max_lines:
-            omitted += 1
-            break
-
-    if len(lines) < max_lines:
-        remaining = max_lines - len(lines)
-        for rel_file in visible_files:
-            parts = Path(rel_file).parts
-            if len(parts) > max_depth + 1:
-                continue
-            indent = "  " * (len(parts) - 1)
-            lines.append(f"{indent}- {parts[-1]}")
-            if len(lines) >= max_lines:
-                omitted += 1
-                break
-
-    total_candidates = sum(1 for d in visible_dirs if len(Path(d).parts) <= max_depth) + sum(
-        1 for f in visible_files if len(Path(f).parts) <= max_depth + 1
-    )
-    omitted += max(0, total_candidates - len(lines) - omitted)
-    if omitted > 0:
-        lines.append(f"[truncated: omitted {omitted} lines]")
-    return lines
-
-
 def _detect_kind(project_root: Path, rel_path: str) -> str:
     abs_path = project_root / rel_path
     try:
@@ -149,83 +107,70 @@ def _detect_kind(project_root: Path, rel_path: str) -> str:
         return "unknown"
 
 
-def _top_exts(items: list[str], *, limit: int = 5) -> list[str]:
-    counter: Counter[str] = Counter()
-    for item in items:
-        suffix = Path(item).suffix.lower() or "(no-ext)"
-        counter[suffix] += 1
-    return [f"{ext}:{count}" for ext, count in counter.most_common(limit)]
+def _build_folded_tree_snapshot(
+    project_root: Path,
+    visible_dirs: list[str],
+    visible_files: list[str],
+) -> list[dict[str, Any]]:
+    tree: dict[str, Any] = {"children": {}}
 
+    for rel_dir in visible_dirs:
+        parts = Path(rel_dir).parts
+        if len(parts) > _MAX_FACT_TREE_DEPTH:
+            continue
+        cursor = tree["children"]
+        prefix: list[str] = []
+        for part in parts:
+            prefix.append(part)
+            path = "/".join(prefix) + "/"
+            cursor = cursor.setdefault(path, {"path": path, "type": "dir", "children": {}})["children"]
 
-def _build_directory_stats(project_root: Path, visible_dirs: list[str], visible_files: list[str]) -> list[dict[str, Any]]:
-    bucket: dict[str, dict[str, Any]] = {}
-    candidates = [".", *visible_dirs]
-    for rel_dir in candidates:
-        bucket[rel_dir] = {
-            "path": rel_dir,
-            "total_files": 0,
-            "text_files": 0,
-            "binary_files": 0,
-            "sample_files": [],
-            "extensions": [],
+    for rel_file in visible_files:
+        parts = Path(rel_file).parts
+        if len(parts) > _MAX_FACT_TREE_DEPTH + 1:
+            continue
+        cursor = tree["children"]
+        prefix: list[str] = []
+        for part in parts[:-1]:
+            prefix.append(part)
+            path = "/".join(prefix) + "/"
+            cursor = cursor.setdefault(path, {"path": path, "type": "dir", "children": {}})["children"]
+        cursor[rel_file] = {
+            "path": rel_file,
+            "type": "file",
+            "kind": _detect_kind(project_root, rel_file),
         }
 
-    files_by_dir: dict[str, list[str]] = {key: [] for key in bucket}
-    for rel_file in visible_files:
-        parent = Path(rel_file).parent.as_posix()
-        if parent == ".":
-            parent = "."
-        if parent not in files_by_dir:
-            files_by_dir[parent] = []
-            bucket[parent] = {
-                "path": parent,
-                "total_files": 0,
-                "text_files": 0,
-                "binary_files": 0,
-                "sample_files": [],
-                "extensions": [],
-            }
-        files_by_dir[parent].append(rel_file)
+    emitted = 0
 
-    rows: list[dict[str, Any]] = []
-    for rel_dir, files in files_by_dir.items():
-        if not files:
-            continue
-        text_count = 0
-        binary_count = 0
-        for rel_file in files:
-            kind = _detect_kind(project_root, rel_file)
-            if kind == "text":
-                text_count += 1
-            elif kind == "binary":
-                binary_count += 1
-        rows.append({
-            "path": rel_dir,
-            "total_files": len(files),
-            "text_files": text_count,
-            "binary_files": binary_count,
-            "sample_files": files[:3],
-            "extensions": _top_exts(files),
-        })
-    rows.sort(key=lambda item: (-item["total_files"], item["path"]))
-    return rows[:_MAX_STATS_ROWS]
+    def _finalize(children: dict[str, Any]) -> list[dict[str, Any]]:
+        nonlocal emitted
+        result: list[dict[str, Any]] = []
+        ordered_keys = sorted(children.keys())
+        visible_keys = ordered_keys[:_MAX_CHILDREN_PER_DIR]
+        hidden_count = max(0, len(ordered_keys) - len(visible_keys))
+        for key in visible_keys:
+            if emitted >= _MAX_TREE_NODES:
+                break
+            node = children[key]
+            emitted += 1
+            if node.get("type") == "dir":
+                result.append({
+                    "path": node["path"],
+                    "type": "dir",
+                    "children": _finalize(node.get("children", {})),
+                    "collapsed": hidden_count > 0 if key == visible_keys[-1] else False,
+                    "omitted_children_count": hidden_count if key == visible_keys[-1] else 0,
+                })
+            else:
+                result.append({
+                    "path": node["path"],
+                    "type": "file",
+                    "kind": node.get("kind", "unknown"),
+                })
+        return result
 
-
-def _build_binary_clusters(project_root: Path, visible_files: list[str]) -> list[dict[str, Any]]:
-    by_dir: dict[str, list[str]] = {}
-    for rel_file in visible_files:
-        if _detect_kind(project_root, rel_file) != "binary":
-            continue
-        parent = Path(rel_file).parent.as_posix()
-        if parent == ".":
-            parent = "."
-        by_dir.setdefault(parent, []).append(rel_file)
-    rows = [
-        {"path": path, "binary_files": len(files), "sample_files": files[:3]}
-        for path, files in by_dir.items()
-    ]
-    rows.sort(key=lambda item: (-item["binary_files"], item["path"]))
-    return rows[:_MAX_BINARY_ROWS]
+    return _finalize(tree["children"])
 
 
 def _build_pceignore_facts(project_root: Path) -> dict[str, Any]:
@@ -233,17 +178,13 @@ def _build_pceignore_facts(project_root: Path) -> dict[str, Any]:
     return {
         "project_root": str(project_root),
         "gitignore": _read_gitignore_text(project_root),
-        "tree_depth": _MAX_FACT_TREE_DEPTH,
-        "tree_snapshot": "\n".join(
-            _build_tree_lines(
-                visible_dirs,
-                visible_files,
-                max_depth=_MAX_FACT_TREE_DEPTH,
-                max_lines=_MAX_FACT_TREE_LINES,
-            )
-        ),
-        "directory_stats": _build_directory_stats(project_root, visible_dirs, visible_files),
-        "binary_clusters": _build_binary_clusters(project_root, visible_files),
+        "hard_ignored": list(_HARD_PATTERNS),
+        "tree_policy": {
+            "max_depth": _MAX_FACT_TREE_DEPTH,
+            "max_children_per_dir": _MAX_CHILDREN_PER_DIR,
+            "max_nodes": _MAX_TREE_NODES,
+        },
+        "tree_snapshot": _build_folded_tree_snapshot(project_root, visible_dirs, visible_files),
     }
 
 

@@ -34,7 +34,12 @@ from mcp.types import CallToolResult, TextContent, Tool
 from .agent import PCEAgent
 from .baseline_maintenance import seed_initial_file_baselines_if_missing
 from .digest_agent import run_digest, should_run_digest
-from .file_discovery import HARD_SKIP_DIRS, should_track_existing_file, should_track_deleted_path
+from .file_discovery import (
+    HARD_SKIP_DIRS,
+    filter_visible_paths,
+    should_track_existing_file,
+    should_track_deleted_path,
+)
 from .insight_cache import InsightCache
 from .indexer import build_index, build_index_incremental
 from .models import InitResponse, LanguageHealthReport
@@ -848,6 +853,13 @@ class PCEContext:
 
     _DIRTY_INJECT_MAX_FILES: int = 50  # 注入脏文件列表的上限
 
+    def _filter_visible_dirty(self, dirty: DirtyState) -> DirtyState:
+        """过滤掉不应暴露给 Agent 的 dirty 路径。"""
+        return DirtyState(
+            changed=filter_visible_paths(self.project_path, dirty.changed),
+            deleted=filter_visible_paths(self.project_path, dirty.deleted),
+        )
+
     @classmethod
     def _format_dirty_context(cls, dirty: DirtyState) -> str:
         """将暂存区脏文件信息格式化为上下文注入文本。
@@ -890,9 +902,10 @@ class PCEContext:
 
         # 注入暂存区脏文件信息到查询上下文
         dirty = await self.staging.list_unacknowledged()
+        visible_dirty = self._filter_visible_dirty(dirty)
         enriched_query = query
-        if not dirty.empty:
-            dirty_info = self._format_dirty_context(dirty)
+        if not visible_dirty.empty:
+            dirty_info = self._format_dirty_context(visible_dirty)
             enriched_query = f"{query}\n\n{dirty_info}"
 
         async with self.serena_session() as serena_client:

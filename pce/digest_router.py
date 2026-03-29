@@ -28,9 +28,10 @@ from .base_agent import (
     _safe_json_dumps,
 )
 from .digest_delta_builder import DigestDeltaBuilder
+from .file_discovery import filter_visible_paths
 from .insight_cache import InsightCache
 from .memory import NAVIGATION_TREE_FILE
-from .models import ModuleDigestDelta, NavigationTree
+from .models import InsightFact, ModuleDigestDelta, NavigationTree
 from .module_registry import ModuleRegistryManager
 from .serena_client import SerenaClient
 from .staging import DirtyState
@@ -99,13 +100,8 @@ def _build_area_maps(
 
 
 def _classify_task_kind(deltas: list[ModuleDigestDelta]) -> str:
-    has_dirty = any(delta.changed_files for delta in deltas)
     has_insight = any(delta.related_insights for delta in deltas)
-    if has_dirty and has_insight:
-        return "mixed"
-    if has_dirty:
-        return "dirty_only"
-    return "insight_only"
+    return "insight_only" if has_insight else "unresolved"
 
 
 def _collect_dirty_paths(deltas: list[ModuleDigestDelta]) -> list[str]:
@@ -141,6 +137,7 @@ class DigestTaskV2:
     dirty_files: list[str]
     related_insight_ids: list[str]
     deltas: list[ModuleDigestDelta]
+    standalone_insights: list[InsightFact] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def to_summary_dict(self) -> dict[str, Any]:
@@ -152,6 +149,7 @@ class DigestTaskV2:
             "affected_area_slugs": list(self.affected_area_slugs),
             "dirty_files_count": len(self.dirty_files),
             "related_insights_count": len(self.related_insight_ids),
+            "standalone_insights_count": len(self.standalone_insights),
             "warnings": list(self.warnings),
         }
 
@@ -164,6 +162,9 @@ class DigestTaskV2:
             "affected_area_slugs": list(self.affected_area_slugs),
             "dirty_files": list(self.dirty_files),
             "related_insight_ids": list(self.related_insight_ids),
+            "standalone_insights": [
+                item.model_dump(mode="json") for item in self.standalone_insights
+            ],
             "warnings": list(self.warnings),
             "module_deltas": [delta.model_dump(mode="json") for delta in self.deltas],
         }
@@ -244,37 +245,29 @@ class DigestPlannerV2:
         self._insight_cache = insight_cache
 
     async def build(self, dirty_state: DirtyState) -> DigestPlanResult:
+        visible_changed = filter_visible_paths(self._project_root, dirty_state.changed)
+        visible_deleted = filter_visible_paths(self._project_root, dirty_state.deleted)
         builder = DigestDeltaBuilder(self._project_root, self._insight_cache)
-        module_deltas = await builder.build_for_changes(
-            changed_files=dirty_state.changed,
-            deleted_files=dirty_state.deleted,
+        module_deltas, unresolved_insights = await builder.build_for_insights(
+            changed_files=visible_changed,
+            deleted_files=visible_deleted,
         )
-
-        dirty_paths = set(dirty_state.changed + dirty_state.deleted)
-        covered_paths = {
-            str(file_fact.path)
-            for delta in module_deltas
-            for file_fact in delta.changed_files
-        }
-        unresolved_dirty = sorted(dirty_paths - covered_paths)
-        warnings = [
-            f"dirty 文件暂未命中 module registry，后续需补归属: {path}"
-            for path in unresolved_dirty
-        ]
+        warnings: list[str] = []
 
         if not module_deltas:
             tasks: list[DigestTaskV2] = []
-            if unresolved_dirty:
+            if unresolved_insights:
                 tasks.append(
                     DigestTaskV2(
-                        id="task:unresolved-dirty",
+                        id="task:unresolved-insights",
                         task_level="unresolved",
-                        task_kind="dirty_only",
+                        task_kind="unresolved",
                         affected_module_slugs=[],
                         affected_area_slugs=[],
-                        dirty_files=unresolved_dirty,
-                        related_insight_ids=[],
+                        dirty_files=list(dict.fromkeys([*visible_changed, *visible_deleted])),
+                        related_insight_ids=[item.id for item in unresolved_insights],
                         deltas=[],
+                        standalone_insights=list(unresolved_insights),
                         warnings=list(warnings),
                     )
                 )
@@ -293,7 +286,7 @@ class DigestPlannerV2:
                 unresolved_group.append(delta)
 
         tasks: list[DigestTaskV2] = []
-        if unresolved_dirty or unresolved_group:
+        if unresolved_insights or unresolved_group:
             unresolved_deltas = list(unresolved_group)
             tasks.append(
                 self._build_task(
@@ -301,7 +294,8 @@ class DigestPlannerV2:
                     task_level="unresolved",
                     affected_area_slugs=[],
                     deltas=unresolved_deltas,
-                    extra_dirty=unresolved_dirty,
+                    extra_dirty=[*visible_changed, *visible_deleted],
+                    standalone_insights=unresolved_insights,
                     extra_warnings=list(warnings),
                 )
             )
@@ -309,7 +303,7 @@ class DigestPlannerV2:
         if not grouped:
             return DigestPlanResult(tasks=tasks, warnings=warnings)
 
-        if len(grouped) == 1 and not unresolved_dirty and not unresolved_group:
+        if len(grouped) == 1 and not unresolved_insights and not unresolved_group:
             area_slug, deltas = next(iter(grouped.items()))
             if len(deltas) == 1:
                 delta = deltas[0]
@@ -355,6 +349,7 @@ class DigestPlannerV2:
         affected_area_slugs: list[str],
         deltas: list[ModuleDigestDelta],
         extra_dirty: list[str] | None = None,
+        standalone_insights: list[InsightFact] | None = None,
         extra_warnings: list[str] | None = None,
     ) -> DigestTaskV2:
         module_slugs = [delta.module_slug for delta in deltas]
@@ -366,12 +361,15 @@ class DigestPlannerV2:
         return DigestTaskV2(
             id=task_id,
             task_level=task_level,
-            task_kind=_classify_task_kind(deltas) if deltas else "dirty_only",
+            task_kind=_classify_task_kind(deltas) if deltas else "unresolved",
             affected_module_slugs=module_slugs,
             affected_area_slugs=list(affected_area_slugs),
             dirty_files=dirty_files,
-            related_insight_ids=_collect_insight_ids(deltas),
+            related_insight_ids=_collect_insight_ids(deltas) + [
+                item.id for item in (standalone_insights or [])
+            ],
             deltas=deltas,
+            standalone_insights=list(standalone_insights or []),
             warnings=list(extra_warnings or []),
         )
 

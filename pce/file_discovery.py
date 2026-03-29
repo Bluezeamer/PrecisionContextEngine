@@ -78,10 +78,40 @@ def _matches_ignore(spec: pathspec.PathSpec | None, rel_path: str | Path) -> boo
     return spec.match_file(normalized)
 
 
+def _matches_ignore_from_base(
+    spec: pathspec.PathSpec | None,
+    *,
+    base_dir: Path,
+    rel_path: str | Path,
+) -> bool:
+    if spec is None:
+        return False
+    normalized = _normalize_rel_path(rel_path)
+    try:
+        scoped = Path(normalized).relative_to(base_dir.as_posix())
+    except ValueError:
+        return False
+    scoped_text = scoped.as_posix()
+    return bool(scoped_text) and spec.match_file(scoped_text)
+
+
 def is_ignored_by_project_gitignore(project_root: Path, rel_path: str | Path) -> bool:
-    """检查项目根 .gitignore。"""
-    spec = _load_ignore_spec(project_root.resolve() / ".gitignore")
-    return _matches_ignore(spec, rel_path)
+    """检查项目树上从根到目标路径沿途的 `.gitignore`。"""
+    root = project_root.resolve()
+    normalized = _normalize_rel_path(rel_path)
+    rel = Path(normalized)
+
+    candidate_dirs = [root]
+    current = root
+    for part in rel.parts[:-1]:
+        current = current / part
+        candidate_dirs.append(current)
+
+    for base_dir in candidate_dirs:
+        spec = _load_ignore_spec(base_dir / ".gitignore")
+        if _matches_ignore_from_base(spec, base_dir=base_dir.relative_to(root), rel_path=normalized):
+            return True
+    return False
 
 
 def is_ignored_by_pce_ignore(project_root: Path, rel_path: str | Path) -> bool:
@@ -105,6 +135,20 @@ def is_ignored(project_root: Path, rel_path: str | Path) -> bool:
     if is_ignored_by_pce_ignore(project_root, rel_path):
         return True
     return False
+
+
+def is_visible_to_agent(project_root: Path, rel_path: str | Path) -> bool:
+    """该路径是否应暴露给受控 Agent 读取/感知。
+
+    规则保持与项目 ignore 体系一致：
+    - 命中硬跳过目录不可见
+    - 命中 `.gitignore` 不可见
+    - 命中 `.pce/pceignore` 不可见
+    """
+    normalized = _normalize_rel_path(rel_path)
+    if not normalized:
+        return False
+    return not is_ignored(project_root, normalized)
 
 
 def is_probably_text_file(path: Path) -> bool:
@@ -156,3 +200,18 @@ def filter_trackable_files(project_root: Path, file_paths: list[str]) -> list[st
         seen.add(normalized)
         results.append(normalized)
     return sorted(results)
+
+
+def filter_visible_paths(project_root: Path, paths: list[str]) -> list[str]:
+    """过滤出允许暴露给 Agent 的相对路径。"""
+    results: list[str] = []
+    seen: set[str] = set()
+    for rel_path in paths:
+        normalized = _normalize_rel_path(rel_path)
+        if not normalized or normalized in seen:
+            continue
+        if not is_visible_to_agent(project_root, normalized):
+            continue
+        seen.add(normalized)
+        results.append(normalized)
+    return results

@@ -51,6 +51,7 @@ from .base_agent import (
     _get_tool_name,
     _safe_json_dumps,
 )
+from .file_discovery import is_visible_to_agent
 from .insight_cache import InsightCache
 from .models import ImpactResponse, InsightConfidence, QueryResponse
 from .prompt_guard import build_prompt_budget, estimate_input_tokens, fit_text_to_budget
@@ -1650,6 +1651,18 @@ class PCEAgent(BaseReActAgent):
             )
             return {"tool_call_id": tc_id, "name": tool_name, "content": content}
 
+        blocked_reason = self._blocked_serena_access_reason(
+            tool_name,
+            args,
+            project_root=serena_client.project_path,
+        )
+        if blocked_reason is not None:
+            logger.info(
+                "[req=%s] round=%d -> %s blocked %dchars",
+                req_id, round_num, preview, len(blocked_reason),
+            )
+            return {"tool_call_id": tc_id, "name": tool_name, "content": blocked_reason}
+
         t0 = time.monotonic()
         try:
             result = await serena_client.call(tool_name, args)
@@ -1664,6 +1677,27 @@ class PCEAgent(BaseReActAgent):
             req_id, round_num, preview, elapsed, len(content),
         )
         return {"tool_call_id": tc_id, "name": tool_name, "content": content}
+
+    @staticmethod
+    def _blocked_serena_access_reason(
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        project_root: Path,
+    ) -> str | None:
+        del tool_name
+        relative_path = args.get("relative_path")
+        if not isinstance(relative_path, str):
+            return None
+        normalized = relative_path.strip()
+        if not normalized:
+            return None
+        if is_visible_to_agent(project_root, normalized):
+            return None
+        return (
+            f"路径 `{normalized}` 不在当前 PCE Agent 的可读边界内。"
+            "该路径命中了项目 ignore / PCE ignore / 安全围栏，因此不可通过 Serena 读取或搜索。"
+        )
 
     # =========================================================================
     # Insight 蒸馏辅助

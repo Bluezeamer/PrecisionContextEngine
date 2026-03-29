@@ -2668,6 +2668,11 @@ def _validate_navigation_tree(
 
         if not area.is_fallback and not area.module_slugs:
             errors.append(f"非 fallback 区域不能为空: {area.slug}")
+        residual_count = sum(
+            1 for module in area.modules if module.module_type == "residual"
+        )
+        if residual_count > 1:
+            errors.append(f"区域 {area.slug} residual 模块超过 1 个")
 
         for ms in area.module_slugs:
             if ms not in active_slugs:
@@ -2706,7 +2711,7 @@ def _repair_navigation_tree(
     used_modules: set[str] = set()
     used_area_slugs: set[str] = set()
     repaired_areas: list[AreaRecord] = []
-    fallback_modules: list[str] = []
+    fallback_modules: list[ModuleNavRecord] = []
     fallback_order: list[str] = []
     fallback_prefixes: list[str] = []
     fallback_summary = ""
@@ -2724,12 +2729,13 @@ def _repair_navigation_tree(
         return uniq
 
     for area in tree.areas:
-        mods = [
-            s for s in _dedupe_keep_order(area.module_slugs)
-            if s in active and s not in used_modules
-        ]
-        for s in mods:
-            used_modules.add(s)
+        kept_modules: list[ModuleNavRecord] = []
+        for module in area.modules:
+            if module.slug not in active or module.slug in used_modules:
+                continue
+            used_modules.add(module.slug)
+            kept_modules.append(module)
+        mods = [module.slug for module in kept_modules]
 
         order = [
             s for s in _dedupe_keep_order(area.recommended_order)
@@ -2740,7 +2746,7 @@ def _repair_navigation_tree(
                 order.append(s)
 
         if area.is_fallback:
-            fallback_modules.extend(mods)
+            fallback_modules.extend(kept_modules)
             fallback_order.extend(order)
             fallback_prefixes.extend(area.source_prefixes)
             fallback_summary = fallback_summary or area.summary
@@ -2751,24 +2757,34 @@ def _repair_navigation_tree(
 
         repaired_areas.append(area.model_copy(update={
             "slug": _uniq_slug(area.slug),
+            "modules": kept_modules,
             "module_slugs": mods,
             "recommended_order": order,
         }))
 
     # 缺失模块塞入 fallback
     missing = [s for s in sorted(active) if s not in used_modules]
-    fallback_modules = _dedupe_keep_order([*fallback_modules, *missing])
-    fallback_order = _dedupe_keep_order([*fallback_order, *fallback_modules])
+    fallback_modules_by_slug = {
+        module.slug: module for module in fallback_modules
+    }
+    for area in tree.areas:
+        for module in area.modules:
+            if module.slug in missing and module.slug not in fallback_modules_by_slug:
+                fallback_modules_by_slug[module.slug] = module
+    fallback_modules = list(fallback_modules_by_slug.values())
+    fallback_order = _dedupe_keep_order([*fallback_order, *[module.slug for module in fallback_modules]])
 
     # area 数量上限 7（+1 fallback = 8）
     if len(repaired_areas) > 7:
         for overflow in repaired_areas[7:]:
-            fallback_modules.extend(overflow.module_slugs)
+            fallback_modules.extend(overflow.modules)
             fallback_order.extend(overflow.recommended_order)
         repaired_areas = repaired_areas[:7]
-        fallback_modules = _dedupe_keep_order(fallback_modules)
+        fallback_modules = list({
+            module.slug: module for module in fallback_modules
+        }.values())
         fallback_order = _dedupe_keep_order(
-            [*fallback_order, *fallback_modules]
+            [*fallback_order, *[module.slug for module in fallback_modules]]
         )
 
     # 至少保留 1 个非 fallback area，避免模型把所有模块都塞进 fallback
@@ -2776,18 +2792,22 @@ def _repair_navigation_tree(
         logger.warning(
             "navigation tree repair: 检测到 fallback-only 结构，自动生成默认主区域 core"
         )
-        seed_modules = _dedupe_keep_order(fallback_modules[: min(len(fallback_modules), 8)])
+        seed_modules = fallback_modules[: min(len(fallback_modules), 8)]
+        seed_slugs = [module.slug for module in seed_modules]
         repaired_areas.append(AreaRecord(
             slug=_uniq_slug("core"),
             display_name="核心模块",
             summary="模型未给出稳定区域划分时的默认主区域。",
-            module_slugs=seed_modules,
-            recommended_order=seed_modules,
+            modules=seed_modules,
+            module_slugs=seed_slugs,
+            recommended_order=seed_slugs,
             source_prefixes=[],
             is_fallback=False,
         ))
-        fallback_modules = [slug for slug in fallback_modules if slug not in set(seed_modules)]
-        fallback_order = [slug for slug in fallback_order if slug not in set(seed_modules)]
+        fallback_modules = [
+            module for module in fallback_modules if module.slug not in set(seed_slugs)
+        ]
+        fallback_order = [slug for slug in fallback_order if slug not in set(seed_slugs)]
 
     fb_slug = tree.fallback_area_slug or NAVIGATION_FALLBACK_AREA_SLUG
     if fb_slug in used_area_slugs:
@@ -2799,7 +2819,8 @@ def _repair_navigation_tree(
         slug=fb_slug,
         display_name=NAVIGATION_FALLBACK_AREA_NAME,
         summary=fallback_summary or "承接暂时无法稳定归入主区域的模块。",
-        module_slugs=fallback_modules,
+        modules=fallback_modules,
+        module_slugs=[module.slug for module in fallback_modules],
         recommended_order=fallback_order,
         source_prefixes=_dedupe_keep_order(fallback_prefixes),
         is_fallback=True,
@@ -3269,48 +3290,485 @@ def _build_topology_discovery_facts(
     entries_map: dict[str, IndexEntry],
     root_path: Path,
 ) -> dict[str, Any]:
-    """构建 topology init 的文件级 discovery facts。"""
-    top_dir_entries: dict[str, list[IndexEntry]] = defaultdict(list)
-    language_counter: Counter[str] = Counter()
-    file_facts: list[dict[str, Any]] = []
+    """构建 topology init 的最小 files_tree facts。"""
+    tree_root: dict[str, Any] = {"children": {}}
 
     for entry in sorted(entries_map.values(), key=lambda item: str(item.file_meta.path)):
         path_str = str(entry.file_meta.path)
         parts = Path(path_str).parts
-        top_dir = f"{parts[0]}/" if len(parts) > 1 else "./"
-        top_dir_entries[top_dir].append(entry)
-        language_counter[entry.file_meta.language] += 1
-        file_facts.append({
-            "path": path_str,
-            "language": entry.file_meta.language,
-            "loc": entry.file_meta.loc,
-            "top_dir": top_dir,
-            "key_symbols": [sym.name for sym in entry.symbols[:3]],
-        })
+        if not parts:
+            continue
 
-    top_level_dirs = [
-        {
-            "path": directory,
-            "file_count": len(items),
-            "languages": _format_language_summary(items, max_items=3),
-            "representatives": _select_representative_paths(items, max_items=4),
+        cursor = tree_root["children"]
+        prefix_parts: list[str] = []
+        for part in parts[:-1]:
+            prefix_parts.append(part)
+            dir_path = "/".join(prefix_parts) + "/"
+            cursor = cursor.setdefault(dir_path, {"path": dir_path, "children": {}})["children"]
+
+        file_path = "/".join(parts)
+        cursor[file_path] = {
+            "path": file_path,
+            "language": entry.file_meta.language,
         }
-        for directory, items in sorted(
-            top_dir_entries.items(),
-            key=lambda item: (-len(item[1]), item[0]),
-        )[:10]
-    ]
-    primary_language = (
-        language_counter.most_common(1)[0][0] if language_counter else "unknown"
-    )
+
+    def _finalize_children(children: dict[str, Any]) -> list[dict[str, Any]]:
+        finalized: list[dict[str, Any]] = []
+        for key in sorted(children.keys()):
+            node = children[key]
+            raw_children = node.get("children")
+            if isinstance(raw_children, dict):
+                finalized.append({
+                    "path": node["path"],
+                    "children": _finalize_children(raw_children),
+                })
+            else:
+                finalized.append({
+                    "path": node["path"],
+                    "language": node["language"],
+                })
+        return finalized
+
     return {
-        "project": {
-            "name": root_path.name,
-            "file_count": len(entries_map),
-            "primary_language": primary_language,
-            "top_level_dirs": top_level_dirs,
-        },
-        "files": file_facts,
+        "project_root": root_path.name,
+        "files_tree": _finalize_children(tree_root["children"]),
+    }
+
+
+def _build_topology_missing_paths_tree(paths: list[str], entries_map: dict[str, IndexEntry]) -> list[dict[str, Any]]:
+    """为 navigation repair 阶段构建未挂载文件树。"""
+    tree_root: dict[str, Any] = {"children": {}}
+
+    for path_str in sorted({path for path in paths if path in entries_map}):
+        parts = Path(path_str).parts
+        if not parts:
+            continue
+
+        cursor = tree_root["children"]
+        prefix_parts: list[str] = []
+        for part in parts[:-1]:
+            prefix_parts.append(part)
+            dir_path = "/".join(prefix_parts) + "/"
+            cursor = cursor.setdefault(dir_path, {"path": dir_path, "children": {}})["children"]
+
+        cursor[path_str] = {
+            "path": path_str,
+            "language": entries_map[path_str].file_meta.language,
+        }
+
+    def _finalize_children(children: dict[str, Any]) -> list[dict[str, Any]]:
+        finalized: list[dict[str, Any]] = []
+        for key in sorted(children.keys()):
+            node = children[key]
+            raw_children = node.get("children")
+            if isinstance(raw_children, dict):
+                finalized.append({
+                    "path": node["path"],
+                    "children": _finalize_children(raw_children),
+                })
+            else:
+                finalized.append({
+                    "path": node["path"],
+                    "language": node["language"],
+                })
+        return finalized
+
+    return _finalize_children(tree_root["children"])
+
+
+def _collect_navigation_tree_coverage_issues(
+    sections: list[dict[str, Any]],
+    entries_map: dict[str, IndexEntry],
+) -> dict[str, Any]:
+    assigned_counts: Counter[str] = Counter()
+    invalid_paths: list[str] = []
+
+    for section in sections:
+        for file_path in _dedupe_keep_order(section.get("file_paths", [])):
+            if file_path in entries_map:
+                assigned_counts[file_path] += 1
+            else:
+                invalid_paths.append(file_path)
+
+    unassigned_paths = sorted(path for path in entries_map if assigned_counts[path] == 0)
+    duplicate_paths = sorted(path for path, count in assigned_counts.items() if count > 1)
+    return {
+        "unassigned_paths": unassigned_paths,
+        "duplicate_paths": duplicate_paths,
+        "invalid_paths": sorted(set(invalid_paths)),
+    }
+
+
+def _collect_navigation_payload_issues(
+    tree: NavigationTree,
+    entries_map: dict[str, IndexEntry],
+) -> dict[str, Any]:
+    """从 navigation_tree 的最终归属结果收集覆盖问题。"""
+    assignment = _assign_navigation_tree_paths(tree, entries_map)
+    return {
+        "unassigned_paths": list(assignment["unassigned_paths"]),
+        "duplicate_paths": list(assignment["duplicate_paths"]),
+        "duplicate_details": list(assignment["duplicate_details"]),
+        "invalid_paths": list(assignment["invalid_paths"]),
+        "area_residuals": list(assignment["area_residuals"]),
+        "too_many_file_centered_modules": list(
+            assignment["too_many_file_centered_modules"]
+        ),
+    }
+
+
+def _build_navigation_repair_feedback(
+    *,
+    attempt: int,
+    max_attempts: int,
+    issues: dict[str, Any],
+) -> str:
+    unassigned_paths = list(issues.get("unassigned_paths") or [])
+    duplicate_paths = list(issues.get("duplicate_paths") or [])
+    duplicate_details = list(issues.get("duplicate_details") or [])
+    invalid_paths = list(issues.get("invalid_paths") or [])
+    lines = [
+        f"上一轮 `navigation_tree` 存在覆盖问题，需要补齐（第 {attempt}/{max_attempts} 次 repair）。",
+        "请保留已有结构中合理的 area/module 划分，仅对遗漏或错误挂载做最小修正。",
+    ]
+    if unassigned_paths:
+        lines.append(f"- 未挂载文件数：{len(unassigned_paths)}")
+    if duplicate_paths:
+        lines.append(f"- 重复挂载文件数：{len(duplicate_paths)}")
+    if duplicate_details:
+        lines.append("- 典型重复挂载：")
+        for item in duplicate_details[:8]:
+            path = str(item.get("path") or "").strip()
+            modules = ", ".join(str(x).strip() for x in item.get("modules") or [] if str(x).strip())
+            if path and modules:
+                lines.append(f"  - {path}: {modules}")
+    if invalid_paths:
+        lines.append(f"- 非法路径数：{len(invalid_paths)}")
+    area_residuals = list(issues.get("area_residuals") or [])
+    if area_residuals:
+        lines.append("- area 内仍存在较大 residual：")
+        for item in area_residuals[:6]:
+            area_slug = str(item.get("area_slug") or "").strip()
+            count = int(item.get("residual_count") or 0)
+            samples = ", ".join(
+                str(x).strip() for x in item.get("sample_paths") or [] if str(x).strip()
+            )
+            if area_slug and count > 0:
+                suffix = f"（样例：{samples}）" if samples else ""
+                lines.append(f"  - {area_slug}: {count} 个{suffix}")
+    too_many_file_centered = list(issues.get("too_many_file_centered_modules") or [])
+    if too_many_file_centered:
+        lines.append("- 某些 area 的 file_centered 模块过多，应优先合并为目录模块或 residual：")
+        for item in too_many_file_centered[:6]:
+            area_slug = str(item.get("area_slug") or "").strip()
+            count = int(item.get("count") or 0)
+            if area_slug and count > 0:
+                lines.append(f"  - {area_slug}: {count} 个")
+    lines.extend([
+        "优先按目录级边界修正 area/module；单文件 module 只在平铺结构且确有中心职责时保留。",
+        "优先把遗漏文件吸收到已有目录模块或 area residual；仅在明显需要时新增少量 module。",
+        "若某个宽泛 include 与更精确的模块冲突，请保留精确模块，并给宽泛模块增加 exclude。",
+        "修正后请重新提交完整 `navigation_tree`。",
+    ])
+    return "\n".join(lines)
+
+
+def _expand_module_path_rules(
+    module: ModuleNavRecord,
+    candidate_paths: set[str],
+) -> tuple[list[str], list[str]]:
+    """按 glob 规则展开模块覆盖范围。"""
+    include_patterns = _dedupe_keep_order(list(module.include))
+    exclude_patterns = _dedupe_keep_order(list(module.exclude))
+    invalid_patterns: list[str] = []
+    matched: list[str] = []
+
+    for pattern in include_patterns:
+        normalized = str(pattern).strip()
+        if not normalized or normalized.startswith("!"):
+            invalid_patterns.append(normalized)
+            continue
+        matched.extend(
+            path for path in sorted(candidate_paths)
+            if Path(path).match(normalized)
+        )
+
+    resolved = _dedupe_keep_order(matched)
+    if exclude_patterns:
+        excluded: set[str] = set()
+        for pattern in exclude_patterns:
+            normalized = str(pattern).strip()
+            if not normalized or normalized.startswith("!"):
+                invalid_patterns.append(normalized)
+                continue
+            excluded.update(
+                path for path in resolved
+                if Path(path).match(normalized)
+            )
+        resolved = [path for path in resolved if path not in excluded]
+
+    return resolved, [pattern for pattern in invalid_patterns if pattern]
+
+
+def _normalize_module_nav_type(value: Any) -> str:
+    text = " ".join(str(value or "").strip().split()).lower()
+    if text in {"directory", "dir"}:
+        return "directory"
+    if text in {"residual", "fallback", "remainder"}:
+        return "residual"
+    return "file_centered"
+
+
+def _merge_navigation_module_payloads(
+    modules: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged_by_slug: dict[str, dict[str, Any]] = {}
+    merged_order: list[str] = []
+    type_rank = {"file_centered": 0, "directory": 1, "residual": 2}
+
+    for module in modules:
+        slug = str(module.get("slug") or "").strip()
+        if not slug:
+            continue
+        existing = merged_by_slug.get(slug)
+        if existing is None:
+            merged_by_slug[slug] = {
+                "slug": slug,
+                "display_name": module["display_name"],
+                "summary": module.get("summary", ""),
+                "module_type": module["module_type"],
+                "include": list(module.get("include", [])),
+                "exclude": list(module.get("exclude", [])),
+            }
+            merged_order.append(slug)
+            continue
+
+        if not existing.get("summary") and module.get("summary"):
+            existing["summary"] = module["summary"]
+        existing["include"] = _dedupe_keep_order(
+            list(existing.get("include", [])) + list(module.get("include", []))
+        )
+        existing["exclude"] = _dedupe_keep_order(
+            list(existing.get("exclude", [])) + list(module.get("exclude", []))
+        )
+        if type_rank[module["module_type"]] > type_rank[existing["module_type"]]:
+            existing["module_type"] = module["module_type"]
+
+    return [merged_by_slug[slug] for slug in merged_order]
+
+
+def _extract_rule_prefix(pattern: str) -> str:
+    normalized = str(pattern).strip()
+    if not normalized:
+        return ""
+    wildcard_positions = [
+        pos for pos in (
+            normalized.find("*"),
+            normalized.find("?"),
+            normalized.find("["),
+        ) if pos >= 0
+    ]
+    if wildcard_positions:
+        normalized = normalized[: min(wildcard_positions)]
+    normalized = normalized.rstrip("/")
+    if "/" not in normalized:
+        return ""
+    if normalized.endswith((".", "-", "_")):
+        normalized = normalized[:-1]
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[0]
+    return normalized.strip("/")
+
+
+def _directory_roots_for_module(module: ModuleNavRecord) -> list[str]:
+    if module.module_type != "directory":
+        return []
+    roots = [
+        _extract_rule_prefix(pattern)
+        for pattern in module.include
+    ]
+    return [root for root in _dedupe_keep_order(roots) if root]
+
+
+def _path_matches_prefix(path: str, prefix: str) -> bool:
+    normalized_prefix = str(prefix).strip().strip("/")
+    if not normalized_prefix:
+        return True
+    return path == normalized_prefix or path.startswith(normalized_prefix + "/")
+
+
+def _path_specificity(path: str, module: ModuleNavRecord) -> tuple[int, int, int]:
+    resolved_paths, _ = _expand_module_path_rules(module, {path})
+    explicit_hit = 1 if resolved_paths else 0
+    roots = _directory_roots_for_module(module)
+    best_root = max((len(root) for root in roots if _path_matches_prefix(path, root)), default=0)
+    return (explicit_hit, best_root, len(module.include))
+
+
+def _derive_area_candidate_paths(
+    area: AreaRecord,
+    *,
+    candidate_paths: set[str],
+    explicit_module_paths: dict[str, list[str]],
+) -> set[str]:
+    derived: set[str] = set()
+    for prefix in area.source_prefixes:
+        derived.update(path for path in candidate_paths if _path_matches_prefix(path, prefix))
+
+    for module in area.modules:
+        for root in _directory_roots_for_module(module):
+            derived.update(path for path in candidate_paths if _path_matches_prefix(path, root))
+        derived.update(explicit_module_paths.get(module.slug, []))
+    return derived
+
+
+def _assign_navigation_tree_paths(
+    tree: NavigationTree,
+    entries_map: dict[str, IndexEntry],
+) -> dict[str, Any]:
+    candidate_paths = set(entries_map)
+    module_by_slug: dict[str, ModuleNavRecord] = {}
+    module_area_by_slug: dict[str, str] = {}
+    explicit_module_paths: dict[str, list[str]] = {}
+    owners: dict[str, list[str]] = {}
+    invalid_paths: list[str] = []
+    file_centered_counter: Counter[str] = Counter()
+
+    for area in tree.areas:
+        for module in area.modules:
+            module_by_slug[module.slug] = module
+            module_area_by_slug[module.slug] = area.slug
+            if module.module_type == "file_centered":
+                file_centered_counter[area.slug] += 1
+            resolved_paths: list[str] = []
+            rule_errors: list[str] = []
+            if module.module_type != "residual" and module.include:
+                resolved_paths, rule_errors = _expand_module_path_rules(module, candidate_paths)
+            invalid_paths.extend(f"{module.slug}:{item}" for item in rule_errors)
+            explicit_module_paths[module.slug] = resolved_paths
+            for file_path in resolved_paths:
+                owners.setdefault(file_path, []).append(module.slug)
+
+    duplicate_paths = sorted(path for path, slugs in owners.items() if len(set(slugs)) > 1)
+    duplicate_details = [
+        {"path": path, "modules": _dedupe_keep_order(owners.get(path, []))}
+        for path in duplicate_paths
+    ]
+
+    final_owner: dict[str, str] = {}
+    module_paths: dict[str, list[str]] = {slug: [] for slug in module_by_slug}
+
+    for path, slugs in owners.items():
+        unique_slugs = _dedupe_keep_order(slugs)
+        if len(unique_slugs) != 1:
+            continue
+        final_owner[path] = unique_slugs[0]
+        module_paths.setdefault(unique_slugs[0], []).append(path)
+
+    area_paths: dict[str, set[str]] = {}
+    for area in tree.areas:
+        area_paths[area.slug] = _derive_area_candidate_paths(
+            area,
+            candidate_paths=candidate_paths,
+            explicit_module_paths=explicit_module_paths,
+        )
+
+    for area in tree.areas:
+        if area.is_fallback:
+            continue
+
+        residual_module = next(
+            (module for module in area.modules if module.module_type == "residual"),
+            None,
+        )
+        directory_modules = [
+            module for module in area.modules if module.module_type == "directory"
+        ]
+        area_candidates = area_paths.get(area.slug, set())
+        if not area_candidates:
+            continue
+
+        for path in sorted(area_candidates):
+            if path in final_owner:
+                continue
+            directory_hits = [
+                module for module in directory_modules
+                if any(_path_matches_prefix(path, root) for root in _directory_roots_for_module(module))
+            ]
+            if len(directory_hits) == 1:
+                owner = directory_hits[0].slug
+                final_owner[path] = owner
+                module_paths.setdefault(owner, []).append(path)
+                continue
+            if len(directory_hits) > 1:
+                ranked = sorted(
+                    directory_hits,
+                    key=lambda module: _path_specificity(path, module),
+                    reverse=True,
+                )
+                if len(ranked) == 1 or _path_specificity(path, ranked[0]) > _path_specificity(path, ranked[1]):
+                    owner = ranked[0].slug
+                    final_owner[path] = owner
+                    module_paths.setdefault(owner, []).append(path)
+                    continue
+            if residual_module is not None:
+                owner = residual_module.slug
+                final_owner[path] = owner
+                module_paths.setdefault(owner, []).append(path)
+
+    fallback_area = next((area for area in tree.areas if area.is_fallback), None)
+    if fallback_area is not None:
+        fallback_residual = next(
+            (module for module in fallback_area.modules if module.module_type == "residual"),
+            None,
+        )
+        for path in sorted(candidate_paths):
+            if path in final_owner:
+                continue
+            if fallback_residual is not None:
+                owner = fallback_residual.slug
+                final_owner[path] = owner
+                module_paths.setdefault(owner, []).append(path)
+
+    unassigned_paths = sorted(path for path in candidate_paths if path not in final_owner)
+    area_residuals: list[dict[str, Any]] = []
+    too_many_file_centered_modules: list[dict[str, Any]] = []
+
+    for area in tree.areas:
+        residual_modules = [
+            module for module in area.modules if module.module_type == "residual"
+        ]
+        if len(residual_modules) > 1:
+            invalid_paths.append(f"{area.slug}:multiple_residual_modules")
+        if file_centered_counter[area.slug] > 4:
+            too_many_file_centered_modules.append({
+                "area_slug": area.slug,
+                "count": file_centered_counter[area.slug],
+            })
+        residual_module = residual_modules[0] if residual_modules else None
+        if residual_module is None:
+            continue
+        residual_paths = sorted(module_paths.get(residual_module.slug, []))
+        if len(residual_paths) >= 3:
+            area_residuals.append({
+                "area_slug": area.slug,
+                "residual_slug": residual_module.slug,
+                "residual_count": len(residual_paths),
+                "sample_paths": residual_paths[:8],
+            })
+
+    for slug, paths in list(module_paths.items()):
+        module_paths[slug] = sorted(_dedupe_keep_order(paths))
+
+    return {
+        "module_paths": module_paths,
+        "path_owner": final_owner,
+        "unassigned_paths": unassigned_paths,
+        "duplicate_paths": duplicate_paths,
+        "duplicate_details": duplicate_details,
+        "invalid_paths": sorted(set(invalid_paths)),
+        "area_residuals": area_residuals,
+        "too_many_file_centered_modules": too_many_file_centered_modules,
     }
 
 
@@ -3630,26 +4088,20 @@ async def _persist_annotation_outputs(
 
 def _build_sections_from_navigation_tree(
     tree: NavigationTree,
+    entries_map: dict[str, IndexEntry],
 ) -> list[dict[str, Any]]:
-    """将 navigation_tree 中的模块入口恢复为 section 列表。"""
+    """将 navigation_tree 中的模块边界与默认从属恢复为 section 列表。"""
     sections: list[dict[str, Any]] = []
     seen_slugs: set[str] = set()
-    mounted_files: dict[str, str] = {}
+    assignment = _assign_navigation_tree_paths(tree, entries_map)
 
     for area in tree.areas:
         for module in area.modules:
-            file_paths = _dedupe_keep_order(list(module.file_paths))
+            file_paths = list(assignment["module_paths"].get(module.slug, []))
             if not file_paths:
                 continue
             if module.slug in seen_slugs:
                 raise ValueError(f"navigation_tree 模块 slug 重复: {module.slug}")
-            for file_path in file_paths:
-                prev = mounted_files.get(file_path)
-                if prev is not None and prev != module.slug:
-                    raise ValueError(
-                        f"navigation_tree 文件重复挂载: {file_path} 同时属于 {prev} / {module.slug}"
-                    )
-                mounted_files[file_path] = module.slug
 
             body_lines = [f"文件：{', '.join(file_paths)}"]
             summary = _truncate_sentence(str(module.summary or '').strip(), max_chars=160)
@@ -3663,6 +4115,17 @@ def _build_sections_from_navigation_tree(
                 "body_lines": body_lines,
             })
             seen_slugs.add(module.slug)
+
+    if assignment["duplicate_paths"]:
+        detail = assignment["duplicate_details"][0]
+        raise ValueError(
+            "navigation_tree 文件重复挂载: "
+            f"{detail['path']} 同时属于 {' / '.join(detail['modules'])}"
+        )
+    if assignment["invalid_paths"]:
+        raise ValueError(
+            "navigation_tree 含非法 path_rules: " + ", ".join(assignment["invalid_paths"][:8])
+        )
 
     return sections
 
@@ -3696,17 +4159,60 @@ def _sync_tree_modules_from_sections(
     for area in tree.areas:
         modules = []
         for slug in area.module_slugs:
-            section = sections_by_slug.get(slug)
-            if section is None:
+            original = _module_nav_record_by_slug(area, slug)
+            if original is None:
                 continue
             modules.append(ModuleNavRecord(
+                module_type=original.module_type,
                 slug=slug,
-                display_name=section["name"],
-                summary=_extract_section_summary(section),
-                file_paths=list(section.get("file_paths", [])),
+                display_name=original.display_name,
+                summary=_extract_section_summary(sections_by_slug.get(slug, {})) or str(original.summary or "").strip(),
+                include=list(original.include),
+                exclude=list(original.exclude),
             ))
         enriched_areas.append(area.model_copy(update={"modules": modules}))
     return tree.model_copy(update={"areas": enriched_areas})
+
+
+def _normalize_navigation_tree_module_slugs(tree: NavigationTree) -> NavigationTree:
+    """规范化 tree 内 module slug，确保全局唯一且稳定。"""
+    used_slugs: set[str] = set()
+    remapped_areas: list[AreaRecord] = []
+
+    for area in tree.areas:
+        alias_map: dict[str, str] = {}
+        remapped_modules: list[ModuleNavRecord] = []
+        for module in area.modules:
+            base_slug = str(module.slug or "").strip()
+            candidate_slug = base_slug or ModuleRegistryManager.normalize_slug(
+                str(module.display_name or "").strip()
+            )
+            unique_slug = _ensure_unique_section_slug(candidate_slug or "module", used_slugs)
+            used_slugs.add(unique_slug)
+            alias_map[base_slug] = unique_slug
+            remapped_modules.append(module.model_copy(update={"slug": unique_slug}))
+
+        module_slugs: list[str] = []
+        for module in remapped_modules:
+            if module.slug not in module_slugs:
+                module_slugs.append(module.slug)
+
+        recommended_order: list[str] = []
+        for slug in area.recommended_order:
+            mapped = alias_map.get(slug, slug)
+            if mapped in module_slugs and mapped not in recommended_order:
+                recommended_order.append(mapped)
+        for slug in module_slugs:
+            if slug not in recommended_order:
+                recommended_order.append(slug)
+
+        remapped_areas.append(area.model_copy(update={
+            "modules": remapped_modules,
+            "module_slugs": module_slugs,
+            "recommended_order": recommended_order,
+        }))
+
+    return tree.model_copy(update={"areas": remapped_areas})
 
 
 def _remap_navigation_tree_model_slugs(
@@ -3717,6 +4223,15 @@ def _remap_navigation_tree_model_slugs(
     """将 tree 中的 module slug 统一映射为稳定 slug。"""
     remapped_areas: list[AreaRecord] = []
     for area in tree.areas:
+        remapped_modules: list[ModuleNavRecord] = []
+        seen_module_slugs: set[str] = set()
+        for module in area.modules:
+            mapped_slug = slug_aliases.get(module.slug, module.slug)
+            cloned = module.model_copy(update={"slug": mapped_slug})
+            if cloned.slug in seen_module_slugs:
+                continue
+            remapped_modules.append(cloned)
+            seen_module_slugs.add(cloned.slug)
         module_slugs = _dedupe_keep_order([
             slug_aliases.get(slug, slug) for slug in area.module_slugs
         ])
@@ -3724,6 +4239,7 @@ def _remap_navigation_tree_model_slugs(
             slug_aliases.get(slug, slug) for slug in area.recommended_order
         ])
         remapped_areas.append(area.model_copy(update={
+            "modules": remapped_modules,
             "module_slugs": module_slugs,
             "recommended_order": recommended_order,
         }))
@@ -3764,14 +4280,21 @@ def _coerce_topology_navigation_tree(
 ) -> NavigationTree:
     def _listish_strings(value: Any) -> list[str]:
         if isinstance(value, list):
-            return [
-                str(item).strip()
-                for item in value
-                if str(item).strip()
-            ]
+            items: list[str] = []
+            for item in value:
+                text = str(item).strip()
+                if not text:
+                    continue
+                parts = [part.strip() for part in re.split(r"[\n,]+", text) if part.strip()]
+                items.extend(parts)
+            return _dedupe_keep_order(items)
         if isinstance(value, str):
             text = value.strip()
-            return [text] if text else []
+            if not text:
+                return []
+            return _dedupe_keep_order([
+                part.strip() for part in re.split(r"[\n,]+", text) if part.strip()
+            ])
         return []
 
     def _normalize_modules(value: Any) -> list[dict[str, Any]]:
@@ -3782,23 +4305,26 @@ def _coerce_topology_navigation_tree(
             if not isinstance(raw_module, dict):
                 continue
             display_name = " ".join(str(raw_module.get("display_name") or "").split())
-            file_paths = _listish_strings(raw_module.get("file_paths"))
-            if not display_name or not file_paths:
+            module_type = _normalize_module_nav_type(raw_module.get("module_type"))
+            include = _listish_strings(raw_module.get("include"))
+            exclude = _listish_strings(raw_module.get("exclude"))
+            if not display_name:
+                continue
+            if module_type != "residual" and not include:
                 continue
             slug = " ".join(str(raw_module.get("slug") or "").split())
             if not slug:
-                slug = ModuleRegistryManager.normalize_slug(
-                    display_name,
-                    file_paths=file_paths,
-                )
+                slug = ModuleRegistryManager.normalize_slug(display_name)
             summary = " ".join(str(raw_module.get("summary") or "").split())
             normalized_modules.append({
                 "slug": slug,
                 "display_name": display_name,
                 "summary": _truncate_sentence(summary, max_chars=160) if summary else "",
-                "file_paths": file_paths,
+                "module_type": module_type,
+                "include": include,
+                "exclude": exclude,
             })
-        return normalized_modules
+        return _merge_navigation_module_payloads(normalized_modules)
 
     tree_payload = dict(payload)
     raw_areas = payload.get("areas")
@@ -4125,6 +4651,8 @@ async def _build_topology_navigation_bundle(
     module_specs: list[tuple[str, str, list[IndexEntry]]] | None = None
     stable_tree: NavigationTree | None = None
     stable_sections_by_slug: dict[str, dict[str, Any]] | None = None
+    repair_attempts = 0
+    max_repair_rounds = 6
 
     last_navigation_exc: BaseException | None = None
     for attempt in range(1, _TOPOLOGY_STAGE_MAX_ATTEMPTS + 1):
@@ -4153,61 +4681,115 @@ async def _build_topology_navigation_bundle(
                 facts={"source_digest": "topology-init"},
                 active_slugs=None,
             )
+            raw_tree = _normalize_navigation_tree_module_slugs(raw_tree)
             _assert_navigation_tree_not_fallback_only(raw_tree)
-            raw_sections = _build_sections_from_navigation_tree(raw_tree)
-            valid_sections, raw_module_specs = _prepare_module_specs(raw_sections, entries_map)
-            if not valid_sections:
-                raise ValueError("navigation_tree 解析后未得到有效模块规格")
+            last_metrics: tuple[int, int, int] | None = None
+            while True:
+                payload_issues = _collect_navigation_payload_issues(raw_tree, entries_map)
+                raw_sections = _build_sections_from_navigation_tree(raw_tree, entries_map)
+                valid_sections, raw_module_specs = _prepare_module_specs(raw_sections, entries_map)
+                if not valid_sections:
+                    raise ValueError("navigation_tree 解析后未得到有效模块规格")
 
-            raw_sections_by_slug = {section["slug"]: section for section in valid_sections}
-            raw_active_slugs = {slug for _, slug, _ in raw_module_specs}
-            raw_tree = _repair_navigation_tree(
+                raw_sections_by_slug = {section["slug"]: section for section in valid_sections}
+                raw_active_slugs = {slug for _, slug, _ in raw_module_specs}
+                raw_tree = _repair_navigation_tree(
+                    raw_tree.model_copy(update={
+                        "generated_at": datetime.now(UTC),
+                        "source_digest": _compute_source_digest(valid_sections),
+                    }),
+                    raw_active_slugs,
+                )
+                raw_tree = _sync_tree_modules_from_sections(raw_tree, raw_sections_by_slug)
+                _assert_navigation_tree_not_fallback_only(raw_tree)
+                tree_errors = _validate_navigation_tree(raw_tree, raw_active_slugs)
+                if tree_errors:
+                    raise ValueError(" | ".join(tree_errors))
+
+                coverage_issues = _collect_navigation_tree_coverage_issues(
+                    valid_sections,
+                    entries_map,
+                )
+                metrics = (
+                    len(coverage_issues["unassigned_paths"]),
+                    len(payload_issues["duplicate_paths"]),
+                    len(payload_issues["invalid_paths"]),
+                )
+                if metrics == (0, 0, 0):
+                    break
+
+                repair_attempts += 1
+                if repair_attempts > max_repair_rounds:
+                    issue_parts: list[str] = []
+                    if coverage_issues["unassigned_paths"]:
+                        issue_parts.append(f"仍有 {len(coverage_issues['unassigned_paths'])} 个文件未挂载")
+                    if payload_issues["duplicate_paths"]:
+                        issue_parts.append(f"仍有 {len(payload_issues['duplicate_paths'])} 个文件重复挂载")
+                    if payload_issues["invalid_paths"]:
+                        issue_parts.append(f"仍有 {len(payload_issues['invalid_paths'])} 个非法路径")
+                    raise ValueError(" | ".join(issue_parts) or "navigation_tree 覆盖修复失败")
+
+                if last_metrics is not None and not (
+                    metrics[0] < last_metrics[0]
+                    or metrics[1] < last_metrics[1]
+                    or metrics[2] < last_metrics[2]
+                ):
+                    raise ValueError(
+                        "navigation_repair 未继续收敛: "
+                        f"unassigned={metrics[0]} duplicate={metrics[1]} invalid={metrics[2]}"
+                    )
+
+                last_metrics = metrics
+                missing_paths_tree = _build_topology_missing_paths_tree(
+                    coverage_issues["unassigned_paths"],
+                    entries_map,
+                )
+                repair_payload = await agent.run_stage(
+                    stage="navigation_repair",
+                    messages=messages,
+                    serena_client=serena_client,
+                    stage_context={
+                        "current_navigation_tree": raw_tree.model_dump(mode="json"),
+                        "missing_paths_tree": missing_paths_tree,
+                        "validation_feedback": {
+                            **coverage_issues,
+                            **payload_issues,
+                        },
+                    },
+                    user_prompt=_build_navigation_repair_feedback(
+                        attempt=repair_attempts,
+                        max_attempts=max_repair_rounds,
+                        issues={
+                            **coverage_issues,
+                            **payload_issues,
+                        },
+                    ),
+                )
+                if not isinstance(repair_payload, dict):
+                    raise ValueError("navigation_repair payload 必须为 object")
+                await _persist_topology_stage_debug(
+                    root_path,
+                    stage="navigation_repair",
+                    payload=repair_payload,
+                    extra={"attempt": attempt, "repair_attempt": repair_attempts, "metrics": metrics},
+                )
+                raw_tree = _coerce_topology_navigation_tree(
+                    repair_payload,
+                    facts={"source_digest": "topology-init-repair"},
+                    active_slugs=None,
+                )
+                raw_tree = _normalize_navigation_tree_module_slugs(raw_tree)
+                _assert_navigation_tree_not_fallback_only(raw_tree)
+
+            stable_sections_by_slug = {
+                section["slug"]: section for section in valid_sections
+            }
+            module_specs = raw_module_specs
+            stable_active_slugs = {slug for _, slug, _ in module_specs}
+            stable_tree = _repair_navigation_tree(
                 raw_tree.model_copy(update={
                     "generated_at": datetime.now(UTC),
                     "source_digest": _compute_source_digest(valid_sections),
-                }),
-                raw_active_slugs,
-            )
-            raw_tree = _sync_tree_modules_from_sections(raw_tree, raw_sections_by_slug)
-            _assert_navigation_tree_not_fallback_only(raw_tree)
-            tree_errors = _validate_navigation_tree(raw_tree, raw_active_slugs)
-            if tree_errors:
-                raise ValueError(" | ".join(tree_errors))
-
-            stabilized_sections = await _stabilize_sections_with_registry(
-                valid_sections,
-                root_path=root_path,
-                entries_map=entries_map,
-            )
-            stabilized_sections = _dedupe_sections_by_slug(stabilized_sections)
-            stabilized_sections, module_specs = _prepare_module_specs(
-                stabilized_sections,
-                entries_map,
-            )
-            if not stabilized_sections:
-                raise ValueError("registry 稳定化后未得到有效模块规格")
-
-            stable_sections_by_slug = {
-                section["slug"]: section for section in stabilized_sections
-            }
-            stable_active_slugs = {slug for _, slug, _ in module_specs}
-            slug_aliases = _build_section_slug_aliases(valid_sections, stabilized_sections)
-            if slug_aliases:
-                logger.info(
-                    "topology slug aliases stabilized: %s",
-                    ", ".join(
-                        f"{src}->{dst}" for src, dst in sorted(slug_aliases.items())
-                    ),
-                )
-            stable_tree = _remap_navigation_tree_model_slugs(
-                raw_tree,
-                slug_aliases,
-                stable_sections_by_slug,
-            )
-            stable_tree = _repair_navigation_tree(
-                stable_tree.model_copy(update={
-                    "generated_at": datetime.now(UTC),
-                    "source_digest": _compute_source_digest(stabilized_sections),
                 }),
                 stable_active_slugs,
             )

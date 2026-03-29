@@ -441,12 +441,29 @@ class ModuleRegistry(BaseSchema):
 class ModuleNavRecord(BaseSchema):
     """导航树中的模块入口记录。"""
 
+    module_type: Literal["directory", "file_centered", "residual"] = Field(
+        default="file_centered",
+        description="模块边界类型：目录型 / 单文件中心型 / residual 承接型",
+    )
     slug: NonEmptyStr = Field(..., description="模块稳定 slug")
     display_name: NonEmptyStr = Field(..., description="模块展示名")
     summary: str = Field(default="", description="模块一句话入口摘要")
-    file_paths: list[NonEmptyStr] = Field(
-        default_factory=list, description="该模块覆盖的真实文件路径"
+    include: list[NonEmptyStr] = Field(
+        default_factory=list, description="模块覆盖规则（glob）"
     )
+    exclude: list[NonEmptyStr] = Field(
+        default_factory=list, description="模块排除规则（glob）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_module_shape(self) -> "ModuleNavRecord":
+        if self.module_type == "residual":
+            return self
+        if not self.include:
+            raise ValueError(
+                f"module {self.slug} ({self.module_type}) must have include rules"
+            )
+        return self
 
 
 class AreaRecord(BaseSchema):
@@ -510,6 +527,13 @@ class AreaRecord(BaseSchema):
                 continue
             normalized_modules.append(module)
             seen.add(module.slug)
+        residual_count = sum(
+            1 for module in normalized_modules if module.module_type == "residual"
+        )
+        if residual_count > 1:
+            raise ValueError(
+                f"area {self.slug} contains more than one residual module"
+            )
         self.modules = normalized_modules
         self.module_slugs = [module.slug for module in normalized_modules]
         return self

@@ -44,14 +44,12 @@ from .digest_router import (
     DigestPlannerV2,
     DigestRouteDecision,
     DigestTaskV2,
-    refresh_digest_navigation,
     route_digest_task,
 )
 from .digest_delta_builder import DigestDeltaBuilder
 from .insight_cache import InsightCache
 from .memory import delete_file_baseline, save_file_baseline
 from .models import ModuleDigestDelta
-from .module_registry import ModuleRegistryManager
 from .prompt_guard import build_prompt_budget, estimate_input_tokens
 from .serena_client import SerenaClient
 from .staging import DirtyState
@@ -1244,7 +1242,10 @@ async def run_digest(
     )
 
     delete_insights_start = time.monotonic()
-    consumed_ids = _collect_consumed_insight_ids(result["consumed_task_list"])
+    consumed_ids = list(dict.fromkeys([
+        *_collect_consumed_insight_ids(result["consumed_task_list"]),
+        *(result.get("consumed_insight_ids") or []),
+    ]))
     deleted_count = await insight_cache.delete_by_ids(consumed_ids)
     logger.info(
         "Digest 阶段耗时: delete_consumed_insights=%.2fs (deleted=%d)",
@@ -1339,6 +1340,7 @@ async def _run_digest_plan_v2(
     consumed_done = DigestTaskList(items=[], warnings=[], created_at=_utc_now())
     resolved_tasks = 0
     pending_tasks = 0
+    consumed_insight_ids: list[str] = []
 
     for task in plan.tasks:
         logger.info(
@@ -1364,10 +1366,9 @@ async def _run_digest_plan_v2(
             continue
 
         logger.info(
-            "Digest Router decision: id=%s decision=%s nav=%s modules=%d",
+            "Digest Router decision: id=%s decision=%s modules=%d",
             task.id,
             decision.decision,
-            decision.requires_navigation_update,
             len(decision.module_update_plans),
         )
 
@@ -1378,25 +1379,18 @@ async def _run_digest_plan_v2(
             )
             continue
 
-        if decision.requires_navigation_update:
-            try:
-                nav_result = await refresh_digest_navigation(
-                    project_root=project_root,
-                    serena_client=serena_client,
-                    model=model,
-                )
-                summaries.append(
-                    f"[{task.id}] navigation refreshed: {nav_result.get('areas', 0)} areas / {nav_result.get('modules', 0)} modules"
-                )
-            except Exception as exc:
-                pending_tasks += 1
-                warnings.append(f"Digest navigation 刷新失败: {task.id}: {exc}")
-                continue
+        if decision.decision in {"update_navigation_only", "update_navigation_and_modules"}:
+            pending_tasks += 1
+            warnings.append(
+                f"Digest 不再负责 navigation 更新: {task.id}: {decision.decision}"
+            )
+            continue
 
-        if decision.decision == "no_update" or decision.decision == "update_navigation_only":
+        if decision.decision == "no_update":
             done_list = _to_legacy_done_task_list(task.deltas)
             baseline_done.items.extend(done_list.items)
             consumed_done.items.extend(done_list.items)
+            consumed_insight_ids.extend(task.related_insight_ids)
             resolved_tasks += 1
             rationale = decision.rationale or "无需修改认知文档"
             summaries.append(f"[{task.id}] {decision.decision}: {rationale}")
@@ -1407,6 +1401,7 @@ async def _run_digest_plan_v2(
             done_list = _to_legacy_done_task_list(task.deltas)
             baseline_done.items.extend(done_list.items)
             consumed_done.items.extend(done_list.items)
+            consumed_insight_ids.extend(task.related_insight_ids)
             resolved_tasks += 1
             summaries.append(f"[{task.id}] no module delta selected")
             continue
@@ -1465,6 +1460,7 @@ async def _run_digest_plan_v2(
         "warnings": warnings,
         "baseline_task_list": baseline_done,
         "consumed_task_list": consumed_done,
+        "consumed_insight_ids": list(dict.fromkeys(consumed_insight_ids)),
     }
 
 
@@ -1475,12 +1471,6 @@ async def should_run_digest(
     dirty_state: DirtyState,
 ) -> tuple[bool, str]:
     """判断当前是否应触发 digest。"""
-    if not dirty_state.empty:
-        return (
-            True,
-            f"dirty_files changed={len(dirty_state.changed)} deleted={len(dirty_state.deleted)}",
-        )
-
     sweep_start = time.monotonic()
     try:
         await insight_cache.sweep_stale()
@@ -1497,7 +1487,7 @@ async def should_run_digest(
         insight_cache=insight_cache,
     ):
         return True, "actionable_fresh_insights"
-    return False, "no_dirty_or_actionable_insights"
+    return False, "no_actionable_insights"
 
 
 async def _run_module_tasks(
@@ -1649,19 +1639,8 @@ async def _has_actionable_fresh_insights(
     project_root: Path,
     insight_cache: InsightCache,
 ) -> bool:
-    manager = ModuleRegistryManager(project_root)
-    _, current_file_to_record, historical_file_to_record = (
-        await manager.build_file_owner_maps()
-    )
-
     records = await insight_cache.get_all_records(include_stale=False)
-    for record in records:
-        scope = str(record.scope).strip()
-        if not scope:
-            continue
-        if scope in current_file_to_record or scope in historical_file_to_record:
-            return True
-    return False
+    return bool(records)
 
 
 def _collect_consumed_insight_ids(task_list: DigestTaskList) -> list[str]:

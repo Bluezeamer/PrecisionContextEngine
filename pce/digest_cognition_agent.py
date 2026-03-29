@@ -35,6 +35,7 @@ from .base_agent import (
     _safe_json_dumps,
 )
 from .digest_router import DigestRouteDecision, DigestTaskV2, ModuleUpdatePlan
+from .file_discovery import is_visible_to_agent
 from .memory import NAVIGATION_TREE_FILE
 from .models import ChangedFileFact, ModuleDigestDelta
 from .module_annotation_contract import (
@@ -167,6 +168,21 @@ def _render_insights(delta: ModuleDigestDelta) -> list[str]:
     return lines
 
 
+def _render_task_standalone_insights(task: DigestTaskV2) -> list[str]:
+    lines: list[str] = []
+    for insight in task.standalone_insights:
+        lines.append(
+            "\n".join(
+                [
+                    f"- scope: `{insight.scope}`",
+                    f"  - confidence: `{insight.confidence}`",
+                    f"  - content: {_truncate_block(insight.content, max_chars=600)}",
+                ]
+            )
+        )
+    return lines
+
+
 def _render_delta_block(delta: ModuleDigestDelta) -> str:
     lines = [
         f"### 模块 `{delta.module_slug}` / {delta.module_name}",
@@ -198,7 +214,7 @@ def build_router_facts_text(
     model: str,
 ) -> tuple[str, bool]:
     lines = [
-        "以下是直接注入的 digest router facts。优先基于这些事实判断是否需要更新以及更新边界。",
+        "以下是直接注入的 digest router facts。优先基于这些事实判断哪些 insight 值得沉淀，以及是否存在陈旧风险。",
         "",
         "## 任务概览",
         f"- task_id: `{task.id}`",
@@ -211,17 +227,13 @@ def build_router_facts_text(
     ]
     if task.warnings:
         lines.extend(["", "## warnings", *[f"- {item}" for item in task.warnings]])
-    lines.extend(["", "## navigation_tree", navigation_tree_text.strip() or "(empty)"])
-    if project_annotation.strip():
-        lines.extend(["", "## project annotation", project_annotation.strip()])
-    for area_slug, content in area_annotations.items():
-        if content.strip():
-            lines.extend(["", f"## area annotation `{area_slug}`", content.strip()])
-    for module_slug, content in module_annotations.items():
-        if content.strip():
-            lines.extend(["", f"## module annotation `{module_slug}`", content.strip()])
+    if task.dirty_files:
+        lines.extend(["", "## dirty files", *[f"- `{item}`" for item in task.dirty_files]])
     for delta in task.deltas:
         lines.extend(["", _render_delta_block(delta)])
+    standalone_insights = _render_task_standalone_insights(task)
+    if standalone_insights:
+        lines.extend(["", "## unresolved insights", *standalone_insights])
 
     full = "\n".join(lines).strip()
     fitted = fit_text_to_budget(
@@ -245,7 +257,7 @@ def build_worker_facts_text(
     model: str,
 ) -> tuple[str, bool]:
     lines = [
-        "以下是直接注入的 digest worker facts。目标是基于增量事实沉淀认知，而不是重建全量认知。",
+        "以下是直接注入的 digest worker facts。目标是基于 insight 做增量认知沉淀，而不是重建全量认知。",
         "",
         "## 任务概览",
         f"- task_id: `{task.id}`",
@@ -254,15 +266,9 @@ def build_worker_facts_text(
         f"- target_module: `{delta.module_slug}` / {delta.module_name}",
         f"- worker_action: `{plan.action}`",
         f"- rationale: {plan.rationale or '(none)'}",
-        "",
-        "## navigation_tree",
-        navigation_tree_text.strip() or "(empty)",
     ]
-    if project_annotation.strip():
-        lines.extend(["", "## project annotation", project_annotation.strip()])
-    for area_slug, content in area_annotations.items():
-        if content.strip():
-            lines.extend(["", f"## area annotation `{area_slug}`", content.strip()])
+    if task.dirty_files:
+        lines.extend(["", "## dirty files", *[f"- `{item}`" for item in task.dirty_files]])
     lines.extend(["", _render_delta_block(delta)])
 
     full = "\n".join(lines).strip()
@@ -359,12 +365,39 @@ class _DigestStageAgent(BaseReActAgent):
         serena_client: SerenaClient,
         state: LoopState | None = None,
     ) -> dict[str, Any]:
-        result = await super()._invoke_serena(tool_call, serena_client, state=state)
         tool_name = _get_tool_name(tool_call) or ""
+        tool_args = _extract_tool_call_args(tool_call) or {}
+        blocked_reason = self._blocked_serena_access_reason(tool_name, tool_args)
+        if blocked_reason is not None:
+            return {
+                "tool_call_id": _get_tool_call_id(tool_call),
+                "name": tool_name or "unknown",
+                "content": blocked_reason,
+            }
+
+        result = await super()._invoke_serena(tool_call, serena_client, state=state)
         if tool_name in _ALLOWED_SERENA_TOOLS and self._tool_budget_used < self._tool_budget_total:
             self._tool_budget_used += 1
             result["content"] = str(result.get("content") or "") + self._budget_note()
         return result
+
+    def _blocked_serena_access_reason(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> str | None:
+        relative_path = tool_args.get("relative_path")
+        if not isinstance(relative_path, str):
+            return None
+        normalized = relative_path.strip()
+        if not normalized:
+            return None
+        if is_visible_to_agent(self._project_root, normalized):
+            return None
+        return (
+            f"路径 `{normalized}` 不在当前 digest agent 的可读边界内。"
+            "该路径命中了项目 ignore / PCE ignore / 安全围栏，因此不可通过 Serena 读取。"
+        )
 
     def _build_base_messages(self) -> list[dict[str, Any]]:
         return [
@@ -538,7 +571,7 @@ class DigestRouterStageAgent(_DigestStageAgent):
             "role": "user",
             "content": (
                 "当前阶段是 digest router。请基于已注入 facts 判断："
-                "是否需要更新、是否需要 navigation 更新、以及哪些 module 需要最小认知修正。"
+                "哪些 insight 值得沉淀、哪些可能因 dirty file 而存在陈旧风险、以及哪些 module 需要最小认知修正。"
                 "优先使用 facts；仅在明显不足时再做少量探索。"
             ),
         })
@@ -558,17 +591,19 @@ class DigestRouterStageAgent(_DigestStageAgent):
                 "你是 PCE 的 DigestRouterAgent，负责对单个 digest task 做轻量路由，不直接写文档。",
                 "",
                 "## 目标",
-                "- 判断是否需要更新认知。",
-                "- 判断是否需要刷新 navigation_tree。",
+                "- 判断哪些 insight 值得沉淀，哪些可以直接跳过。",
+                "- 判断哪些 insight 可能因 dirty file 而存在陈旧风险。",
                 "- 若需要模块更新，指出需要更新的 module slug 以及更新强度。",
                 "",
                 "## 约束",
                 "- 代码事实优先，文档只能参考。",
                 "- 优先依赖直接注入的 facts；只有在 facts 不足时才调用 Serena。",
                 "- 探索预算很小，只做高价值、窄范围探索。",
-                "- 目标是路由和边界判断，不是重建全量认知。",
+                "- 目标是 insight 路由和边界判断，不是重建全量认知。",
+                "- 低价值、明显重复、或对既有认知没有新增信息的 insight，可直接 `no_update`。",
+                "- dirty file 只是辅助判断 insight 是否可能陈旧，不是独立认知沉淀触发源。",
                 "- 最终必须先调用 `deliver_stage_result(payload)`，再调用 `deliver(answer='stage done')`。",
-                "- `decision` 只能是 `no_update` / `update_module_only` / `update_navigation_only` / `update_navigation_and_modules` / `unresolved`。",
+                "- `decision` 只能是 `no_update` / `update_module_only` / `unresolved`。",
                 "- `module_update_plans[*].action` 只能是 `light_update` / `rewrite` / `create_if_missing` / `no_change`。",
             ]
         )
@@ -657,8 +692,8 @@ class DigestWorkerStageAgent(_DigestStageAgent):
             "role": "user",
             "content": (
                 f"当前阶段是 digest worker，目标模块是 `{self._delta.module_slug}`。"
-                "请基于已注入的变化说明、diff/patch、相关 insight 和 annotation baseline，"
-                "做最小必要的认知修正。若证据不足，可在预算内做少量探索。"
+                "请基于已注入的 insight 与 dirty file 事实，"
+                "判断当前 insight 是否可能陈旧，并做最小必要的认知修正。若证据不足，可在预算内做少量探索。"
                 "目标是沉淀增量认知，不是重建全量认知。"
             ),
         })
@@ -683,9 +718,11 @@ class DigestWorkerStageAgent(_DigestStageAgent):
                 "",
                 "## 约束",
                 "- 代码事实优先，文档只能参考。",
-                "- 优先依赖直接注入的 facts；只有在 facts 不足时才调用 Serena。",
+                "- 优先依赖直接注入的 insight / dirty file 事实；只有在 facts 不足时才调用 Serena。",
                 "- 探索预算有限，应做高价值、窄范围探索。",
-                "- 目标是修正现有认知，不是重写整个项目认知。",
+                "- 目标是围绕 insight 修正现有认知，不是重写整个项目认知。",
+                "- 若当前 insight 低价值、重复、或不足以改变现有认知，可直接 `mark_module_skipped`。",
+                "- dirty file 仅用于辅助判断该 insight 是否可能过期，不应把任务扩展成全量变更调查。",
                 "- 文档必须保留固定章节：`## 覆盖文件` `## 核心职责` `## 关键流程` `## 外部协作` `## 风险与约束`。",
                 "- `## 关键符号` 可选，且只能保留少量稳定锚点。",
                 "- 最终必须调用 `write_module_annotation_and_finish` 或 `mark_module_skipped`，再 `deliver(answer='stage done')`。",
@@ -834,15 +871,12 @@ async def run_digest_router(
             provider=provider,
         )
         agent._project_index_context = project_annotation
-        agent._injected_context_paths.add(_annotation_rel_index())
-        for slug, content in area_annotations.items():
-            if content.strip():
-                agent._injected_context_paths.add(_annotation_rel_area(slug))
-        for slug, content in module_annotations.items():
-            if content.strip():
-                agent._injected_context_paths.add(_annotation_rel_module(slug))
-        agent._readable_area_contexts = {}
-        agent._readable_module_contexts = {}
+        agent._readable_area_contexts = {
+            slug: content for slug, content in area_annotations.items() if content.strip()
+        }
+        agent._readable_module_contexts = {
+            slug: content for slug, content in module_annotations.items() if content.strip()
+        }
         try:
             return await agent.run(serena_client=serena_client, retry_feedback=feedback)
         except Exception as exc:
@@ -902,12 +936,12 @@ async def run_digest_worker(
             provider=provider,
         )
         agent._project_index_context = project_annotation
-        agent._injected_context_paths.add(_annotation_rel_index())
-        for slug in task.affected_area_slugs:
-            agent._injected_context_paths.add(_annotation_rel_area(slug))
-        agent._injected_context_paths.add(_annotation_rel_module(delta.module_slug))
-        agent._readable_area_contexts = {}
-        agent._readable_module_contexts = extra_module_annotations
+        agent._readable_area_contexts = {
+            slug: content for slug, content in area_annotations.items() if content.strip()
+        }
+        agent._readable_module_contexts = {
+            slug: content for slug, content in extra_module_annotations.items() if content.strip()
+        }
         try:
             return await agent.run(serena_client=serena_client, retry_feedback=feedback)
         except Exception as exc:

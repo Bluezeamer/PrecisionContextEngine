@@ -25,18 +25,24 @@ from .base_agent import (
     _get_tool_name,
     _safe_json_dumps,
 )
-from .init_cognition_limits import PCEIGNORE_STAGE_TOOL_BUDGET
+from .init_cognition_limits import (
+    PCEIGNORE_STAGE_TOOL_BUDGET,
+    TOPOLOGY_NAVIGATION_STAGE_TOOL_BUDGET,
+    TOPOLOGY_REPAIR_STAGE_TOOL_BUDGET,
+)
 from .module_annotation_contract import validate_module_annotation_markdown
-from .prompt_guard import fit_text_to_budget
 from .serena_client import SerenaClient
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SECONDS = 180.0
+_BATCH_READ_MAX_FILES = 10
+_BATCH_READ_MAX_LINES = 50
 _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE: dict[str, frozenset[str]] = {
     "pceignore": frozenset({"read_file", "search_for_pattern"}),
     "pceignore_refresh": frozenset({"read_file", "search_for_pattern"}),
-    "navigation_tree": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
+    "navigation_tree": frozenset({"find_file", "get_symbols_overview", "read_file"}),
+    "navigation_repair": frozenset({"find_file"}),
     "write_area_modules": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
 }
 _REACT_FAILURE_MESSAGES: dict[str, str] = {
@@ -106,10 +112,18 @@ class TopologyCognitionAgent(BaseReActAgent):
         self._active_stage = stage
         self._stage_payload = None
         self._stage_context = dict(stage_context or {})
-        if stage != "write_area_modules":
+        if stage not in {"write_area_modules", "navigation_repair"}:
             self._stage_context = {}
         if stage in {"pceignore", "pceignore_refresh"}:
             self._stage_tool_budget_total = PCEIGNORE_STAGE_TOOL_BUDGET
+            self._stage_tool_budget_used = 0
+            self._stage_budget_exhausted_notified = False
+        elif stage == "navigation_tree":
+            self._stage_tool_budget_total = TOPOLOGY_NAVIGATION_STAGE_TOOL_BUDGET
+            self._stage_tool_budget_used = 0
+            self._stage_budget_exhausted_notified = False
+        elif stage == "navigation_repair":
+            self._stage_tool_budget_total = TOPOLOGY_REPAIR_STAGE_TOOL_BUDGET
             self._stage_tool_budget_used = 0
             self._stage_budget_exhausted_notified = False
         else:
@@ -128,16 +142,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         return self._stage_payload
 
     def _build_embedded_facts_text(self) -> str:
-        discovery_text = json.dumps(
-            self._discovery_facts, ensure_ascii=False, indent=2
-        )
-        discovery_text = fit_text_to_budget(
-            self._model,
-            discovery_text,
-            token_budget=14000,
-            notice="\n... [discovery facts 已截断，可用 read_discovery_facts 取回更多内容] ...\n",
-            min_chars=1800,
-        )
+        discovery_text = json.dumps(self._discovery_facts, ensure_ascii=False, indent=2)
         return "\n".join(
             [
                 "以下是直接注入的 discovery facts。优先基于这些事实工作；只有信息不足时再探索代码。",
@@ -156,6 +161,7 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- 唯一稳定事实来源是当前代码结构与代码内容；文档只能参考，不能直接当成事实。",
                 "- 优先使用直接注入的 discovery facts；仅在 facts 不足时，再调用 Serena 工具补证据。",
                 "- 若需读取代码，先用 Serena 的搜索/符号工具定界，再按需 read_file，避免无界读取。",
+                "- 若发现明显扁平的目录结构，可优先用受控批量读取快速查看多个同级文件的局部内容，再判断是否需要拆成单文件模块。",
                 "- 目标是形成稳定导航与轻量模块认知，不展开内部实现细节，不穷举符号。",
                 "- 若证据不足，宁可保持较粗但稳定的划分，也不要切出很多脆弱小模块。",
                 "- stage1 为 `pceignore` 阶段：允许有限探索后给出保守过滤规则，用于减少后续索引噪声。",
@@ -168,6 +174,7 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- stage1 输出 `pceignore`：提交 `{ignore_patterns:[...]}`。",
                 "- `pceignore_refresh` 输出 `{action, ignore_patterns, rationale}`，其中 `action` 只能是 `no_update` 或 `append_patterns`。",
                 "- stage2 输出 `navigation_tree`：直接给出 project -> areas -> modules 的完整导航树。",
+                "- `navigation_repair` 阶段也输出完整 `navigation_tree`，但目标是基于现有结构补齐遗漏与修正错误挂载。",
                 "- stage3 不再输出大 JSON；而是直接调用 `write_module_annotation` 写当前 area 下的模块文档。",
                 "- 当当前 area 全部处理完后，调用 `mark_area_done`，再调用 `deliver(answer='stage done')`。",
                 "",
@@ -181,9 +188,15 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- `project_summary` 必须是一段简短概括，说明项目做什么、面向什么问题或场景。",
                 "- `areas[*]` 字段：`slug`, `display_name`, `summary`, `modules`, `recommended_order`, `source_prefixes`, `is_fallback`。",
                 "- `areas[*].summary` 必须是一段 area 级概括，说明该 area 主要职责与边界。",
-                "- `areas[*].modules[*]` 字段：`slug`, `display_name`, `summary`, `file_paths`。",
+                "- `areas[*].modules[*]` 字段：`slug`, `display_name`, `summary`, `module_type`, `include`, `exclude`。",
+                "- `module_type` 只能是 `directory`、`file_centered`、`residual`。",
+                "- 优先按目录层级建立 `directory` 模块；单文件 `file_centered` 只在平铺结构且该文件确实像职责中心时使用。",
+                "- 每个 area 最多保留 1 个 `residual` 模块；它用于承接该 area 内剩余文件，可不写 `include` / `exclude`。",
+                "- `include` / `exclude` 使用 glob 风格路径规则表达显式边界；优先按目录层级覆盖，而不是单文件穷举。",
+                "- 若宽泛 `include` 会覆盖到更精确的模块，请通过 `exclude` 消除重叠，而不是让同一文件落入多个模块。",
                 "- `areas[*].modules[*].summary` 必须是一句 module 入口介绍，用于快速导航。",
                 "- 恰好 1 个 fallback area；每个文件只能归属一个 module；每个 module 只能归属一个 area。",
+                "- `include` / `exclude` 只能引用当前注入 `files_tree` 可覆盖的候选路径，不要编造索引外文件。",
                 "- 不要单独输出 module_catalog，也不要把目录名机械等同于 area/module。",
                 "",
                 "## write_module_annotation 约束",
@@ -201,7 +214,7 @@ class TopologyCognitionAgent(BaseReActAgent):
             return "\n".join(
                 [
                     "当前阶段：`pceignore`。",
-                    "请基于已注入的目录结构、统计与 .gitignore 事实，必要时再做极少量探索，输出保守可用的 `.pce/pceignore` 规则。",
+                    "请基于已注入的折叠目录树摘要与 `.gitignore` 事实，必要时再做极少量探索，输出保守可用的 `.pce/pceignore` 规则。",
                     "本阶段最多允许有限工具探索；每次调用工具后你会收到预算反馈。",
                     "预算耗尽后必须停止探索，并基于当前证据提交结果。",
                     "先提交 pceignore 阶段结果，再调用 deliver(answer=\"stage done\")。",
@@ -211,7 +224,7 @@ class TopologyCognitionAgent(BaseReActAgent):
             return "\n".join(
                 [
                     "当前阶段：`pceignore_refresh`。",
-                    "请基于已注入的 dirty files、当前 `.pce/pceignore`、目录摘要与统计事实，判断当前 ignore 边界是否需要增量更新。",
+                    "请基于已注入的 dirty files、当前 `.pce/pceignore` 与折叠目录树摘要，判断当前 ignore 边界是否需要增量更新。",
                     "若当前规则仍然足够，请输出 `action=no_update` 并直接结束。",
                     "若需要更新，请仅输出最小增量 ignore patterns，避免重建整份 `.pce/pceignore`。",
                     "本阶段允许有限工具探索；每次调用工具后你会收到预算反馈。",
@@ -223,11 +236,42 @@ class TopologyCognitionAgent(BaseReActAgent):
             return "\n".join(
                 [
                     "当前阶段：`navigation_tree`。",
-                    "请基于已注入 discovery facts，必要时再探索代码，直接产出完整导航树。",
-                    "你需要同时完成项目概括、areas 划分、modules 划分，以及 area/module 的导航摘要。",
+                    "请基于已注入的 `files_tree`，仅在必要时做少量高价值探索，直接产出完整导航树。",
+                    "目标是给出稳定的 areas / modules 边界，并让全部候选文件最终可被收敛挂载。",
+                    "优先按目录建立 `directory` 模块；只有平铺结构中的少量职责中心文件才用 `file_centered`。",
+                    "需要注意观察明显扁平的目录结构：这通常暗示同级文件可能以非目录形式各自承担模块化职责，必要时可批量快速读取这些文件的局部内容来判断。",
+                    "若某个 area 内还存在无法稳定细分的剩余文件，请保留一个 `residual` 模块承接，不要把结构化内容直接塞进 fallback。",
+                    "显式规则优先表达边界，不要为了追求全覆盖而逐文件穷举。",
+                    "本阶段是轻量建模，不要展开大范围项目调研；优先基于现有树结构直接完成划分。",
                     "先调用 `deliver_stage_result(stage='navigation_tree', payload=...)`，再调用 `deliver(answer='stage done')`。",
                 ]
             )
+        if stage == "navigation_repair":
+            current_tree = self._stage_context.get("current_navigation_tree")
+            missing_paths_tree = self._stage_context.get("missing_paths_tree")
+            validation_feedback = self._stage_context.get("validation_feedback")
+            lines = [
+                "当前阶段：`navigation_repair`。",
+                "请基于现有 `navigation_tree` 做最小修正，补齐遗漏文件，并消除重复/非法挂载。",
+                "优先复用已有 area/module；只在明显需要时新增少量 module。",
+                "优先修边界：目录模块过宽/过窄、residual 过大、单文件模块过碎，而不是重做全局分类。",
+                "若某个平铺目录下的多个同级文件是否应独立成模块仍不清楚，可批量快速读取这些文件的局部内容辅助判断。",
+                "修正时优先调整 `include` / `exclude` 规则，避免长串单文件枚举。",
+                "本阶段只做局部修复，不要重新调查整个项目。",
+                "修正后请重新提交完整 `navigation_tree`。",
+                "",
+                "## current_navigation_tree",
+                json.dumps(current_tree, ensure_ascii=False, indent=2),
+                "",
+                "## missing_paths_tree",
+                json.dumps(missing_paths_tree, ensure_ascii=False, indent=2),
+                "",
+                "## validation_feedback",
+                json.dumps(validation_feedback, ensure_ascii=False, indent=2),
+                "",
+                "先调用 `deliver_stage_result(stage='navigation_repair', payload=...)`，再调用 `deliver(answer='stage done')`。",
+            ]
+            return "\n".join(lines)
         if stage == "write_area_modules":
             area_slug = str(self._stage_context.get("area_slug") or "").strip()
             area_name = str(self._stage_context.get("area_display_name") or "").strip()
@@ -237,13 +281,7 @@ class TopologyCognitionAgent(BaseReActAgent):
             modules = raw_modules if isinstance(raw_modules, list) else []
             if not area_slug or not area_name or not modules:
                 raise ValueError("write_area_modules 阶段缺少 area 上下文")
-            modules_text = fit_text_to_budget(
-                self._model,
-                json.dumps(modules, ensure_ascii=False, indent=2),
-                token_budget=5000,
-                notice="\n... [当前 area 的 modules 清单已截断，请优先围绕已给 facts 与代码证据推进] ...\n",
-                min_chars=1200,
-            )
+            modules_text = json.dumps(modules, ensure_ascii=False, indent=2)
             lines = [
                 "当前阶段：`write_area_modules`。",
                 f"当前 area: `{area_slug}` / {area_name}",
@@ -273,7 +311,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         filtered = []
         allowed_names = _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE.get(self._active_stage or "", frozenset())
         allow_exploration = not (
-            self._active_stage in {"pceignore", "pceignore_refresh"}
+            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"}
             and self._stage_tool_budget_used >= self._stage_tool_budget_total > 0
         )
         for schema in serena_client.tools_schema:
@@ -297,6 +335,15 @@ class TopologyCognitionAgent(BaseReActAgent):
         self, state: LoopState, finish_reason: str
     ) -> dict[str, Any]:
         current_stage = self._active_stage or "unknown"
+        if current_stage in {"navigation_tree", "navigation_repair", "pceignore", "pceignore_refresh"}:
+            return {
+                "role": "user",
+                "content": (
+                    f"你刚才没有调用工具。当前阶段是 `{current_stage}`。"
+                    "如果现有 facts 已足够，请直接调用 `deliver_stage_result(...)` 提交结果，再调用 deliver。"
+                    "只有在证据明显不足时才调用少量工具。"
+                ),
+            }
         return {
             "role": "user",
             "content": (
@@ -307,7 +354,7 @@ class TopologyCognitionAgent(BaseReActAgent):
 
     async def on_before_round(self, state: LoopState) -> None:
         if (
-            self._active_stage in {"pceignore", "pceignore_refresh"}
+            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"}
             and self._stage_tool_budget_total > 0
             and self._stage_tool_budget_used >= self._stage_tool_budget_total
             and not self._stage_budget_exhausted_notified
@@ -316,14 +363,14 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "role": "user",
                 "content": (
                     "工具预算已耗尽，禁止继续探索。"
-                    "请基于当前已掌握的目录结构与证据，输出最保守可用的结果。"
-                    "不要误伤可能属于源码、配置、脚本、测试、关键文档的路径。"
+                    "请基于当前已掌握的结构与证据直接收口输出。"
+                    "不要继续发散调查。"
                 ),
             })
             self._stage_budget_exhausted_notified = True
 
     def _stage_budget_note(self) -> str:
-        if self._active_stage not in {"pceignore", "pceignore_refresh"} or self._stage_tool_budget_total <= 0:
+        if self._active_stage not in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"} or self._stage_tool_budget_total <= 0:
             return ""
         remaining = max(0, self._stage_tool_budget_total - self._stage_tool_budget_used)
         return (
@@ -400,6 +447,54 @@ class TopologyCognitionAgent(BaseReActAgent):
             lines.append(f"[truncated: omitted {omitted} lines]")
         return "\n".join(lines)
 
+    def _render_batch_file_slice(
+        self,
+        paths: list[str],
+        *,
+        start_line: int,
+        max_lines: int,
+    ) -> str:
+        normalized_paths = []
+        seen: set[str] = set()
+        for raw in paths[:_BATCH_READ_MAX_FILES]:
+            path = str(raw or "").strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            normalized_paths.append(path)
+
+        outputs: list[str] = []
+        safe_start = max(1, start_line)
+        safe_max_lines = max(1, min(_BATCH_READ_MAX_LINES, max_lines))
+
+        for rel_path in normalized_paths:
+            abs_path = (self._project_root / rel_path).resolve()
+            try:
+                abs_path.relative_to(self._project_root)
+            except Exception:
+                outputs.append(f"## {rel_path}\n[error] 路径越界")
+                continue
+            if not abs_path.exists() or not abs_path.is_file():
+                outputs.append(f"## {rel_path}\n[error] 文件不存在")
+                continue
+            try:
+                lines = abs_path.read_text(encoding="utf-8").splitlines()
+            except Exception as exc:
+                outputs.append(f"## {rel_path}\n[error] 读取失败: {exc}")
+                continue
+
+            start_idx = min(len(lines), safe_start - 1)
+            end_idx = min(len(lines), start_idx + safe_max_lines)
+            snippet = lines[start_idx:end_idx]
+            outputs.append(
+                "\n".join(
+                    [f"## {rel_path}", f"[lines {start_idx + 1}-{end_idx}]"]
+                    + [f"{idx + 1}: {line}" for idx, line in enumerate(snippet, start=start_idx)]
+                )
+            )
+
+        return "\n\n".join(outputs) if outputs else "[empty]"
+
     async def on_deliver(
         self, args: dict[str, Any] | None, state: LoopState
     ) -> DeliverDecision:
@@ -439,6 +534,23 @@ class TopologyCognitionAgent(BaseReActAgent):
             max_lines = max(20, min(240, int(args.get("max_lines") or 120)))
             self._stage_tool_budget_used += 1
             return _ok(self._render_tree_snapshot(root, max_depth=max_depth, max_lines=max_lines) + self._stage_budget_note())
+
+        if name == "batch_read_file_slice":
+            if self._active_stage not in {"navigation_tree", "navigation_repair"}:
+                return _err("batch_read_file_slice 只能在 navigation_tree / navigation_repair 阶段使用")
+            raw_paths = args.get("paths")
+            if not isinstance(raw_paths, list):
+                return _err("paths 必须是字符串数组")
+            start_line = int(args.get("start_line") or 1)
+            max_lines = int(args.get("max_lines") or 30)
+            self._stage_tool_budget_used += 1
+            return _ok(
+                self._render_batch_file_slice(
+                    [str(item) for item in raw_paths],
+                    start_line=start_line,
+                    max_lines=max_lines,
+                ) + self._stage_budget_note()
+            )
 
         if name == "deliver_stage_result":
             stage = str(args.get("stage") or "").strip()
@@ -501,6 +613,28 @@ class TopologyCognitionAgent(BaseReActAgent):
                             "max_lines": {"type": "integer"},
                         },
                         "required": ["root"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
+        if self._active_stage in {"navigation_tree", "navigation_repair"}:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "batch_read_file_slice",
+                    "description": "批量读取多个文件从指定起始行开始的连续片段；用于扁平目录下快速比较同级文件职责。单次最多 10 个文件、每个文件最多 50 行。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": _BATCH_READ_MAX_FILES,
+                            },
+                            "start_line": {"type": "integer"},
+                            "max_lines": {"type": "integer"},
+                        },
+                        "required": ["paths"],
                         "additionalProperties": False,
                     },
                 },
@@ -621,7 +755,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         tool_name = _get_tool_name(tool_call) or "unknown"
         result = await super()._invoke_serena(tool_call, serena_client, state=state)
         if (
-            self._active_stage in {"pceignore", "pceignore_refresh"}
+            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"}
             and tool_name in _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE[self._active_stage]
             and self._stage_tool_budget_total > 0
         ):

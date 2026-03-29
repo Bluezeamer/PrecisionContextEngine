@@ -42,10 +42,22 @@ class DigestDeltaBuilder:
         changed_files: list[str],
         deleted_files: list[str] | None = None,
     ) -> list[ModuleDigestDelta]:
+        deltas, _ = await self.build_for_insights(
+            changed_files=changed_files,
+            deleted_files=deleted_files,
+        )
+        return deltas
+
+    async def build_for_insights(
+        self,
+        *,
+        changed_files: list[str],
+        deleted_files: list[str] | None = None,
+    ) -> tuple[list[ModuleDigestDelta], list[InsightFact]]:
         deleted = set(deleted_files or [])
         snapshot = await load_index(root_path=self.project_root)
         if snapshot is None:
-            return []
+            return [], []
 
         registry, current_file_to_record, historical_file_to_record = (
             await self.registry.build_file_owner_maps()
@@ -60,28 +72,26 @@ class DigestDeltaBuilder:
             )
 
         affected_module_ids: list[str] = []
-        for path in [*changed_files, *deleted]:
-            record = _resolve_owner(path)
-            if record is not None and record.module_id not in affected_module_ids:
-                affected_module_ids.append(record.module_id)
-
-        insight_records = await self.insight_cache.get_all_records(include_stale=True)
+        unresolved_insights: list[InsightFact] = []
+        insight_records = await self.insight_cache.get_all_records(include_stale=False)
         module_to_insights: dict[str, list[InsightFact]] = {}
         for record in insight_records:
             owner = _resolve_owner(record.scope)
-            if owner is None:
-                continue
             content = await self.insight_cache.get_entry_content(record.id)
             if not content:
                 continue
+            insight_fact = InsightFact(
+                id=record.id,
+                scope=record.scope,
+                content=content,
+                confidence=record.confidence,
+                created_at=record.created_at,
+            )
+            if owner is None:
+                unresolved_insights.append(insight_fact)
+                continue
             module_to_insights.setdefault(owner.module_id, []).append(
-                InsightFact(
-                    id=record.id,
-                    scope=record.scope,
-                    content=content,
-                    confidence=record.confidence,
-                    created_at=record.created_at,
-                )
+                insight_fact
             )
             if owner.module_id not in affected_module_ids:
                 affected_module_ids.append(owner.module_id)
@@ -122,7 +132,7 @@ class DigestDeltaBuilder:
                     external_context=[],
                 )
             )
-        return results
+        return results, unresolved_insights
 
     @staticmethod
     def _classify_change_scope(
