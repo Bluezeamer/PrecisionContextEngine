@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pce.digest_agent as digest_agent
 from pce.digest_cognition_agent import (
     DigestCleanupStageAgent,
     DigestFilterStageAgent,
@@ -18,6 +19,7 @@ from pce.digest_cognition_agent import (
     SharedToolBudget,
     build_stale_check_facts_text,
 )
+from pce.insight_cache import InsightCache
 from pce.memory import save_file_baseline, save_index
 from pce.models import (
     BuildStats,
@@ -29,6 +31,7 @@ from pce.models import (
     NavigationTree,
     ProjectMeta,
 )
+from pce.staging import DirtyState
 
 
 def _insight(idx: int, *, scope: str, content: str) -> InsightFact:
@@ -255,10 +258,53 @@ async def _test_stageC_rewrite_and_reset_tools() -> None:
         assert "- src/alpha.py" in reset_md
 
 
+async def _test_digest_gate_and_run_digest_support_cleanup_only() -> None:
+    with TemporaryDirectory(prefix="pce-digest-cleanup-only-") as tmpdir:
+        root = Path(tmpdir)
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "alpha.py").write_text("print('x')\n", "utf-8")
+        insight_cache = InsightCache(root)
+        dirty = DirtyState(changed=["src/alpha.py"], deleted=[])
+
+        should_run, reason = await digest_agent.should_run_digest(
+            project_root=root,
+            insight_cache=insight_cache,
+            dirty_state=dirty,
+        )
+        assert should_run is True
+        assert reason == "dirty_files_require_cleanup"
+
+        original_cleanup = digest_agent.run_digest_cleanup
+
+        class _CleanupResult:
+            def __init__(self, summary: str) -> None:
+                self.summary = summary
+
+        async def _fake_cleanup(**kwargs):
+            return _CleanupResult("cleanup only path ok")
+
+        digest_agent.run_digest_cleanup = _fake_cleanup
+        try:
+            result = await digest_agent.run_digest(
+                project_root=root,
+                serena_client=object(),
+                insight_cache=insight_cache,
+                dirty_state=dirty,
+                skip_initial_sweep=True,
+            )
+        finally:
+            digest_agent.run_digest_cleanup = original_cleanup
+
+        assert result["executed"] is True
+        assert result["resolved_tasks"] == 1
+        assert "cleanup only path ok" in result["summary"]
+
+
 def main() -> None:
     asyncio.run(_test_shared_budget_between_stage1_and_stage2())
     asyncio.run(_test_stage2_rejects_non_dirty_paths())
     asyncio.run(_test_stageC_rewrite_and_reset_tools())
+    asyncio.run(_test_digest_gate_and_run_digest_support_cleanup_only())
     print("digest stage2/stageC tests passed")
 
 

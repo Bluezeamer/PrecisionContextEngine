@@ -86,6 +86,9 @@ async def run_digest(
     skip_initial_sweep: bool = False,
 ) -> dict[str, Any]:
     digest_start = time.monotonic()
+    visible_changed = filter_visible_paths(project_root, dirty_state.changed)
+    visible_deleted = filter_visible_paths(project_root, dirty_state.deleted)
+    dirty_files = list(dict.fromkeys([*visible_changed, *visible_deleted]))
     if not skip_initial_sweep:
         sweep_start = time.monotonic()
         try:
@@ -102,34 +105,45 @@ async def run_digest(
         time.monotonic() - load_start,
         len(insights),
     )
-    if not insights:
-        cleanup_start = time.monotonic()
-        try:
-            removed = await insight_cache.cleanup_stale()
-            if removed:
-                logger.info("Digest cleanup_stale: 删除 %d 条", removed)
-        except Exception as exc:
-            logger.warning("Digest cleanup_stale 失败（已忽略）: %s", exc)
-        finally:
-            logger.info("Digest 阶段耗时: cleanup_stale=%.2fs", time.monotonic() - cleanup_start)
-        logger.info("Digest 总耗时: %.2fs", time.monotonic() - digest_start)
-        return {
-            "executed": False,
-            "summary": "",
-            "resolved_tasks": 0,
-            "pending_tasks": 0,
-            "deleted_insights": 0,
-            "warnings": [],
-        }
-
-    visible_changed = filter_visible_paths(project_root, dirty_state.changed)
-    visible_deleted = filter_visible_paths(project_root, dirty_state.deleted)
-    dirty_files = list(dict.fromkeys([*visible_changed, *visible_deleted]))
     patch_builder = DigestDeltaBuilder(project_root)
     patch_facts = await patch_builder.build_patch_facts(
         changed_files=visible_changed,
         deleted_files=visible_deleted,
     )
+    if not insights:
+        cleanup_start = time.monotonic()
+        summaries: list[str] = []
+        warnings: list[str] = []
+        try:
+            if dirty_files:
+                logger.info("Digest stageC start (insight=0): dirty_files=%d", len(dirty_files))
+                cleanup_result = await run_digest_cleanup(
+                    project_root=project_root,
+                    dirty_files=dirty_files,
+                    patch_facts=patch_facts,
+                    model=model,
+                    provider=provider,
+                    serena_client=serena_client,
+                )
+                if cleanup_result.summary:
+                    summaries.append(f"[cleanup] {cleanup_result.summary}".strip())
+            removed = await insight_cache.cleanup_stale()
+            if removed:
+                logger.info("Digest cleanup_stale: 删除 %d 条", removed)
+        except Exception as exc:
+            warnings.append(f"Digest cleanup/stale 失败: {exc}")
+            logger.warning("Digest cleanup_stale 失败（已忽略）: %s", exc)
+        finally:
+            logger.info("Digest 阶段耗时: cleanup_stale=%.2fs", time.monotonic() - cleanup_start)
+        logger.info("Digest 总耗时: %.2fs", time.monotonic() - digest_start)
+        return {
+            "executed": bool(dirty_files),
+            "summary": "\n\n".join(item for item in summaries if item).strip(),
+            "resolved_tasks": 1 if dirty_files else 0,
+            "pending_tasks": 0,
+            "deleted_insights": 0,
+            "warnings": warnings,
+        }
 
     filter_start = time.monotonic()
     summaries: list[str] = []
@@ -269,7 +283,6 @@ async def should_run_digest(
     insight_cache: InsightCache,
     dirty_state: DirtyState,
 ) -> tuple[bool, str]:
-    del project_root, dirty_state
     sweep_start = time.monotonic()
     try:
         await insight_cache.sweep_stale()
@@ -278,4 +291,10 @@ async def should_run_digest(
     finally:
         logger.info("Digest gate 阶段耗时: sweep_stale=%.2fs", time.monotonic() - sweep_start)
     records = await insight_cache.get_all_records(include_stale=False)
-    return (True, "actionable_fresh_insights") if records else (False, "no_actionable_insights")
+    if records:
+        return True, "actionable_fresh_insights"
+    visible_changed = filter_visible_paths(project_root, dirty_state.changed)
+    visible_deleted = filter_visible_paths(project_root, dirty_state.deleted)
+    if visible_changed or visible_deleted:
+        return True, "dirty_files_require_cleanup"
+    return False, "no_actionable_insights_or_dirty_files"
