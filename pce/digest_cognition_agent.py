@@ -738,6 +738,51 @@ def _render_markdown_sections(header_lines: list[str], sections: dict[str, list[
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _split_markdown_title_block(raw: str) -> tuple[str, list[str], dict[str, list[str]], list[str]]:
+    lines = raw.splitlines()
+    title = ""
+    body_before_sections: list[str] = []
+    section_lines: list[str] = []
+    seen_sections = False
+
+    for line in lines:
+        if not title and line.startswith("# "):
+            title = line.rstrip()
+            continue
+        if line.startswith("## "):
+            seen_sections = True
+        if seen_sections:
+            section_lines.append(line)
+        else:
+            body_before_sections.append(line.rstrip())
+
+    _, sections, order = _split_markdown_sections("\n".join(section_lines))
+    return title or "#", body_before_sections, sections, order
+
+
+def _render_markdown_title_block(
+    title: str,
+    title_body: list[str],
+    sections: dict[str, list[str]],
+    order: list[str],
+) -> str:
+    lines = [title.rstrip()]
+    cleaned_title_body = [line.rstrip() for line in title_body]
+    while cleaned_title_body and not cleaned_title_body[0].strip():
+        cleaned_title_body.pop(0)
+    while cleaned_title_body and not cleaned_title_body[-1].strip():
+        cleaned_title_body.pop()
+    if cleaned_title_body:
+        lines.extend(["", *cleaned_title_body])
+    for heading in order:
+        body = sections.get(heading)
+        if body is None:
+            continue
+        lines.extend(["", f"## {heading}"])
+        lines.extend(body)
+    return "\n".join(lines).rstrip() + "\n"
+
+
 async def _build_annotation_skeleton(project_root: Path, path: str) -> str:
     from .annotation_writer import (
         _annotation_index_path,
@@ -1273,19 +1318,22 @@ class DigestCleanupStageAgent(_DigestStageAgent):
             existing = await _read_text_if_exists(self._project_root / _normalize_rel_path(path))
             if not existing:
                 return err_builder("annotation 不存在")
-            header_lines, sections, order = _split_markdown_sections(existing)
+            title, title_body, sections, order = _split_markdown_title_block(existing)
             for heading, content in section_map.items():
-                if heading not in sections:
-                    continue
                 body = [line.rstrip() for line in content.splitlines()]
                 while body and not body[0].strip():
                     body.pop(0)
                 while body and not body[-1].strip():
                     body.pop()
+                if heading == "#":
+                    title_body = body
+                    continue
+                if heading not in sections:
+                    return err_builder(f"section 不存在: {heading}")
                 sections[heading] = body
             await _write_text_atomic(
                 self._project_root / _normalize_rel_path(path),
-                _render_markdown_sections(header_lines, sections, order),
+                _render_markdown_title_block(title, title_body, sections, order),
             )
             self._consume_budget()
             return ok_builder(f"sections 已重写: {path}" + self._budget_note())

@@ -248,6 +248,28 @@ async def _test_stageC_rewrite_and_reset_tools() -> None:
 
         content = await _call_virtual(
             agent,
+            "rewrite_sections",
+            {
+                "path": ".pce/annotations/modules/alpha.md",
+                "sections": [{"heading": "#", "content": "新的模块概览"}],
+            },
+        )
+        assert "sections 已重写" in content
+        rewritten = module_path.read_text("utf-8")
+        assert "新的模块概览" in rewritten
+
+        content = await _call_virtual(
+            agent,
+            "rewrite_sections",
+            {
+                "path": ".pce/annotations/modules/alpha.md",
+                "sections": [{"heading": "不存在的标题", "content": "x"}],
+            },
+        )
+        assert "section 不存在" in content
+
+        content = await _call_virtual(
+            agent,
             "reset_annotation_to_skeleton",
             {"path": ".pce/annotations/modules/alpha.md"},
         )
