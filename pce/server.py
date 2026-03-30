@@ -484,8 +484,8 @@ class PCEContext:
             except Exception:
                 logger.exception("Serena 会话关闭异常")
 
-    async def _run_index_refresh(self, serena_client: SerenaClient) -> DirtyState:
-        """执行索引刷新逻辑（全量或增量），返回本次刷新前的 DirtyState 供 Digest 消费。
+    async def _run_index_refresh(self, serena_client: SerenaClient) -> dict[str, Any]:
+        """执行索引刷新逻辑，返回统一的刷新结果。
 
         调用方负责加锁（_sync_lock）与状态位更新。
         1. 索引不存在 → 全量构建 + 清空暂存区
@@ -498,7 +498,7 @@ class PCEContext:
             logger.info("PCE 索引不存在，开始全量构建...")
             all_paths = dirty.changed + dirty.deleted
             hash_snapshot = await self.staging.snapshot_hashes(all_paths) if all_paths else None
-            await build_index(
+            snapshot = await build_index(
                 project_path=self.project_path,
                 serena_client=serena_client,
                 memory_root=self.project_path,
@@ -509,7 +509,12 @@ class PCEContext:
                     expected_hashes=hash_snapshot,
                 )
             logger.info("PCE 索引全量构建完成")
-            return dirty
+            return {
+                "dirty_state": dirty,
+                "snapshot": snapshot,
+                "refresh_mode": "full_rebuild",
+                "message": "Serena 已重连，PCE 索引全量重建完成",
+            }
 
         if not dirty.empty:
             all_paths = dirty.changed + dirty.deleted
@@ -518,7 +523,7 @@ class PCEContext:
                 f"检测到 {len(dirty.changed)} 个变更、"
                 f"{len(dirty.deleted)} 个删除，执行增量索引更新"
             )
-            await build_index_incremental(
+            snapshot = await build_index_incremental(
                 project_path=self.project_path,
                 serena_client=serena_client,
                 memory_root=self.project_path,
@@ -527,8 +532,20 @@ class PCEContext:
             )
             await self.staging.acknowledge_after_reindex(all_paths, expected_hashes=hash_snapshot)
             logger.info("增量索引更新完成")
+            return {
+                "dirty_state": dirty,
+                "snapshot": snapshot,
+                "refresh_mode": "incremental",
+                "message": "Serena 已重连，PCE 索引增量更新完成",
+            }
 
-        return dirty
+        snapshot = await load_index(root_path=self.project_path)
+        return {
+            "dirty_state": dirty,
+            "snapshot": snapshot,
+            "refresh_mode": "noop",
+            "message": "暂存区无变更，索引已是最新",
+        }
 
     async def _backfill_dirty_if_needed(self) -> DirtyState:
         """当 watcher 离线导致暂存区为空时，基于 baseline/索引做轻量补录。"""
@@ -672,24 +689,8 @@ class PCEContext:
                             time.monotonic() - activate_start,
                         )
 
-                    index_refresh_start = time.monotonic()
-                    digest_dirty = await self._run_index_refresh(serena_client)
-                    logger.info(
-                        "Bootstrap 阶段耗时: index_refresh=%.2fs (changed=%d deleted=%d)",
-                        time.monotonic() - index_refresh_start,
-                        len(digest_dirty.changed),
-                        len(digest_dirty.deleted),
-                    )
-
-                    baseline_seed_start = time.monotonic()
-                    await seed_initial_file_baselines_if_missing(project_root=project_path)
-                    logger.info(
-                        "Bootstrap 阶段耗时: seed_initial_baselines=%.2fs",
-                        time.monotonic() - baseline_seed_start,
-                    )
-                    await self._run_post_index_cognition_pipeline(
+                    await self._run_post_index_pipeline(
                         serena_client=serena_client,
-                        dirty_state=digest_dirty,
                         warnings=warnings,
                         phase_label="Bootstrap",
                     )
@@ -1025,6 +1026,48 @@ class PCEContext:
                 time.monotonic() - digest_start,
             )
 
+    async def _run_post_index_pipeline(
+        self,
+        *,
+        serena_client: SerenaClient,
+        warnings: list[str] | None,
+        phase_label: str,
+    ) -> dict[str, Any]:
+        """统一的 index 后处理编排入口。
+
+        顺序固定为：
+        1. index refresh（内部已覆盖 navigation 增量更新/重建）
+        2. seed baselines
+        3. digest gate + digest
+        """
+        index_refresh_start = time.monotonic()
+        refresh_result = await self._run_index_refresh(serena_client)
+        dirty_state: DirtyState = refresh_result["dirty_state"]
+        logger.info(
+            "%s 阶段耗时: index_refresh=%.2fs (changed=%d deleted=%d mode=%s)",
+            phase_label,
+            time.monotonic() - index_refresh_start,
+            len(dirty_state.changed),
+            len(dirty_state.deleted),
+            refresh_result["refresh_mode"],
+        )
+
+        baseline_seed_start = time.monotonic()
+        await seed_initial_file_baselines_if_missing(project_root=self.project_path)
+        logger.info(
+            "%s 阶段耗时: seed_initial_baselines=%.2fs",
+            phase_label,
+            time.monotonic() - baseline_seed_start,
+        )
+
+        await self._run_post_index_cognition_pipeline(
+            serena_client=serena_client,
+            dirty_state=dirty_state,
+            warnings=warnings,
+            phase_label=phase_label,
+        )
+        return refresh_result
+
     async def handle_sync(self) -> dict[str, Any]:
         """触发 Serena 断开重连并按需更新 PCE 索引。
 
@@ -1036,72 +1079,17 @@ class PCEContext:
         assert self.staging is not None
         assert self.insight_cache is not None
 
-        digest_warnings: list[str] = []
-
         async with self._sync_lock:
-            dirty = await self._backfill_dirty_if_needed()
-            snapshot = await load_index(root_path=self.project_path) if dirty.empty else None
-            if dirty.empty and snapshot is not None:
-                should_digest, digest_reason = await should_run_digest(
-                    project_root=self.project_path,
-                    insight_cache=self.insight_cache,
-                    dirty_state=dirty,
-                )
-                if not should_digest:
-                    logger.info("pce_sync: 无 dirty 且无需 digest，快速返回: %s", digest_reason)
-                    return {
-                        "success": True,
-                        "message": "暂存区无变更，索引已是最新",
-                        "stats": snapshot.build_stats.model_dump(mode="json"),
-                        "warnings": [],
-                    }
+            digest_warnings: list[str] = []
 
             async with self.serena_session() as serena_client:
-                if dirty.empty:
-                    if snapshot is None:
-                        logger.info("pce_sync: 暂存区无变更但索引缺失，执行全量重建")
-                        snapshot = await build_index(
-                            project_path=self.project_path,
-                            serena_client=serena_client,
-                            memory_root=self.project_path,
-                        )
-                        message = "Serena 已重连，PCE 索引全量重建完成"
-                    else:
-                        logger.info("pce_sync: 暂存区无变更，跳过索引重建，继续统一后处理")
-                        message = "暂存区无变更，索引已是最新"
-                else:
-                    all_paths = dirty.changed + dirty.deleted
-                    # 索引前快照 hash，防止索引期间新变更被提前确认
-                    hash_snapshot = await self.staging.snapshot_hashes(all_paths)
-                    logger.info(
-                        f"pce_sync: 增量更新 {len(dirty.changed)} 变更, "
-                        f"{len(dirty.deleted)} 删除"
-                    )
-                    snapshot = await build_index_incremental(
-                        project_path=self.project_path,
-                        serena_client=serena_client,
-                        memory_root=self.project_path,
-                        changed_files=dirty.changed,
-                        deleted_files=dirty.deleted,
-                    )
-                    await self.staging.acknowledge_after_reindex(
-                        all_paths,
-                        expected_hashes=hash_snapshot,
-                    )
-                    message = "Serena 已重连，PCE 索引增量更新完成"
-
-                seed_start = time.monotonic()
-                await seed_initial_file_baselines_if_missing(project_root=self.project_path)
-                logger.info(
-                    "pce_sync 阶段耗时: seed_initial_baselines=%.2fs",
-                    time.monotonic() - seed_start,
-                )
-                await self._run_post_index_cognition_pipeline(
+                refresh_result = await self._run_post_index_pipeline(
                     serena_client=serena_client,
-                    dirty_state=dirty,
                     warnings=digest_warnings,
                     phase_label="pce_sync",
                 )
+                snapshot = refresh_result["snapshot"]
+                message = refresh_result["message"]
 
             self._init_state = "initialized"
             logger.info(
