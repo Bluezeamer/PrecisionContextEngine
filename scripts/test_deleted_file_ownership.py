@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pce.digest_delta_builder import DigestDeltaBuilder
-from pce.insight_cache import InsightCache
 from pce.memory import save_file_baseline, save_index
 from pce.models import BuildStats, FileMeta, IndexEntry, IndexSnapshot, ProjectMeta
 from pce.module_registry import ModuleRegistryManager
@@ -102,23 +101,18 @@ async def _main() -> None:
             root_path=root,
         )
 
-        builder = DigestDeltaBuilder(root, InsightCache(root))
-        deltas = await builder.build_for_changes(
+        builder = DigestDeltaBuilder(root)
+        patch_facts = await builder.build_patch_facts(
             changed_files=[],
             deleted_files=["legacy/old.py", "legacy_pkg/models.py"],
         )
 
-        delta_map = {delta.module_slug: delta for delta in deltas}
-        assert second.slug in delta_map
-        assert len(delta_map[second.slug].changed_files) == 1
-        assert str(delta_map[second.slug].changed_files[0].path) == "legacy/old.py"
-        assert delta_map[second.slug].changed_files[0].status == "deleted"
-        assert delta_map[second.slug].changed_files[0].old_content == "def old():\n    return 0\n"
-
-        modern_delta = next(
-            delta for delta in deltas if any(str(f.path) == "legacy_pkg/models.py" for f in delta.changed_files)
-        )
-        assert modern_delta.module_slug == modern.slug
+        fact_map = {str(fact.path): fact for fact in patch_facts}
+        assert len(fact_map) == 2
+        assert fact_map["legacy/old.py"].status == "deleted"
+        assert fact_map["legacy/old.py"].old_content == "def old():\n    return 0\n"
+        assert fact_map["legacy_pkg/models.py"].status == "deleted"
+        assert fact_map["legacy_pkg/models.py"].old_content == "class OldModel:\n    pass\n"
 
     print(
         json.dumps(
@@ -126,9 +120,8 @@ async def _main() -> None:
                 "ok": True,
                 "tests": [
                     "module_registry 保留历史文件归属",
-                    "删除文件可通过历史归属命中原模块",
-                    "deleted file 能进入 digest delta 并携带旧 baseline",
-                    "历史归属缺失时，deleted path 可通过轻量路径相似性回挂模块",
+                    "deleted file 能进入 digest patch facts 并携带旧 baseline",
+                    "digest patch facts 不再依赖模块级路由或历史归属推断",
                 ],
             },
             ensure_ascii=False,

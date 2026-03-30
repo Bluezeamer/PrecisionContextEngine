@@ -11,7 +11,7 @@ from .digest_cognition_agent import run_digest_assimilation, run_digest_filter
 from .digest_delta_builder import DigestDeltaBuilder
 from .file_discovery import filter_visible_paths
 from .insight_cache import InsightCache
-from .models import ChangedFileFact, InsightFact
+from .models import InsightFact
 from .serena_client import SerenaClient
 from .staging import DirtyState
 
@@ -48,19 +48,6 @@ def _chunk_insights(insights: list[InsightFact], *, max_chars: int = _STAGE_A_MA
     if current:
         batches.append(InsightBatch(insights=list(current)))
     return batches
-
-
-def _dedupe_changed_file_facts(deltas: list[Any]) -> list[ChangedFileFact]:
-    deduped: list[ChangedFileFact] = []
-    seen: set[str] = set()
-    for delta in deltas:
-        for file_fact in delta.changed_files:
-            rel = str(file_fact.path)
-            if rel in seen:
-                continue
-            seen.add(rel)
-            deduped.append(file_fact)
-    return deduped
 
 
 async def _load_active_insights(insight_cache: InsightCache) -> list[InsightFact]:
@@ -132,12 +119,11 @@ async def run_digest(
     visible_changed = filter_visible_paths(project_root, dirty_state.changed)
     visible_deleted = filter_visible_paths(project_root, dirty_state.deleted)
     dirty_files = list(dict.fromkeys([*visible_changed, *visible_deleted]))
-    patch_builder = DigestDeltaBuilder(project_root, insight_cache)
-    deltas, _ = await patch_builder.build_for_insights(
+    patch_builder = DigestDeltaBuilder(project_root)
+    patch_facts = await patch_builder.build_patch_facts(
         changed_files=visible_changed,
         deleted_files=visible_deleted,
     )
-    patch_facts = _dedupe_changed_file_facts(deltas)
 
     filter_start = time.monotonic()
     summaries: list[str] = []

@@ -1,9 +1,8 @@
-"""模块级 DigestDelta 构建器。"""
+"""Digest patch facts 构建器。"""
 
 from __future__ import annotations
 
 import ast
-import difflib
 import hashlib
 import logging
 import re
@@ -12,233 +11,40 @@ import tokenize
 from io import StringIO
 from pathlib import Path
 
-from .insight_cache import InsightCache
-from .memory import get_module_annotation, load_file_baseline, load_index
-from .models import (
-    ChangedFileFact,
-    InsightFact,
-    ModuleDigestDelta,
-    ModuleRecord,
-    ModuleRegistry,
-    PatchBlock,
-    SymbolFact,
-)
-from .module_registry import ModuleRegistryManager
+from .memory import load_file_baseline, load_index
+from .models import ChangedFileFact, PatchBlock, SymbolFact
 
 logger = logging.getLogger(__name__)
 
 
 class DigestDeltaBuilder:
-    """构建模块级认知修正事实包。"""
+    """为 digest stageB 构建最小可用的 patch facts。"""
 
-    def __init__(self, project_root: Path, insight_cache: InsightCache) -> None:
+    def __init__(self, project_root: Path) -> None:
         self.project_root = project_root.resolve()
-        self.insight_cache = insight_cache
-        self.registry = ModuleRegistryManager(self.project_root)
 
-    async def build_for_changes(
+    async def build_patch_facts(
         self,
         *,
         changed_files: list[str],
         deleted_files: list[str] | None = None,
-    ) -> list[ModuleDigestDelta]:
-        deltas, _ = await self.build_for_insights(
-            changed_files=changed_files,
-            deleted_files=deleted_files,
-        )
-        return deltas
-
-    async def build_for_insights(
-        self,
-        *,
-        changed_files: list[str],
-        deleted_files: list[str] | None = None,
-    ) -> tuple[list[ModuleDigestDelta], list[InsightFact]]:
+    ) -> list[ChangedFileFact]:
         deleted = set(deleted_files or [])
         snapshot = await load_index(root_path=self.project_root)
         if snapshot is None:
-            return [], []
+            return []
 
-        registry, current_file_to_record, historical_file_to_record = (
-            await self.registry.build_file_owner_maps()
-        )
         entries_map = {str(entry.file_meta.path): entry for entry in snapshot.entries}
-
-        def _resolve_owner(path: str) -> ModuleRecord | None:
-            return (
-                current_file_to_record.get(path)
-                or historical_file_to_record.get(path)
-                or self._guess_deleted_owner(path, registry)
+        patch_facts: list[ChangedFileFact] = []
+        for rel_path in [*changed_files, *deleted]:
+            file_fact = await self._build_changed_file_fact(
+                rel_path,
+                current_entry=entries_map.get(rel_path),
+                deleted=rel_path in deleted,
             )
-
-        affected_module_ids: list[str] = []
-        unresolved_insights: list[InsightFact] = []
-        insight_records = await self.insight_cache.get_all_records(include_stale=False)
-        module_to_insights: dict[str, list[InsightFact]] = {}
-        for record in insight_records:
-            owner = _resolve_owner(record.scope)
-            content = await self.insight_cache.get_entry_content(record.id)
-            if not content:
-                continue
-            insight_fact = InsightFact(
-                id=record.id,
-                scope=record.scope,
-                content=content,
-                confidence=record.confidence,
-                created_at=record.created_at,
-            )
-            if owner is None:
-                unresolved_insights.append(insight_fact)
-                continue
-            module_to_insights.setdefault(owner.module_id, []).append(
-                insight_fact
-            )
-            if owner.module_id not in affected_module_ids:
-                affected_module_ids.append(owner.module_id)
-
-        results: list[ModuleDigestDelta] = []
-        for module_id in affected_module_ids:
-            record = registry.records[module_id]
-            module_file_facts: list[ChangedFileFact] = []
-            for path in [*changed_files, *deleted]:
-                owner = _resolve_owner(path)
-                if owner is None or owner.module_id != module_id:
-                    continue
-                file_fact = await self._build_changed_file_fact(
-                    path,
-                    current_entry=entries_map.get(path),
-                    deleted=path in deleted,
-                )
-                if file_fact is not None:
-                    module_file_facts.append(file_fact)
-
-            related_insights = module_to_insights.get(module_id, [])
-            if not module_file_facts and not related_insights:
-                continue
-
-            results.append(
-                ModuleDigestDelta(
-                    module_id=record.module_id,
-                    module_slug=record.slug,
-                    module_name=record.display_name,
-                    annotation_baseline=await get_module_annotation(
-                        record.slug,
-                        root_path=self.project_root,
-                    )
-                    or "",
-                    related_insights=related_insights,
-                    changed_files=module_file_facts,
-                    change_scope_hint=self._classify_change_scope(module_file_facts),
-                    external_context=[],
-                )
-            )
-        return results, unresolved_insights
-
-    @staticmethod
-    def _classify_change_scope(
-        changed_files: list[ChangedFileFact],
-    ) -> str:
-        if not changed_files:
-            return "agent_decide"
-
-        if all(file_fact.status == "modified" for file_fact in changed_files):
-            return "module"
-
-        created = [file_fact for file_fact in changed_files if file_fact.status == "created"]
-        deleted = [file_fact for file_fact in changed_files if file_fact.status == "deleted"]
-        modified = [file_fact for file_fact in changed_files if file_fact.status == "modified"]
-
-        if created and deleted and not modified:
-            remaining_deleted = list(deleted)
-            matched = 0
-            for created_fact in created:
-                match_idx = next(
-                    (
-                        idx
-                        for idx, deleted_fact in enumerate(remaining_deleted)
-                        if created_fact.new_hash
-                        and deleted_fact.old_hash
-                        and created_fact.new_hash == deleted_fact.old_hash
-                    ),
-                    None,
-                )
-                if match_idx is None:
-                    continue
-                matched += 1
-                remaining_deleted.pop(match_idx)
-            if matched == len(created) and not remaining_deleted:
-                return "route"
-
-        return "agent_decide"
-
-    @staticmethod
-    def _guess_deleted_owner(path: str, registry: ModuleRegistry) -> ModuleRecord | None:
-        """为缺失历史映射的 deleted path 提供轻量兜底归属。
-
-        典型场景：
-        - 技术路线迁移，旧目录整体替换为新目录（如 foo -> foo_v2）
-        - 历史 registry 未完整覆盖，删除事件只能依赖路径相似性回挂模块
-        """
-        deleted_path = Path(path)
-        best_record: ModuleRecord | None = None
-        best_score = 0.0
-
-        for record in registry.records.values():
-            if record.status != "active":
-                continue
-            candidate_paths = {
-                *record.file_paths,
-                *record.historical_file_paths,
-            }
-            for candidate in candidate_paths:
-                score = DigestDeltaBuilder._score_deleted_path_similarity(
-                    deleted_path,
-                    Path(candidate),
-                )
-                if score > best_score:
-                    best_score = score
-                    best_record = record
-
-        return best_record if best_score >= 1.35 else None
-
-    @staticmethod
-    def _score_deleted_path_similarity(deleted_path: Path, candidate_path: Path) -> float:
-        deleted_str = deleted_path.as_posix()
-        candidate_str = candidate_path.as_posix()
-        score = difflib.SequenceMatcher(None, deleted_str, candidate_str).ratio()
-        deleted_stem = deleted_path.stem
-        candidate_stem = candidate_path.stem
-
-        if deleted_path.name == candidate_path.name:
-            score += 0.8
-        if deleted_stem == candidate_stem:
-            score += 0.4
-        score += difflib.SequenceMatcher(None, deleted_stem, candidate_stem).ratio() * 0.5
-        if deleted_stem.startswith(candidate_stem) or candidate_stem.startswith(deleted_stem):
-            score += 0.35
-
-        deleted_parts = set(deleted_path.parts)
-        candidate_parts = set(candidate_path.parts)
-        if deleted_parts and candidate_parts:
-            overlap = len(deleted_parts & candidate_parts)
-            union = len(deleted_parts | candidate_parts)
-            score += (overlap / union) * 0.5
-
-        deleted_group = DigestDeltaBuilder._normalize_dir_group(deleted_path.parent)
-        candidate_group = DigestDeltaBuilder._normalize_dir_group(candidate_path.parent)
-        if deleted_group and candidate_group and deleted_group == candidate_group:
-            score += 0.9
-
-        return score
-
-    @staticmethod
-    def _normalize_dir_group(path: Path) -> str:
-        raw = path.as_posix().strip("./")
-        if not raw:
-            return ""
-        raw = re.sub(r"[_-]?v\d+\b", "", raw)
-        raw = raw.replace("__", "_")
-        return raw
+            if file_fact is not None:
+                patch_facts.append(file_fact)
+        return patch_facts
 
     async def _build_changed_file_fact(
         self,
@@ -313,10 +119,6 @@ class DigestDeltaBuilder:
         old_symbols: list[SymbolFact],
         new_symbols: list[SymbolFact],
     ) -> bool:
-        """轻量判断变更是否值得进入 digest。
-
-        目标：在不引入昂贵语义分析的前提下，过滤掉纯空白/纯注释类低价值改动。
-        """
         if old_content == new_content:
             return False
         if not DigestDeltaBuilder._symbols_equal(old_symbols, new_symbols):
@@ -374,7 +176,6 @@ class DigestDeltaBuilder:
 
     @staticmethod
     def _strip_python_docstrings(content: str) -> str:
-        """剥离模块/类/函数 docstring，避免仅文档说明变更触发 digest。"""
         try:
             tree = ast.parse(content)
         except SyntaxError:

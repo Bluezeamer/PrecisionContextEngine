@@ -378,28 +378,6 @@ class FileBaseline(BaseSchema):
     captured_at: UTCDateTime = Field(..., description="基线采集时间（UTC）")
 
 
-class ModuleDigestDelta(BaseSchema):
-    """模块级认知修正事实包。"""
-
-    module_id: UUIDStr = Field(..., description="模块稳定 ID")
-    module_slug: NonEmptyStr = Field(..., description="模块稳定 slug")
-    module_name: NonEmptyStr = Field(..., description="模块展示名")
-    annotation_baseline: str = Field(default="", description="当前模块认知基线")
-    related_insights: list[InsightFact] = Field(
-        default_factory=list, description="与该模块相关的 insight"
-    )
-    changed_files: list[ChangedFileFact] = Field(
-        default_factory=list, description="该模块相关的文件差异事实"
-    )
-    change_scope_hint: Literal["route", "module", "agent_decide"] = Field(
-        default="agent_decide",
-        description="对该模块变更层级的轻量预判提示",
-    )
-    external_context: list[str] = Field(
-        default_factory=list, description="模块级外部上下文提示"
-    )
-
-
 class ModuleRecord(BaseSchema):
     """模块 Registry 中的单条记录。"""
 
