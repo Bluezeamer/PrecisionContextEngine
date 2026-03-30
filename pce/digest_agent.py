@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .digest_cognition_agent import (
+    run_digest_cleanup,
     SharedToolBudget,
     run_digest_assimilation,
     run_digest_filter,
@@ -231,6 +232,18 @@ async def run_digest(
 
     cleanup_start = time.monotonic()
     try:
+        if dirty_files:
+            logger.info("Digest stageC start: dirty_files=%d", len(dirty_files))
+            cleanup_result = await run_digest_cleanup(
+                project_root=project_root,
+                dirty_files=dirty_files,
+                patch_facts=patch_facts,
+                model=model,
+                provider=provider,
+                serena_client=serena_client,
+            )
+            if cleanup_result.summary:
+                summaries.append(f"[cleanup] {cleanup_result.summary}".strip())
         removed = await insight_cache.cleanup_stale()
         if removed:
             logger.info("Digest cleanup_stale: 删除 %d 条", removed)

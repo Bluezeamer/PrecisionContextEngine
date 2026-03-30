@@ -12,13 +12,23 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from pce.digest_cognition_agent import (
+    DigestCleanupStageAgent,
     DigestFilterStageAgent,
     DigestStaleCheckStageAgent,
     SharedToolBudget,
     build_stale_check_facts_text,
 )
-from pce.memory import save_file_baseline
-from pce.models import InsightConfidence, InsightFact
+from pce.memory import save_file_baseline, save_index
+from pce.models import (
+    BuildStats,
+    FileMeta,
+    IndexEntry,
+    IndexSnapshot,
+    InsightConfidence,
+    InsightFact,
+    NavigationTree,
+    ProjectMeta,
+)
 
 
 def _insight(idx: int, *, scope: str, content: str) -> InsightFact:
@@ -114,10 +124,142 @@ async def _test_stage2_rejects_non_dirty_paths() -> None:
         assert "没有可读取的 dirty file diff" in content
 
 
+async def _test_stageC_rewrite_and_reset_tools() -> None:
+    with TemporaryDirectory(prefix="pce-digest-stagec-") as tmpdir:
+        root = Path(tmpdir)
+        annotations = root / ".pce" / "annotations"
+        modules_dir = annotations / "modules"
+        areas_dir = annotations / "areas"
+        modules_dir.mkdir(parents=True, exist_ok=True)
+        areas_dir.mkdir(parents=True, exist_ok=True)
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "alpha.py").write_text("def run():\n    return 2\n", "utf-8")
+
+        module_path = modules_dir / "alpha.md"
+        module_path.write_text(
+            "# Alpha\n\n## 覆盖文件\n- src/alpha.py\n\n## 核心职责\n- 旧职责\n\n## 关键流程\n- 旧流程\n",
+            "utf-8",
+        )
+        (areas_dir / "runtime.md").write_text("# 运行时\n\n## 区域说明\n旧区域说明\n", "utf-8")
+        (annotations / "index.md").write_text("# 项目认知导航\n\n## 项目概览\n旧项目概览\n", "utf-8")
+
+        tree = NavigationTree.model_validate({
+            "generated_at": datetime.now(UTC).isoformat(),
+            "project_summary": "项目围绕运行时组织。",
+            "fallback_area_slug": "fallback",
+            "source_digest": "seed",
+            "areas": [
+                {
+                    "slug": "runtime",
+                    "display_name": "运行时",
+                    "summary": "运行时区域摘要",
+                    "modules": [
+                        {
+                            "slug": "alpha",
+                            "display_name": "Alpha",
+                            "summary": "Alpha 摘要",
+                            "module_type": "directory",
+                            "include": ["src/**"],
+                            "exclude": [],
+                        }
+                    ],
+                    "recommended_order": ["alpha"],
+                    "source_prefixes": ["src/"],
+                    "is_fallback": False,
+                },
+                {
+                    "slug": "fallback",
+                    "display_name": "未分类（Fallback）",
+                    "summary": "承接剩余内容",
+                    "modules": [],
+                    "recommended_order": [],
+                    "source_prefixes": [],
+                    "is_fallback": True,
+                },
+            ],
+        })
+        (annotations / "navigation_tree.json").write_text(
+            __import__("json").dumps(tree.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
+            "utf-8",
+        )
+        await save_index(
+            IndexSnapshot(
+                project_meta=ProjectMeta(
+                    root_path=root,
+                    created_at=datetime.now(UTC),
+                    index_version="test",
+                    file_count=1,
+                    loc_total=2,
+                ),
+                entries=[
+                    IndexEntry(
+                        file_meta=FileMeta(
+                            path=Path("src/alpha.py"),
+                            language="python",
+                            size_bytes=20,
+                            mtime=datetime.now(UTC),
+                            loc=2,
+                        ),
+                        symbols=[],
+                        imports=[],
+                        edges=[],
+                    )
+                ],
+                created_at=datetime.now(UTC),
+                build_stats=BuildStats(
+                    total_files=1,
+                    total_symbols=0,
+                    total_edges=0,
+                    duration_ms=1,
+                    warnings=[],
+                ),
+            ),
+            root_path=root,
+        )
+        await save_file_baseline(
+            "src/alpha.py",
+            content="def run():\n    return 1\n",
+            content_hash="baseline-hash",
+            symbols=[],
+            root_path=root,
+        )
+
+        agent = DigestCleanupStageAgent(
+            project_root=root,
+            dirty_files=["src/alpha.py"],
+            facts_text="cleanup facts",
+            facts_truncated=False,
+        )
+        content = await _call_virtual(
+            agent,
+            "rewrite_sections",
+            {
+                "path": ".pce/annotations/modules/alpha.md",
+                "sections": [{"heading": "核心职责", "content": ""}],
+            },
+        )
+        assert "sections 已重写" in content
+        rewritten = module_path.read_text("utf-8")
+        assert "## 核心职责" in rewritten
+        assert "- 旧职责" not in rewritten
+
+        content = await _call_virtual(
+            agent,
+            "reset_annotation_to_skeleton",
+            {"path": ".pce/annotations/modules/alpha.md"},
+        )
+        assert "已重置为骨架" in content
+        reset_md = module_path.read_text("utf-8")
+        assert "## 覆盖文件" in reset_md
+        assert "## 核心职责" in reset_md
+        assert "- src/alpha.py" in reset_md
+
+
 def main() -> None:
     asyncio.run(_test_shared_budget_between_stage1_and_stage2())
     asyncio.run(_test_stage2_rejects_non_dirty_paths())
-    print("digest stage2 tests passed")
+    asyncio.run(_test_stageC_rewrite_and_reset_tools())
+    print("digest stage2/stageC tests passed")
 
 
 if __name__ == "__main__":

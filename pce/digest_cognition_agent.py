@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from .base_agent import (
 )
 from .file_discovery import first_blocked_tool_path
 from .memory import load_file_baseline
-from .models import ChangedFileFact, InsightFact
+from .models import ChangedFileFact, InsightFact, NavigationTree
 from .prompt_guard import fit_text_to_budget
 from .serena_client import SerenaClient
 
@@ -254,6 +255,11 @@ class SharedToolBudget:
 
 @dataclass
 class AssimilationResult:
+    summary: str
+
+
+@dataclass
+class CleanupResult:
     summary: str
 
 
@@ -689,6 +695,96 @@ def _build_file_diff_excerpt(
     return f"### `{path}`\n```diff\n" + "\n".join(excerpt) + "\n```"
 
 
+def _split_markdown_sections(raw: str) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    header_lines: list[str] = []
+    sections: dict[str, list[str]] = {}
+    order: list[str] = []
+    current_heading: str | None = None
+    current_body: list[str] = []
+    seen_section = False
+
+    def _flush() -> None:
+        nonlocal current_heading, current_body
+        if current_heading is None:
+            return
+        sections[current_heading] = current_body[:]
+        order.append(current_heading)
+
+    for raw_line in raw.splitlines():
+        if raw_line.startswith("## "):
+            seen_section = True
+            _flush()
+            current_heading = raw_line[3:].strip()
+            current_body = []
+            continue
+        if not seen_section:
+            header_lines.append(raw_line)
+        elif current_heading is not None:
+            current_body.append(raw_line.rstrip())
+    _flush()
+    return header_lines, sections, order
+
+
+def _render_markdown_sections(header_lines: list[str], sections: dict[str, list[str]], order: list[str]) -> str:
+    lines = [line.rstrip() for line in header_lines]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for heading in order:
+        body = sections.get(heading)
+        if body is None:
+            continue
+        lines.extend(["", f"## {heading}"])
+        lines.extend(body)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+async def _build_annotation_skeleton(project_root: Path, path: str) -> str:
+    from .annotation_writer import (
+        _annotation_index_path,
+        _build_empty_module_skeleton_md,
+        _build_sections_from_navigation_tree,
+        _navigation_tree_path,
+        _render_area_md,
+        _render_hierarchical_index_md,
+    )
+    from .memory import load_index
+
+    normalized = _normalize_rel_path(path)
+    tree_path = _navigation_tree_path(project_root)
+    raw_tree = await _read_text_if_exists(tree_path)
+    if not raw_tree:
+        raise ValueError("navigation_tree 不存在，无法重置骨架")
+    tree = NavigationTree.model_validate(json.loads(raw_tree))
+    snapshot = await load_index(root_path=project_root)
+    if snapshot is None:
+        raise ValueError("index snapshot 不存在，无法重置骨架")
+    entries_map = {str(entry.file_meta.path): entry for entry in snapshot.entries}
+    sections = _build_sections_from_navigation_tree(tree, entries_map)
+    sections_by_slug = {section["slug"]: section for section in sections}
+
+    if normalized == _annotation_index_path(project_root).relative_to(project_root).as_posix():
+        return _render_hierarchical_index_md(tree, sections_by_slug)
+
+    if normalized.startswith(".pce/annotations/areas/") and normalized.endswith(".md"):
+        slug = Path(normalized).stem
+        area = next((item for item in tree.areas if item.slug == slug), None)
+        if area is None:
+            raise ValueError("area 不存在，无法重置骨架")
+        return _render_area_md(area, sections_by_slug)
+
+    if normalized.startswith(".pce/annotations/modules/") and normalized.endswith(".md"):
+        slug = Path(normalized).stem
+        section = sections_by_slug.get(slug)
+        if section is None:
+            raise ValueError("module 不存在，无法重置骨架")
+        module_name = str(section.get("name") or slug)
+        file_paths = list(section.get("file_paths", []))
+        entries = [entries_map[item] for item in file_paths if item in entries_map]
+        return _build_empty_module_skeleton_md(module_name, entries)
+
+    raise ValueError("annotation path 不支持骨架重置")
+
+
 class DigestStaleCheckStageAgent(_DigestStageAgent):
     def __init__(
         self,
@@ -984,6 +1080,229 @@ class DigestAssimilationStageAgent(_DigestStageAgent):
         return ok_builder("stageB 结果已接收")
 
 
+class DigestCleanupStageAgent(_DigestStageAgent):
+    def __init__(
+        self,
+        *,
+        project_root: Path,
+        dirty_files: list[str],
+        facts_text: str,
+        facts_truncated: bool,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        super().__init__(
+            project_root=project_root,
+            facts_text=facts_text,
+            facts_truncated=facts_truncated,
+            tool_budget=max(0, len(dirty_files) * 3),
+            shared_budget=None,
+            allow_serena=False,
+            allow_write_annotation=False,
+            allow_read_annotation=True,
+            model=model,
+            provider=provider,
+        )
+        self._result: CleanupResult | None = None
+        self._dirty_files = {str(item).strip() for item in dirty_files if str(item).strip()}
+
+    async def run(self, *, serena_client: SerenaClient, retry_feedback: str | None = None) -> CleanupResult:
+        messages = self._build_base_messages()
+        messages.append({
+            "role": "user",
+            "content": (
+                "当前是 digest stageC。请判断已有 annotation 是否因 dirty files 存在陈旧性风险。"
+                "你可以读取 annotation，必要时读取完整 diff。若确认存在陈旧风险，只做局部清理："
+                "要么局部重置为骨架，要么按 `##` 标题重写对应 section。无需修改时可直接结束。"
+            ),
+        })
+        if retry_feedback:
+            messages.append({"role": "user", "content": retry_feedback})
+        summary, _ = await self.run_loop(messages, serena_client)
+        failure = _FAILURE_MESSAGES.get(summary)
+        if failure is not None:
+            raise RuntimeError(failure)
+        if self._result is None:
+            raise RuntimeError("stageC 未提交结果")
+        return self._result
+
+    def _build_system_prompt(self) -> str:
+        return "\n".join(
+            [
+                "你是 PCE 的 DigestCleanupAgent，负责清理因 dirty files 而可能陈旧的 annotation。",
+                "",
+                "## 目标",
+                "- 识别受 dirty files 影响而可能误导的现有 annotation。",
+                "- 只做清理，不做补正、不做扩写。",
+                "- 清理动作仅限：局部重置为骨架，或按 `##` 标题重写 section。",
+                "",
+                "## 约束",
+                "- 优先使用已注入的 dirty file diff 摘要与 annotation 列表判断。",
+                "- 需要更多证据时，可读取完整 diff 或读取 annotation。",
+                "- 允许 noop；若未发现陈旧风险，不要为了完成任务而修改。",
+                "- 最终必须先调用 `deliver_stage_result`，再调用 `deliver(answer='stage done')`。",
+            ]
+        )
+
+    def _build_no_tool_prompt(self) -> str:
+        return "若当前 facts 已足够且无需清理，请直接提交结果；若需判断陈旧性，只读少量 annotation 或完整 diff。"
+
+    def _build_budget_exhausted_prompt(self) -> str:
+        return "stageC 工具预算已耗尽。请停止探索，基于当前证据直接收口。"
+
+    async def on_deliver(self, args: dict[str, Any] | None, state: LoopState) -> DeliverDecision:
+        if self._result is None:
+            return DeliverDecision.continue_with({
+                "role": "user",
+                "content": "你尚未调用 `deliver_stage_result`。请先提交 stageC 结果，再 deliver。",
+            })
+        return DeliverDecision.finish(_safe_json_dumps({"summary": self._result.summary}))
+
+    def _extra_virtual_tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_diff",
+                    "description": "读取 dirty file 的完整 baseline diff。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["paths"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "rewrite_sections",
+                    "description": "按 `##` 标题重写 annotation 中的 section 正文。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "sections": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "heading": {"type": "string"},
+                                        "content": {"type": "string"},
+                                    },
+                                    "required": ["heading", "content"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["path", "sections"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "reset_annotation_to_skeleton",
+                    "description": "将指定 annotation 局部重置为来自当前 navigation_tree 的骨架。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "deliver_stage_result",
+                    "description": "提交 stageC 的极简完成说明。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"summary": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    async def _handle_stage_virtual_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        ok_builder: Any,
+        err_builder: Any,
+    ) -> dict[str, Any]:
+        if name == "read_diff":
+            raw_paths = args.get("paths")
+            if not isinstance(raw_paths, list) or not all(isinstance(item, str) for item in raw_paths):
+                return err_builder("paths 必须是字符串数组")
+            normalized = []
+            for item in raw_paths[:10]:
+                path = _normalize_rel_path(item)
+                if path and path in self._dirty_files and path not in normalized:
+                    normalized.append(path)
+            if not normalized:
+                return err_builder("没有可读取的 dirty file diff")
+            self._consume_budget()
+            chunks: list[str] = []
+            for path in normalized:
+                baseline = await load_file_baseline(path, root_path=self._project_root)
+                old_content = baseline.content if baseline is not None else None
+                abs_path = self._project_root / path
+                new_content = await _read_text_if_exists(abs_path) if abs_path.exists() else None
+                chunks.append(_build_file_diff_excerpt(path=path, old_content=old_content, new_content=new_content, max_lines=5000))
+            return ok_builder("\n\n".join(chunks) + self._budget_note())
+        if name == "rewrite_sections":
+            path = str(args.get("path") or "").strip()
+            raw_sections = args.get("sections")
+            if not _annotation_path_allowed(path):
+                return err_builder("annotation path 不合法")
+            if not isinstance(raw_sections, list):
+                return err_builder("sections 必须是对象数组")
+            section_map: dict[str, str] = {}
+            for item in raw_sections:
+                if not isinstance(item, dict):
+                    return err_builder("sections 项必须为对象")
+                heading = str(item.get("heading") or "").strip()
+                content = str(item.get("content") or "")
+                if not heading:
+                    return err_builder("heading 不能为空")
+                section_map[heading] = content
+            existing = await _read_text_if_exists(self._project_root / _normalize_rel_path(path))
+            if not existing:
+                return err_builder("annotation 不存在")
+            header_lines, sections, order = _split_markdown_sections(existing)
+            for heading, content in section_map.items():
+                if heading not in sections:
+                    continue
+                body = [line.rstrip() for line in content.splitlines()]
+                while body and not body[0].strip():
+                    body.pop(0)
+                while body and not body[-1].strip():
+                    body.pop()
+                sections[heading] = body
+            await _write_text_atomic(
+                self._project_root / _normalize_rel_path(path),
+                _render_markdown_sections(header_lines, sections, order),
+            )
+            self._consume_budget()
+            return ok_builder(f"sections 已重写: {path}" + self._budget_note())
+        if name == "reset_annotation_to_skeleton":
+            path = str(args.get("path") or "").strip()
+            if not _annotation_path_allowed(path):
+                return err_builder("annotation path 不合法")
+            skeleton = await _build_annotation_skeleton(self._project_root, path)
+            await _write_text_atomic(self._project_root / _normalize_rel_path(path), skeleton)
+            self._consume_budget()
+            return ok_builder(f"annotation 已重置为骨架: {path}" + self._budget_note())
+        if name != "deliver_stage_result":
+            return err_builder(f"未知虚拟工具: {name}")
+        self._result = CleanupResult(summary=str(args.get("summary") or "").strip())
+        return ok_builder("stageC 结果已接收")
+
+
 async def run_digest_filter(
     *,
     project_root: Path,
@@ -1105,6 +1424,78 @@ async def run_digest_assimilation(
             feedback = (
                 f"上一次 stageB 尝试失败（第 {attempt}/3 次）：{exc}\n"
                 "请修正工具调用；若当前证据已足够，应直接完成内化并提交结果。"
+            )
+    assert last_exc is not None
+    raise last_exc
+
+
+def build_cleanup_facts_text(
+    *,
+    dirty_files: list[str],
+    patch_facts: list[ChangedFileFact],
+    annotation_paths: list[str],
+    model: str,
+) -> tuple[str, bool]:
+    lines = [
+        "以下是 digest stageC 直接注入的 facts。目标是识别并清理可能陈旧的 annotation。",
+        "",
+        "## Dirty Files",
+    ]
+    lines.extend([f"- `{item}`" for item in dirty_files] or ["- (none)"])
+    lines.extend(["", "## Diff Evidence (excerpt)"])
+    if patch_facts:
+        lines.extend(_render_patch_fact(item) for item in patch_facts)
+    else:
+        lines.append("- (none)")
+    lines.extend(["", "## Readable Annotations"])
+    lines.extend([f"- `{item}`" for item in annotation_paths] or ["- (none)"])
+    full = "\n".join(lines).strip()
+    fitted = fit_text_to_budget(
+        model,
+        full,
+        token_budget=32000,
+        notice=_FACTS_NOTICE,
+        min_chars=5000,
+    )
+    return fitted, fitted != full
+
+
+async def run_digest_cleanup(
+    *,
+    project_root: Path,
+    dirty_files: list[str],
+    patch_facts: list[ChangedFileFact],
+    model: str | None,
+    provider: str | None,
+    serena_client: SerenaClient,
+) -> CleanupResult:
+    annotation_paths = _iter_available_annotation_paths(project_root)
+    facts_text, truncated = build_cleanup_facts_text(
+        dirty_files=dirty_files,
+        patch_facts=patch_facts,
+        annotation_paths=annotation_paths,
+        model=model or "gpt-4o-mini",
+    )
+    feedback: str | None = None
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        agent = DigestCleanupStageAgent(
+            project_root=project_root,
+            dirty_files=dirty_files,
+            facts_text=facts_text,
+            facts_truncated=truncated,
+            model=model,
+            provider=provider,
+        )
+        try:
+            return await agent.run(serena_client=serena_client, retry_feedback=feedback)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 3:
+                break
+            feedback = (
+                f"上一次 stageC 尝试失败（第 {attempt}/3 次）：{exc}\n"
+                "请修正工具调用；若无需清理，也应直接提交结果。"
             )
     assert last_exc is not None
     raise last_exc
