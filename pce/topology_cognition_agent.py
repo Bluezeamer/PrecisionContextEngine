@@ -61,6 +61,7 @@ _REACT_FAILURE_MESSAGES: dict[str, str] = {
 class TopologyCognitionAgent(BaseReActAgent):
     """用于 init 轻量建图与模块认知直写的特化 Agent。"""
 
+    _temperature_env_key = "PCE_TOPOLOGY_TEMPERATURE"
     _completion_temperature = 0.1
     _enable_budget_warning = False
 

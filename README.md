@@ -66,6 +66,11 @@ PCE 使用 [LiteLLM](https://github.com/BerriAI/litellm) 作为 LLM 调用层，
 | `PCE_BASE_URL`        |   否   | —      | 自定义 API 端点，用于第三方中转或本地部署（如 vLLM、LocalAI）                |
 | `PCE_API_BASE`        |   否   | —      | `PCE_BASE_URL` 的兼容别名，效果相同                                          |
 | `PCE_MODEL_FALLBACKS` |   否   | —      | 同 provider 下的模型降级链，逗号分隔，如 `gpt-4o-mini,gpt-4.1-mini`          |
+| `PCE_TEMPERATURE`     |   否   | —      | 全局模型温度总控；一旦设置，会覆盖所有更细粒度的 temperature 配置             |
+| `PCE_AGENT_TEMPERATURE` | 否   | —      | 主 `query` / `impact` / ReAct 主链温度                                       |
+| `PCE_TOPOLOGY_TEMPERATURE` | 否 | —      | `pceignore` / `navigation_tree` / topology 增量链温度                        |
+| `PCE_DIGEST_TEMPERATURE` | 否  | —      | digest stage1 / stage2 / stageB / stageC 温度                                |
+| `PCE_ANNOTATION_TEMPERATURE` | 否 | —    | `annotation_writer` 独立补全链温度                                           |
 
 #### 运行配置（可选）
 
@@ -275,6 +280,11 @@ PCE uses [LiteLLM](https://github.com/BerriAI/litellm) under the hood — any pr
 | `PCE_BASE_URL`        |     No      | —       | Custom API endpoint for proxies or local deployments (vLLM, LocalAI, etc.)                   |
 | `PCE_API_BASE`        |     No      | —       | Legacy alias for `PCE_BASE_URL`                                                              |
 | `PCE_MODEL_FALLBACKS` |     No      | —       | Comma-separated fallback models under the same provider                                      |
+| `PCE_TEMPERATURE`     |     No      | —       | Global master temperature; when set, overrides all finer-grained temperature settings        |
+| `PCE_AGENT_TEMPERATURE` |   No      | —       | Temperature for the main `query` / `impact` / ReAct chain                                    |
+| `PCE_TOPOLOGY_TEMPERATURE` | No     | —       | Temperature for `pceignore` / topology / navigation chains                                   |
+| `PCE_DIGEST_TEMPERATURE` | No       | —       | Temperature for digest stage1 / stage2 / stageB / stageC                                     |
+| `PCE_ANNOTATION_TEMPERATURE` | No   | —       | Temperature for the standalone `annotation_writer` completion path                           |
 
 #### Runtime configuration (optional)
 

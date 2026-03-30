@@ -264,6 +264,7 @@ class CleanupResult:
 
 
 class _DigestStageAgent(BaseReActAgent):
+    _temperature_env_key = "PCE_DIGEST_TEMPERATURE"
     _completion_temperature = 0.1
     _enable_budget_warning = False
 

@@ -1488,6 +1488,7 @@ class PCEAgent(BaseReActAgent):
     """
 
     # PCEAgent 启用预算告警
+    _temperature_env_key = "PCE_AGENT_TEMPERATURE"
     _enable_budget_warning: bool = True
 
     def __init__(

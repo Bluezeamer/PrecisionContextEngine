@@ -27,7 +27,7 @@ from typing import Any
 import litellm
 import litellm.exceptions as litellm_exc
 
-from ._env import build_litellm_model, get_completion_overrides, get_env_text
+from ._env import build_litellm_model, get_completion_overrides, get_env_text, get_temperature
 from .prompt_guard import build_prompt_budget, estimate_input_tokens
 from .serena_client import SerenaClient, SerenaClientError
 
@@ -326,6 +326,7 @@ class BaseReActAgent(ABC):
     """
 
     # 子类可覆盖的类级配置
+    _temperature_env_key: str | None = None
     _completion_temperature: float = 0.2
     _completion_timeout: float = 60.0
     _enable_budget_warning: bool = False
@@ -356,6 +357,10 @@ class BaseReActAgent(ABC):
         )
         self._model_fallbacks = [m for m in raw_fallbacks if m and m != self._model]
         self._max_seconds = float(max_seconds)
+        self._completion_temperature = get_temperature(
+            specific_key=self._temperature_env_key,
+            default=self._completion_temperature,
+        )
 
     # ── 子类必须实现 ──────────────────────────────────────────────────────────
 

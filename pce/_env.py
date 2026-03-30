@@ -5,6 +5,7 @@
 - model
 - base_url（可选）
 - api_key（可选）
+- temperature（可选）
 """
 
 from __future__ import annotations
@@ -38,6 +39,38 @@ def get_completion_overrides() -> dict[str, Any]:
     if (api_base := get_base_url()) is not None:
         overrides["api_base"] = api_base
     return overrides
+
+
+def get_env_float(name: str) -> float | None:
+    """读取环境变量浮点数；非法值视为未配置。"""
+    text = get_env_text(name)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def get_temperature(
+    *,
+    specific_key: str | None,
+    default: float,
+    fallback_key: str = "PCE_TEMPERATURE",
+) -> float:
+    """读取温度配置。
+
+    优先级：
+    1. fallback_key（全局总控）
+    2. specific_key
+    3. 代码默认值
+    """
+    if (fallback := get_env_float(fallback_key)) is not None:
+        return fallback
+    if specific_key:
+        if (specific := get_env_float(specific_key)) is not None:
+            return specific
+    return float(default)
 
 
 def configure_litellm_runtime() -> None:

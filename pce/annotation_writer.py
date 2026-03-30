@@ -26,7 +26,7 @@ from typing import Any
 import aiofiles
 import litellm
 
-from ._env import build_litellm_model, get_completion_overrides, get_env_text
+from ._env import build_litellm_model, get_completion_overrides, get_env_text, get_temperature
 from .init_cognition_limits import TOPOLOGY_STAGE_MAX_ATTEMPTS
 from .memory import (
     ANNOTATIONS_DIR,
@@ -1179,7 +1179,10 @@ async def _llm_complete_text(
                 litellm.completion,
                 model=effective_model,
                 messages=messages,
-                temperature=0.1,
+                temperature=get_temperature(
+                    specific_key="PCE_ANNOTATION_TEMPERATURE",
+                    default=0.1,
+                ),
                 **get_completion_overrides(),
             ),
             timeout=_ANNOTATION_LLM_TIMEOUT_SECONDS,
