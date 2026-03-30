@@ -291,7 +291,6 @@ _MAX_TIMEOUT_RETRIES = 1
 # Insight Cache 注入与蒸馏参数
 _INSIGHT_TOP_K = 5
 _INSIGHT_TOKEN_BUDGET = 4000  # 字符数上限（粗略估算 token）
-_INSIGHT_MAX_SCOPES = 3  # 每次 deliver 最多写入的 scope 数量
 # system prompt 动态注入块软上限（token 数），运行时从 env 读取。
 # 仅针对可压缩块（structure.md + annotations/index.md + InsightCache），
 # 不含 SYSTEM_PROMPT_HEADER 和工具 schema。
@@ -301,9 +300,6 @@ _SYSTEM_PROMPT_TRUNCATED_NOTICE = (
     "\n\n(以上内容因 system prompt token 预算限制已被截断，如需完整信息请通过工具按需读取)"
 )
 _SYSTEM_PROMPT_PLACEHOLDER = "(内容因 system prompt token 超限未注入，请通过工具按需读取)"
-_INSIGHT_MAX_CONTENT_CHARS = 1200  # 单条 insight content 最大字符数
-# 从文本中提取形如 pce/agent.py 或 ./src/foo.py:123 的路径
-_PATH_RE = re.compile(r"(?<![\w./-])(?:\./)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_+\-]+)(?::\d+)?")
 
 
 def _normalize_rel_path(path: str) -> str:
@@ -1775,67 +1771,6 @@ class PCEAgent(BaseReActAgent):
             return InsightConfidence.LOW
         return InsightConfidence.MEDIUM
 
-    def _extract_path_candidates(self, text: str) -> list[str]:
-        """从文本中提取候选相对路径（去重，保留出现顺序）。"""
-        seen: set[str] = set()
-        result: list[str] = []
-        for m in _PATH_RE.finditer(text):
-            candidate = m.group(1).removeprefix("./")
-            if candidate not in seen:
-                seen.add(candidate)
-                result.append(candidate)
-        return result
-
-    def _pick_insight_scopes(self, answer: str, question: str) -> list[str]:
-        """从 answer + question 中选出真实存在于项目根目录下的相对文件路径。
-
-        优先取 answer 中出现的路径（更贴近结论），再回退到 question。
-        最多返回 _INSIGHT_MAX_SCOPES 个。
-        """
-        if self._insight_cache is None:
-            return []
-        root = self._insight_cache.project_root
-        ordered = self._extract_path_candidates(answer) + self._extract_path_candidates(question)
-
-        scopes: list[str] = []
-        seen: set[str] = set()
-        for candidate in ordered:
-            try:
-                resolved = (root / candidate).resolve()
-                rel = resolved.relative_to(root).as_posix()
-            except (ValueError, OSError):
-                continue
-            if not resolved.is_file():
-                continue
-            if rel in seen:
-                continue
-            seen.add(rel)
-            scopes.append(rel)
-            if len(scopes) >= _INSIGHT_MAX_SCOPES:
-                break
-        return scopes
-
-    @staticmethod
-    def _distill_insight_content(question: str, answer: str, scope: str) -> str:
-        """将 question/answer 对蒸馏为与 scope 相关的紧凑 insight 内容。"""
-        # 问题截断
-        q = " ".join(question.strip().split())
-        if len(q) > 220:
-            q = q[:220].rstrip() + "..."
-
-        # 优先提取 answer 中包含 scope 的行作为核心结论
-        lines = [ln.strip() for ln in answer.splitlines() if scope in ln and ln.strip()][:8]
-        if lines:
-            core = "\n".join(f"- {ln}" for ln in lines)
-        else:
-            # 回退：取 answer 全文（空白折叠）
-            core = " ".join(answer.strip().split())
-
-        content = f"问题: {q}\n与 {scope} 相关结论:\n{core}"
-        if len(content) > _INSIGHT_MAX_CONTENT_CHARS:
-            content = content[:_INSIGHT_MAX_CONTENT_CHARS].rstrip() + "..."
-        return content
-
     async def _persist_insights(
         self,
         question: str,
@@ -1852,20 +1787,16 @@ class PCEAgent(BaseReActAgent):
         if answer.startswith("__REACT_"):
             return
 
-        scopes = self._pick_insight_scopes(answer, question)
-        if not scopes:
-            return
-
         conf = self._confidence_from_str(confidence)
-        for scope in scopes:
-            content = self._distill_insight_content(question, answer, scope)
-            try:
-                await self._insight_cache.upsert(scope=scope, content=content, confidence=conf)
-                logger.debug(f"Insight 蒸馏写入: scope={scope}")
-            except FileNotFoundError:
-                logger.debug(f"Insight scope 文件不存在，跳过: {scope}")
-            except Exception as e:
-                logger.warning(f"Insight upsert 失败: scope={scope}: {e}")
+        try:
+            await self._insight_cache.upsert(
+                question=question,
+                answer=answer,
+                confidence=conf,
+            )
+            logger.debug("Insight 原始问答写入完成")
+        except Exception as e:
+            logger.warning(f"Insight upsert 失败: {e}")
 
     async def _read_pce_file(self, path: Path) -> str:
         """读取 .pce 目录下的文件内容,文件不存在时返回占位文本。"""

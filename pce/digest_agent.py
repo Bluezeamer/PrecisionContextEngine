@@ -34,7 +34,7 @@ class InsightBatch:
 
 
 def _estimate_insight_chars(insight: InsightFact) -> int:
-    return len(insight.id) + len(insight.scope) + len(insight.content) + 64
+    return len(insight.id) + len(insight.question) + len(insight.answer) + 64
 
 
 def _chunk_insights(insights: list[InsightFact], *, max_chars: int = _STAGE_A_MAX_FACTS_CHARS) -> list[InsightBatch]:
@@ -60,14 +60,14 @@ async def _load_active_insights(insight_cache: InsightCache) -> list[InsightFact
     records = await insight_cache.get_all_records(include_stale=False)
     result: list[InsightFact] = []
     for record in records:
-        content = await insight_cache.get_entry_content(record.id)
-        if not content:
+        entry = await insight_cache.get_entry(record.id)
+        if entry is None:
             continue
         result.append(
             InsightFact(
                 id=record.id,
-                scope=record.scope,
-                content=content,
+                question=entry.question,
+                answer=entry.answer,
                 confidence=record.confidence,
                 created_at=record.created_at,
             )

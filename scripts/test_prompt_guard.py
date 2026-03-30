@@ -79,8 +79,8 @@ async def _test_digest_guard() -> None:
     insights = [
         InsightFact(
             id=str(uuid.uuid4()),
-            scope=f"pkg/file_{idx}.py",
-            content="X" * 1200,
+            question=f"问题 {idx}",
+            answer="X" * 1200,
             confidence=InsightConfidence.MEDIUM,
             created_at=datetime.now(UTC),
         )

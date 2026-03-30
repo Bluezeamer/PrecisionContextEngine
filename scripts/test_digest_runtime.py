@@ -70,14 +70,14 @@ async def _load_active_insights(insight_cache: InsightCache) -> list[InsightFact
     records = await insight_cache.get_all_records(include_stale=False)
     results: list[InsightFact] = []
     for record in records:
-        content = await insight_cache.get_entry_content(record.id)
-        if not content:
+        entry = await insight_cache.get_entry(record.id)
+        if entry is None:
             continue
         results.append(
             InsightFact(
                 id=record.id,
-                scope=record.scope,
-                content=content,
+                question=entry.question,
+                answer=entry.answer,
                 confidence=record.confidence,
                 created_at=record.created_at,
             )
@@ -86,7 +86,7 @@ async def _load_active_insights(insight_cache: InsightCache) -> list[InsightFact
 
 
 def _estimate_insight_chars(insight: InsightFact) -> int:
-    return len(insight.id) + len(insight.scope) + len(insight.content) + 64
+    return len(insight.id) + len(insight.question) + len(insight.answer) + 64
 
 
 def _count_batches(insights: list[InsightFact], *, max_chars: int = 32000) -> int:
@@ -140,7 +140,7 @@ async def main() -> None:
             "insight_preview": [
                 {
                     "id": item.id,
-                    "scope": item.scope,
+                    "question": item.question[:120],
                     "confidence": str(item.confidence),
                 }
                 for item in active_insights[: args.max_items]

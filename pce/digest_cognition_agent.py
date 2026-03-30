@@ -128,9 +128,10 @@ def _render_insight(insight: InsightFact) -> str:
     return "\n".join(
         [
             f"- id: `{insight.id}`",
-            f"  - scope: `{insight.scope}`",
+            f"  - created_at: `{insight.created_at.isoformat()}`",
             f"  - confidence: `{insight.confidence}`",
-            f"  - content: {_truncate_block(insight.content, max_chars=800)}",
+            f"  - question: {_truncate_block(insight.question, max_chars=400)}",
+            f"  - answer: {_truncate_block(insight.answer, max_chars=800)}",
         ]
     )
 

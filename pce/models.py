@@ -598,11 +598,11 @@ class InsightConfidence(str, Enum):
 
 
 class InsightFact(BaseSchema):
-    """供 DigestDelta 使用的轻量 insight 事实。"""
+    """供 digest 使用的原始问答 insight 事实。"""
 
     id: UUIDStr = Field(..., description="Insight 条目 ID")
-    scope: NonEmptyStr = Field(..., description="Insight 作用域")
-    content: NonEmptyStr = Field(..., description="Insight 正文")
+    question: NonEmptyStr = Field(..., description="原始问题")
+    answer: NonEmptyStr = Field(..., description="原始回答")
     confidence: InsightConfidence = Field(..., description="Insight 置信度")
     created_at: UTCDateTime = Field(..., description="Insight 创建时间（UTC）")
 
@@ -611,35 +611,20 @@ class InsightEntry(BaseSchema):
     """Insight 完整条目，用于写入 entries/{uuid}.json。"""
 
     id: UUIDStr = Field(..., description="条目唯一 ID（UUID）")
-    scope: NonEmptyStr = Field(..., description="作用域（相对项目根的文件路径）")
-    content: NonEmptyStr = Field(..., description="蒸馏后的模块级理解内容")
+    question: NonEmptyStr = Field(..., description="原始问题")
+    answer: NonEmptyStr = Field(..., description="原始回答")
     confidence: InsightConfidence = Field(
         default=InsightConfidence.MEDIUM, description="条目置信度"
     )
     created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
-    last_referenced_at: UTCDateTime = Field(..., description="最后引用时间（UTC）")
-    source_hash: NonEmptyStr = Field(..., description="创建时源文件的 SHA256 哈希")
-    supersedes: Optional[UUIDStr] = Field(
-        default=None, description="被当前条目覆盖的旧条目 ID（可选）"
-    )
 
 
 class InsightIndexRecord(BaseSchema):
-    """Insight 索引记录，不含 content，用于 index.json。"""
+    """Insight 索引记录，不含问答正文，用于 index.json。"""
 
     id: UUIDStr = Field(..., description="条目唯一 ID（UUID）")
-    scope: NonEmptyStr = Field(..., description="作用域（相对项目根的文件路径）")
     confidence: InsightConfidence = Field(..., description="条目置信度")
     created_at: UTCDateTime = Field(..., description="创建时间（UTC）")
-    last_referenced_at: UTCDateTime = Field(..., description="最后引用时间（UTC）")
-    source_hash: NonEmptyStr = Field(..., description="创建时源文件的 SHA256 哈希")
-    supersedes: Optional[UUIDStr] = Field(
-        default=None, description="被当前条目覆盖的旧条目 ID（可选）"
-    )
-    stale: bool = Field(default=False, description="是否已过时")
-    stale_checked_at: Optional[UTCDateTime] = Field(
-        default=None, description="最近一次 stale 检查时间（UTC）"
-    )
 
 
 class InsightIndex(BaseSchema):

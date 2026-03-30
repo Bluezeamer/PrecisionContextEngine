@@ -34,11 +34,11 @@ from pce.models import (
 from pce.staging import DirtyState
 
 
-def _insight(idx: int, *, scope: str, content: str) -> InsightFact:
+def _insight(idx: int, *, question: str, answer: str) -> InsightFact:
     return InsightFact(
         id=f"00000000-0000-0000-0000-{idx:012d}",
-        scope=scope,
-        content=content,
+        question=question,
+        answer=answer,
         confidence=InsightConfidence.MEDIUM,
         created_at=datetime.now(UTC),
     )
@@ -73,7 +73,7 @@ async def _test_shared_budget_between_stage1_and_stage2() -> None:
         (root / "src").mkdir(parents=True, exist_ok=True)
         (root / "src" / "alpha.py").write_text("def run():\n    return 2\n", "utf-8")
 
-        insights = [_insight(1, scope="src/alpha.py", content="alpha 模块负责执行 run 流程")]
+        insights = [_insight(1, question="src/alpha.py 的 run 流程是什么？", answer="alpha 模块负责执行 src/alpha.py 中的 run 流程")]
         shared = SharedToolBudget(total=3)
 
         stage1 = DigestFilterStageAgent(
@@ -109,7 +109,7 @@ async def _test_shared_budget_between_stage1_and_stage2() -> None:
 async def _test_stage2_rejects_non_dirty_paths() -> None:
     with TemporaryDirectory(prefix="pce-digest-stage2-guard-") as tmpdir:
         root = Path(tmpdir)
-        insights = [_insight(2, scope="src/alpha.py", content="alpha insight")]
+        insights = [_insight(2, question="src/alpha.py 有什么作用？", answer="alpha insight")]
         facts_text, truncated = build_stale_check_facts_text(
             insights=insights,
             dirty_files=["src/alpha.py"],

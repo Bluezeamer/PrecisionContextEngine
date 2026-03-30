@@ -687,41 +687,12 @@ class PCEContext:
                         "Bootstrap 阶段耗时: seed_initial_baselines=%.2fs",
                         time.monotonic() - baseline_seed_start,
                     )
-
-                    should_digest, digest_reason = await should_run_digest(
-                        project_root=project_path,
-                        insight_cache=self.insight_cache,
+                    await self._run_post_index_cognition_pipeline(
+                        serena_client=serena_client,
                         dirty_state=digest_dirty,
+                        warnings=warnings,
+                        phase_label="Bootstrap",
                     )
-                    if should_digest:
-                        digest_start = time.monotonic()
-                        try:
-                            digest_result = await run_digest(
-                                project_root=project_path,
-                                serena_client=serena_client,
-                                insight_cache=self.insight_cache,
-                                dirty_state=digest_dirty,
-                                skip_initial_sweep=True,
-                            )
-                            for w in digest_result.get("warnings", []):
-                                warnings.append(f"Digest: {w}")
-                            logger.info(
-                                "Bootstrap Digest 完成: resolved=%d pending=%d deleted_insights=%d",
-                                digest_result.get("resolved_tasks", 0),
-                                digest_result.get("pending_tasks", 0),
-                                digest_result.get("deleted_insights", 0),
-                            )
-                        except Exception as e:
-                            warning = f"Bootstrap Digest 失败（不影响初始化）: {_format_exception_brief(e)}"
-                            warnings.append(warning)
-                            logger.warning(warning)
-                        finally:
-                            logger.info(
-                                "Bootstrap 阶段耗时: digest=%.2fs",
-                                time.monotonic() - digest_start,
-                            )
-                    else:
-                        logger.info("Bootstrap Digest 已跳过：%s", digest_reason)
 
             self._init_state = "initialized"
             self._bootstrap_warnings = list(warnings)
@@ -1003,6 +974,57 @@ class PCEContext:
 
         return {"success": True, "tool": tool_name, "result": result}
 
+    async def _run_post_index_cognition_pipeline(
+        self,
+        *,
+        serena_client: SerenaClient,
+        dirty_state: DirtyState,
+        warnings: list[str] | None,
+        phase_label: str,
+    ) -> dict[str, Any] | None:
+        assert self.insight_cache is not None
+        should_digest, digest_reason = await should_run_digest(
+            project_root=self.project_path,
+            insight_cache=self.insight_cache,
+            dirty_state=dirty_state,
+        )
+        if not should_digest:
+            logger.info("%s Digest 已跳过：%s", phase_label, digest_reason)
+            return None
+
+        digest_start = time.monotonic()
+        try:
+            digest_result = await run_digest(
+                project_root=self.project_path,
+                serena_client=serena_client,
+                insight_cache=self.insight_cache,
+                dirty_state=dirty_state,
+                skip_initial_sweep=True,
+            )
+            if warnings is not None:
+                for item in digest_result.get("warnings", []):
+                    warnings.append(f"Digest: {item}")
+            logger.info(
+                "%s Digest 完成: resolved=%d pending=%d deleted_insights=%d",
+                phase_label,
+                digest_result.get("resolved_tasks", 0),
+                digest_result.get("pending_tasks", 0),
+                digest_result.get("deleted_insights", 0),
+            )
+            return digest_result
+        except Exception as e:
+            warning = f"{phase_label} Digest 失败（不影响主流程）: {_format_exception_brief(e)}"
+            if warnings is not None:
+                warnings.append(warning)
+            logger.warning(warning)
+            return None
+        finally:
+            logger.info(
+                "%s 阶段耗时: digest=%.2fs",
+                phase_label,
+                time.monotonic() - digest_start,
+            )
+
     async def handle_sync(self) -> dict[str, Any]:
         """触发 Serena 断开重连并按需更新 PCE 索引。
 
@@ -1018,10 +1040,15 @@ class PCEContext:
 
         async with self._sync_lock:
             dirty = await self._backfill_dirty_if_needed()
-            if dirty.empty:
-                snapshot = await load_index(root_path=self.project_path)
-                if snapshot is not None:
-                    logger.info("pce_sync: 暂存区无变更，跳过重建")
+            snapshot = await load_index(root_path=self.project_path) if dirty.empty else None
+            if dirty.empty and snapshot is not None:
+                should_digest, digest_reason = await should_run_digest(
+                    project_root=self.project_path,
+                    insight_cache=self.insight_cache,
+                    dirty_state=dirty,
+                )
+                if not should_digest:
+                    logger.info("pce_sync: 无 dirty 且无需 digest，快速返回: %s", digest_reason)
                     return {
                         "success": True,
                         "message": "暂存区无变更，索引已是最新",
@@ -1031,13 +1058,17 @@ class PCEContext:
 
             async with self.serena_session() as serena_client:
                 if dirty.empty:
-                    logger.info("pce_sync: 暂存区无变更，执行全量重建")
-                    snapshot = await build_index(
-                        project_path=self.project_path,
-                        serena_client=serena_client,
-                        memory_root=self.project_path,
-                    )
-                    message = "Serena 已重连，PCE 索引全量重建完成"
+                    if snapshot is None:
+                        logger.info("pce_sync: 暂存区无变更但索引缺失，执行全量重建")
+                        snapshot = await build_index(
+                            project_path=self.project_path,
+                            serena_client=serena_client,
+                            memory_root=self.project_path,
+                        )
+                        message = "Serena 已重连，PCE 索引全量重建完成"
+                    else:
+                        logger.info("pce_sync: 暂存区无变更，跳过索引重建，继续统一后处理")
+                        message = "暂存区无变更，索引已是最新"
                 else:
                     all_paths = dirty.changed + dirty.deleted
                     # 索引前快照 hash，防止索引期间新变更被提前确认
@@ -1065,35 +1096,12 @@ class PCEContext:
                     "pce_sync 阶段耗时: seed_initial_baselines=%.2fs",
                     time.monotonic() - seed_start,
                 )
-
-                should_digest, digest_reason = await should_run_digest(
-                    project_root=self.project_path,
-                    insight_cache=self.insight_cache,
+                await self._run_post_index_cognition_pipeline(
+                    serena_client=serena_client,
                     dirty_state=dirty,
+                    warnings=digest_warnings,
+                    phase_label="pce_sync",
                 )
-                if should_digest:
-                    try:
-                        digest_result = await run_digest(
-                            project_root=self.project_path,
-                            serena_client=serena_client,
-                            insight_cache=self.insight_cache,
-                            dirty_state=dirty,
-                            skip_initial_sweep=True,
-                        )
-                        digest_warnings = [f"Digest: {w}" for w in digest_result.get("warnings", [])]
-                        logger.info(
-                            "pce_sync Digest 完成: resolved=%d pending=%d deleted_insights=%d",
-                            digest_result.get("resolved_tasks", 0),
-                            digest_result.get("pending_tasks", 0),
-                            digest_result.get("deleted_insights", 0),
-                        )
-                    except Exception as e:
-                        w = f"pce_sync Digest 失败（不影响同步）: {e}"
-                        digest_warnings = [w]
-                        logger.warning(w)
-                else:
-                    digest_warnings = []
-                    logger.info("pce_sync Digest 已跳过：%s", digest_reason)
 
             self._init_state = "initialized"
             logger.info(
