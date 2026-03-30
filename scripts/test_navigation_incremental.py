@@ -268,9 +268,221 @@ async def _test_module_update_persists_stable_tree() -> None:
         assert not (modules_dir / "legacy-single.md").exists()
 
 
+async def _test_area_rebuild_rewrites_navigation_layers_without_touching_unrelated_modules() -> None:
+    with TemporaryDirectory(prefix="pce-nav-incremental-area-") as tmpdir:
+        root = Path(tmpdir)
+        annotations_dir = root / ".pce" / "annotations"
+        modules_dir = annotations_dir / "modules"
+        modules_dir.mkdir(parents=True, exist_ok=True)
+
+        current_tree = NavigationTree(
+            generated_at=datetime.now(UTC),
+            project_summary="测试项目",
+            fallback_area_slug="fallback",
+            source_digest="seed",
+            areas=[
+                AreaRecord(
+                    slug="backend",
+                    display_name="后端",
+                    summary="后端能力",
+                    modules=[
+                        {
+                            "slug": "api",
+                            "display_name": "API",
+                            "summary": "API 模块",
+                            "module_type": "directory",
+                            "include": ["src/backend/api/**"],
+                            "exclude": [],
+                        },
+                        {
+                            "slug": "jobs",
+                            "display_name": "Jobs",
+                            "summary": "Jobs 模块",
+                            "module_type": "directory",
+                            "include": ["src/backend/jobs/**"],
+                            "exclude": [],
+                        },
+                    ],
+                    module_slugs=["api", "jobs"],
+                    recommended_order=["api", "jobs"],
+                    source_prefixes=["src/backend/"],
+                    is_fallback=False,
+                ),
+                AreaRecord(
+                    slug="frontend",
+                    display_name="前端",
+                    summary="前端能力",
+                    modules=[
+                        {
+                            "slug": "ui",
+                            "display_name": "UI",
+                            "summary": "UI 模块",
+                            "module_type": "directory",
+                            "include": ["src/frontend/**"],
+                            "exclude": [],
+                        }
+                    ],
+                    module_slugs=["ui"],
+                    recommended_order=["ui"],
+                    source_prefixes=["src/frontend/"],
+                    is_fallback=False,
+                ),
+                AreaRecord(
+                    slug="fallback",
+                    display_name="未分类（Fallback）",
+                    summary="承接剩余内容",
+                    modules=[],
+                    module_slugs=[],
+                    recommended_order=[],
+                    source_prefixes=[],
+                    is_fallback=True,
+                ),
+            ],
+        )
+
+        (_navigation_tree_path(root)).write_text(
+            json.dumps(current_tree.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
+            "utf-8",
+        )
+        (annotations_dir / "index.md").write_text("# 项目认知导航\n", "utf-8")
+        for slug, path, note in [
+            ("api", "src/backend/api/routes.py", "保留 API 正文"),
+            ("jobs", "src/backend/jobs/worker.py", "旧模块应被清理"),
+            ("ui", "src/frontend/app.tsx", "前端正文应保留"),
+        ]:
+            (modules_dir / f"{slug}.md").write_text(
+                "\n".join([
+                    f"# {slug.upper()}",
+                    "",
+                    "## 覆盖文件",
+                    f"- {path}",
+                    "",
+                    "## 核心职责",
+                    f"- {note}",
+                    "",
+                ]) + "\n",
+                "utf-8",
+            )
+
+        entries = [
+            _entry("src/backend/api/routes.py"),
+            _entry("src/backend/platform/service.py"),
+            _entry("src/frontend/app.tsx", language="typescript"),
+        ]
+
+        rebuilt_tree = NavigationTree(
+            generated_at=datetime.now(UTC),
+            project_summary="测试项目",
+            fallback_area_slug="fallback",
+            source_digest="candidate",
+            areas=[
+                AreaRecord(
+                    slug="backend",
+                    display_name="后端",
+                    summary="后端能力",
+                    modules=[
+                        {
+                            "slug": "api",
+                            "display_name": "API",
+                            "summary": "API 模块",
+                            "module_type": "directory",
+                            "include": ["src/backend/api/**"],
+                            "exclude": [],
+                        },
+                        {
+                            "slug": "platform",
+                            "display_name": "Platform",
+                            "summary": "Platform 模块",
+                            "module_type": "directory",
+                            "include": ["src/backend/platform/**"],
+                            "exclude": [],
+                        },
+                    ],
+                    module_slugs=["api", "platform"],
+                    recommended_order=["api", "platform"],
+                    source_prefixes=["src/backend/"],
+                    is_fallback=False,
+                ),
+                AreaRecord(
+                    slug="frontend",
+                    display_name="前端",
+                    summary="前端能力",
+                    modules=[
+                        {
+                            "slug": "ui",
+                            "display_name": "UI",
+                            "summary": "UI 模块",
+                            "module_type": "directory",
+                            "include": ["src/frontend/**"],
+                            "exclude": [],
+                        }
+                    ],
+                    module_slugs=["ui"],
+                    recommended_order=["ui"],
+                    source_prefixes=["src/frontend/"],
+                    is_fallback=False,
+                ),
+                AreaRecord(
+                    slug="fallback",
+                    display_name="未分类（Fallback）",
+                    summary="承接剩余内容",
+                    modules=[],
+                    module_slugs=[],
+                    recommended_order=[],
+                    source_prefixes=[],
+                    is_fallback=True,
+                ),
+            ],
+        )
+
+        original_runner = annotation_writer._run_incremental_navigation_update
+        original_full_write = annotation_writer._write_annotations
+
+        async def _fake_runner(**_: object) -> dict[str, object]:
+            return {
+                "decision": "area_rebuild",
+                "rationale": "test",
+                "navigation_tree": rebuilt_tree,
+            }
+
+        async def _unexpected_full_write(*args: object, **kwargs: object) -> None:
+            raise AssertionError("area_rebuild 测试不应回落到全量重建")
+
+        annotation_writer._run_incremental_navigation_update = _fake_runner
+        annotation_writer._write_annotations = _unexpected_full_write
+        try:
+            await _update_annotations_incremental(
+                entries,
+                _project_meta(root, entries),
+                root,
+                changed_files=["src/backend/platform/service.py"],
+                deleted_files=["src/backend/jobs/worker.py"],
+                model=None,
+                serena_client=object(),
+            )
+        finally:
+            annotation_writer._run_incremental_navigation_update = original_runner
+            annotation_writer._write_annotations = original_full_write
+
+        persisted_tree = json.loads(_navigation_tree_path(root).read_text("utf-8"))
+        backend_area = next(area for area in persisted_tree["areas"] if area["slug"] == "backend")
+        frontend_area = next(area for area in persisted_tree["areas"] if area["slug"] == "frontend")
+        assert backend_area["module_slugs"] == ["api", "platform"]
+        assert frontend_area["module_slugs"] == ["ui"]
+
+        api_md = (modules_dir / "api.md").read_text("utf-8")
+        ui_md = (modules_dir / "ui.md").read_text("utf-8")
+        platform_md = (modules_dir / "platform.md").read_text("utf-8")
+        assert "保留 API 正文" in api_md
+        assert "前端正文应保留" in ui_md
+        assert "- src/backend/platform/service.py" in platform_md
+        assert not (modules_dir / "jobs.md").exists()
+
+
 def main() -> None:
     asyncio.run(_test_created_file_already_covered_returns_no_change())
     asyncio.run(_test_module_update_persists_stable_tree())
+    asyncio.run(_test_area_rebuild_rewrites_navigation_layers_without_touching_unrelated_modules())
     print("incremental navigation tests passed")
 
 
