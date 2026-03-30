@@ -208,9 +208,9 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- 优先按目录层级建立 `directory` 模块；单文件 `file_centered` 只在平铺结构且该文件确实像职责中心时使用。",
                 "- 每个 area 最多保留 1 个 `residual` 模块；它用于承接该 area 内剩余文件，可不写 `include` / `exclude`。",
                 "- `include` / `exclude` 使用 glob 风格路径规则表达显式边界；优先按目录层级覆盖，而不是单文件穷举。",
-                "- 若宽泛 `include` 会覆盖到更精确的模块，请通过 `exclude` 消除重叠，而不是让同一文件落入多个模块。",
+                "- 若宽泛 `include` 会覆盖到更精确的模块，请通过 `exclude` 消除重叠，而不是让同一文件落入多个模块。任何重复挂载文件都必须被你裁决为唯一归属。",
                 "- `areas[*].modules[*].summary` 必须是一句 module 入口介绍，用于快速导航。",
-                "- 恰好 1 个 fallback area；每个文件只能归属一个 module；每个 module 只能归属一个 area。",
+                "- 恰好 1 个 fallback area；每个文件必须且只能归属一个 module；每个 module 只能归属一个 area。",
                 "- `include` / `exclude` 只能引用当前注入 `files_tree` 可覆盖的候选路径，不要编造索引外文件。",
                 "- 不要单独输出 module_catalog，也不要把目录名机械等同于 area/module。",
                 "",
@@ -259,10 +259,10 @@ class TopologyCognitionAgent(BaseReActAgent):
                 [
                     "当前阶段：`navigation_tree`。",
                     "请基于已注入的 `files_tree`，仅在必要时做少量高价值探索，直接产出完整导航树。",
-                    "目标是给出稳定的 areas / modules 边界，并让全部候选文件最终可被收敛挂载。",
+                    "目标是给出稳定的 areas / modules 边界，并让全部候选文件最终可被收敛挂载。最终结果中每个文件都必须只有唯一挂载点。",
                     "优先按目录建立 `directory` 模块；只有平铺结构中的少量职责中心文件才用 `file_centered`。",
                     "需要注意观察明显扁平的目录结构：这通常暗示同级文件可能以非目录形式各自承担模块化职责，必要时可批量快速读取这些文件的局部内容来判断。",
-                    "若某个 area 内还存在无法稳定细分的剩余文件，请保留一个 `residual` 模块承接，不要把结构化内容直接塞进 fallback。",
+                    "若某个 area 内还存在无法稳定细分的剩余文件，请保留一个 `residual` 模块承接，不要把结构化内容直接塞进 fallback。若出现重复挂载，必须明确裁决冲突文件唯一归属。",
                     "显式规则优先表达边界，不要为了追求全覆盖而逐文件穷举。",
                     "本阶段是轻量建模，不要展开大范围项目调研；优先基于现有树结构直接完成划分。",
                     "先调用 `deliver_stage_result(stage='navigation_tree', payload=...)`，再调用 `deliver(answer='stage done')`。",
@@ -274,11 +274,11 @@ class TopologyCognitionAgent(BaseReActAgent):
             validation_feedback = self._stage_context.get("validation_feedback")
             lines = [
                 "当前阶段：`navigation_repair`。",
-                "请基于现有 `navigation_tree` 做最小修正，补齐遗漏文件，并消除重复/非法挂载。",
+                "请基于现有 `navigation_tree` 做最小修正，补齐遗漏文件，并消除重复/非法挂载。所有重复挂载文件都必须被你重新裁决为唯一归属。",
                 "优先复用已有 area/module；只在明显需要时新增少量 module。",
                 "优先修边界：目录模块过宽/过窄、residual 过大、单文件模块过碎，而不是重做全局分类。",
                 "若某个平铺目录下的多个同级文件是否应独立成模块仍不清楚，可批量快速读取这些文件的局部内容辅助判断。",
-                "修正时优先调整 `include` / `exclude` 规则，避免长串单文件枚举。",
+                "修正时优先调整 `include` / `exclude` 规则，避免长串单文件枚举。若有一批冲突文件，请批量做唯一归属判断直到收敛。",
                 "本阶段只做局部修复，不要重新调查整个项目。",
                 "修正后请重新提交完整 `navigation_tree`。",
                 "",
@@ -300,7 +300,7 @@ class TopologyCognitionAgent(BaseReActAgent):
             validation_feedback = self._stage_context.get("validation_feedback")
             lines = [
                 "当前阶段：`navigation_incremental`。",
-                "请基于现有 `navigation_tree` 与 dirty file 结构变化，判断本次导航更新级别。",
+                "请基于现有 `navigation_tree` 与 dirty file 结构变化，判断本次导航更新级别，并保证任何受影响文件最终都只有唯一挂载。",
                 "可选决策只有：`no_change`、`module_update`、`area_rebuild`、`full_rebuild`。",
                 "如果当前 tree 规则已经足以覆盖本次新增/删除/迁移，直接输出 `no_change`。",
                 "如果只涉及少量模块挂载变更，输出 `module_update` 并给出基于当前 tree 最小修正后的完整 `navigation_tree`。",
@@ -326,7 +326,7 @@ class TopologyCognitionAgent(BaseReActAgent):
             validation_feedback = self._stage_context.get("validation_feedback")
             lines = [
                 "当前阶段：`navigation_incremental_repair`。",
-                "上一轮增量导航判定未通过校验，请基于现有 tree 做更保守、更小范围的修正。",
+                "上一轮增量导航判定未通过校验，请基于现有 tree 做更保守、更小范围的修正。若存在重复挂载，必须显式裁决冲突文件唯一归属。",
                 "优先保持当前 area/module 结构稳定，除非 facts 明确表明必须新增、删除或重建。",
                 "若现有 tree 已足以覆盖变化，请直接改判为 `no_change`。",
                 "若无法在局部修正下保持结构可信，应提升为 `area_rebuild` 或 `full_rebuild`。",

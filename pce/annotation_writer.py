@@ -3393,7 +3393,9 @@ def _build_navigation_repair_feedback(
     lines.extend([
         "优先按目录级边界修正 area/module；单文件 module 只在平铺结构且确有中心职责时保留。",
         "优先把遗漏文件吸收到已有目录模块或 area residual；仅在明显需要时新增少量 module。",
-        "若某个宽泛 include 与更精确的模块冲突，请保留精确模块，并给宽泛模块增加 exclude。",
+        "对每一个重复挂载文件，必须强行选择唯一 module 归属；不能保留模糊共存或双归属。",
+        "若某个宽泛 include 与更精确的模块冲突，请保留精确模块，并给宽泛模块增加 exclude，直到冲突文件只剩唯一归属。",
+        "若本轮仍有一批挂载不明朗的文件，请批量处理这些冲突文件的唯一归属，而不是回避或仅部分修正。",
         "修正后请重新提交完整 `navigation_tree`。",
     ])
     return "\n".join(lines)
