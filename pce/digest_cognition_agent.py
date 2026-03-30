@@ -25,6 +25,7 @@ from .base_agent import (
     _safe_json_dumps,
 )
 from .file_discovery import first_blocked_tool_path
+from .memory import load_file_baseline
 from .models import ChangedFileFact, InsightFact
 from .prompt_guard import fit_text_to_budget
 from .serena_client import SerenaClient
@@ -246,6 +247,12 @@ class FilterDecision:
 
 
 @dataclass
+class SharedToolBudget:
+    total: int
+    used: int = 0
+
+
+@dataclass
 class AssimilationResult:
     summary: str
 
@@ -261,8 +268,10 @@ class _DigestStageAgent(BaseReActAgent):
         facts_text: str,
         facts_truncated: bool,
         tool_budget: int,
+        shared_budget: SharedToolBudget | None,
         allow_serena: bool,
         allow_write_annotation: bool,
+        allow_read_annotation: bool = True,
         model: str | None = None,
         provider: str | None = None,
         max_seconds: float = _DEFAULT_MAX_SECONDS,
@@ -271,13 +280,15 @@ class _DigestStageAgent(BaseReActAgent):
         self._project_root = project_root.resolve()
         self._facts_text = facts_text.strip()
         self._facts_truncated = facts_truncated
-        self._tool_budget_total = tool_budget
-        self._tool_budget_used = 0
+        self._shared_budget = shared_budget
+        self._tool_budget_total = shared_budget.total if shared_budget is not None else tool_budget
+        self._tool_budget_used = shared_budget.used if shared_budget is not None else 0
         self._budget_exhausted_notified = False
         self._deliver_tool = DELIVER_TOOL
         self._virtual_tool_names_set: set[str] = set()
         self._allow_serena = allow_serena
         self._allow_write_annotation = allow_write_annotation
+        self._allow_read_annotation = allow_read_annotation
         self._annotation_paths = _iter_available_annotation_paths(self._project_root)
 
     def _budget_note(self) -> str:
@@ -288,6 +299,7 @@ class _DigestStageAgent(BaseReActAgent):
         )
 
     async def on_before_round(self, state: LoopState) -> None:
+        self._sync_budget_from_shared()
         if (
             self._tool_budget_total > 0
             and self._tool_budget_used >= self._tool_budget_total
@@ -297,6 +309,7 @@ class _DigestStageAgent(BaseReActAgent):
             self._budget_exhausted_notified = True
 
     def build_tools_schema(self, serena_client: SerenaClient, state: LoopState) -> list[dict[str, Any]]:
+        self._sync_budget_from_shared()
         tools: list[dict[str, Any]] = []
         if self._allow_serena and self._tool_budget_used < self._tool_budget_total:
             for schema in serena_client.tools_schema:
@@ -331,7 +344,7 @@ class _DigestStageAgent(BaseReActAgent):
             }
         result = await super()._invoke_serena(tool_call, serena_client, state=state)
         if tool_name in _ALLOWED_SERENA_TOOLS and self._tool_budget_used < self._tool_budget_total:
-            self._tool_budget_used += 1
+            self._consume_budget()
             result["content"] = str(result.get("content") or "") + self._budget_note()
         return result
 
@@ -362,7 +375,7 @@ class _DigestStageAgent(BaseReActAgent):
         lines = [
             "## 认知读取边界",
             "- `Readable Annotations` 中列出的 annotation 只能通过 `read_annotation` 访问。",
-            "- stageA 不允许读取代码，只允许读取 annotation。",
+            "- stageA/Stage2 默认不读代码；若允许读取 diff，只能通过受控 diff 工具访问。",
             "- stageB 可在预算内做少量代码探索，但 annotation 仍只能通过受控工具访问。",
             "- 若已注入 facts 足够，请不要为了完整性继续探索。",
         ]
@@ -379,19 +392,20 @@ class _DigestStageAgent(BaseReActAgent):
                     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
                 },
             })
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "read_annotation",
-                "description": "读取指定 annotation 文档。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                    "additionalProperties": False,
+        if self._allow_read_annotation:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "read_annotation",
+                    "description": "读取指定 annotation 文档。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
                 },
-            },
-        })
+            })
         if self._allow_write_annotation:
             tools.append({
                 "type": "function",
@@ -426,9 +440,12 @@ class _DigestStageAgent(BaseReActAgent):
         if name == "read_facts":
             return _ok(self._facts_text.replace(_FACTS_NOTICE, ""))
         if name == "read_annotation":
+            if not self._allow_read_annotation:
+                return _err("当前阶段不允许读取 annotation")
             path = str(args.get("path") or "").strip()
             if not _annotation_path_allowed(path):
                 return _err("annotation path 不合法")
+            self._consume_budget()
             return _ok(await _read_text_if_exists(self._project_root / _normalize_rel_path(path)))
         if name == "write_annotation":
             path = str(args.get("path") or "").strip()
@@ -447,6 +464,16 @@ class _DigestStageAgent(BaseReActAgent):
                 self._annotation_paths.append(path)
             return _ok(f"annotation 已写入: {path}")
         return await self._handle_stage_virtual_tool(name, args, _ok, _err)
+
+    def _sync_budget_from_shared(self) -> None:
+        if self._shared_budget is not None:
+            self._tool_budget_total = self._shared_budget.total
+            self._tool_budget_used = self._shared_budget.used
+
+    def _consume_budget(self, amount: int = 1) -> None:
+        self._tool_budget_used += amount
+        if self._shared_budget is not None:
+            self._shared_budget.used = self._tool_budget_used
 
     def build_no_tool_correction(self, state: LoopState, finish_reason: str) -> dict[str, Any]:
         return {"role": "user", "content": self._build_no_tool_prompt()}
@@ -481,6 +508,7 @@ class DigestFilterStageAgent(_DigestStageAgent):
         insights: list[InsightFact],
         facts_text: str,
         facts_truncated: bool,
+        shared_budget: SharedToolBudget | None = None,
         model: str | None = None,
         provider: str | None = None,
     ) -> None:
@@ -489,6 +517,7 @@ class DigestFilterStageAgent(_DigestStageAgent):
             facts_text=facts_text,
             facts_truncated=facts_truncated,
             tool_budget=_compute_filter_budget(len(insights)),
+            shared_budget=shared_budget,
             allow_serena=False,
             allow_write_annotation=False,
             model=model,
@@ -605,6 +634,247 @@ class DigestFilterStageAgent(_DigestStageAgent):
         return ok_builder("stageA 结果已接收")
 
 
+def _render_dirty_file(item: str) -> str:
+    return f"- `{item}`"
+
+
+def build_stale_check_facts_text(
+    *,
+    insights: list[InsightFact],
+    dirty_files: list[str],
+    model: str,
+) -> tuple[str, bool]:
+    lines = [
+        "以下是 digest stage2 直接注入的 facts。你的任务是判断 insight 是否因 dirty files 存在陈旧风险。",
+        "",
+        "## Insights",
+    ]
+    lines.extend(_render_insight(item) for item in insights)
+    lines.extend(["", "## Dirty Files"])
+    lines.extend([_render_dirty_file(item) for item in dirty_files] or ["- (none)"])
+    full = "\n".join(lines).strip()
+    fitted = fit_text_to_budget(
+        model,
+        full,
+        token_budget=32000,
+        notice=_FACTS_NOTICE,
+        min_chars=4000,
+    )
+    return fitted, fitted != full
+
+
+def _build_file_diff_excerpt(
+    *,
+    path: str,
+    old_content: str | None,
+    new_content: str | None,
+    max_lines: int = 50,
+) -> str:
+    import difflib
+
+    old_lines = (old_content or "").splitlines()
+    new_lines = (new_content or "").splitlines()
+    diff_lines = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+    )
+    if not diff_lines:
+        return f"### `{path}`\n```diff\n(no diff)\n```"
+    excerpt = diff_lines[:max_lines]
+    return f"### `{path}`\n```diff\n" + "\n".join(excerpt) + "\n```"
+
+
+class DigestStaleCheckStageAgent(_DigestStageAgent):
+    def __init__(
+        self,
+        *,
+        project_root: Path,
+        insights: list[InsightFact],
+        facts_text: str,
+        facts_truncated: bool,
+        dirty_files: list[str],
+        shared_budget: SharedToolBudget | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        super().__init__(
+            project_root=project_root,
+            facts_text=facts_text,
+            facts_truncated=facts_truncated,
+            tool_budget=_compute_filter_budget(len(insights)),
+            shared_budget=shared_budget,
+            allow_serena=False,
+            allow_write_annotation=False,
+            allow_read_annotation=False,
+            model=model,
+            provider=provider,
+        )
+        self._decision: FilterDecision | None = None
+        self._dirty_files = {str(item).strip() for item in dirty_files if str(item).strip()}
+
+    async def run(self, *, serena_client: SerenaClient, retry_feedback: str | None = None) -> FilterDecision:
+        messages = self._build_base_messages()
+        messages.append({
+            "role": "user",
+            "content": (
+                "当前是 digest stage2。请先判断哪些 insight 与哪些 dirty files 存在显著关联，"
+                "再按需读取少量 baseline diff，判断 insight 是否存在陈旧性风险。"
+                "最后提交 keep/drop 结果。不要读取 annotation，不要进入写入层级判断。"
+            ),
+        })
+        if retry_feedback:
+            messages.append({"role": "user", "content": retry_feedback})
+        summary, _ = await self.run_loop(messages, serena_client)
+        failure = _FAILURE_MESSAGES.get(summary)
+        if failure is not None:
+            raise RuntimeError(failure)
+        if self._decision is None:
+            raise RuntimeError("stage2 未提交筛选结果")
+        return self._decision
+
+    def _build_system_prompt(self) -> str:
+        return "\n".join(
+            [
+                "你是 PCE 的 DigestStaleCheckAgent，负责判断 insight 是否因 dirty files 存在陈旧风险。",
+                "",
+                "## 目标",
+                "- 先做 insight 与 dirty files 的显著关联绑定，不要强行绑定。",
+                "- 只对显著相关的 dirty files 读取 baseline diff。",
+                "- 若 insight 已明显陈旧且不再值得进入内化，直接 drop。",
+                "- 若 insight 仍有价值，即使存在一定陈旧风险，也可 keep 交给 stageB。",
+                "",
+                "## 约束",
+                "- 本阶段不读 annotation，不读代码全文，只允许读取受控 baseline diff。",
+                "- 工具预算与 stage1 共享，应优先最可能相关的 dirty files。",
+                "- 最终必须先调用 `deliver_stage_result`，再调用 `deliver(answer='stage done')`。",
+            ]
+        )
+
+    def _build_no_tool_prompt(self) -> str:
+        return (
+            "你刚才没有调用工具。若路径级信息已足够，请直接提交结果；"
+            "若确需判断陈旧风险，只能读取少量 dirty files 的 baseline diff。"
+        )
+
+    def _build_budget_exhausted_prompt(self) -> str:
+        return "stage2 工具预算已耗尽。请停止探索，直接提交当前最保守可用的筛选结果。"
+
+    async def on_deliver(self, args: dict[str, Any] | None, state: LoopState) -> DeliverDecision:
+        if self._decision is None:
+            return DeliverDecision.continue_with({
+                "role": "user",
+                "content": "你尚未调用 `deliver_stage_result`。请先提交 stage2 筛选结果，再 deliver。",
+            })
+        return DeliverDecision.finish(
+            _safe_json_dumps(
+                {
+                    "keep_insight_ids": self._decision.keep_insight_ids,
+                    "drop_insight_ids": self._decision.drop_insight_ids,
+                    "notes": self._decision.notes,
+                }
+            )
+        )
+
+    def _extra_virtual_tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file_diff",
+                    "description": "读取 dirty files 相对 PCE baseline 的 diff 摘要。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            }
+                        },
+                        "required": ["paths"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "deliver_stage_result",
+                    "description": "提交 stage2 的筛选结果。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "keep_insight_ids": {"type": "array", "items": {"type": "string"}},
+                            "drop_insight_ids": {"type": "array", "items": {"type": "string"}},
+                            "notes": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["keep_insight_ids", "drop_insight_ids"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    async def _handle_stage_virtual_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        ok_builder: Any,
+        err_builder: Any,
+    ) -> dict[str, Any]:
+        if name == "read_file_diff":
+            raw_paths = args.get("paths")
+            if not isinstance(raw_paths, list) or not all(isinstance(item, str) for item in raw_paths):
+                return err_builder("paths 必须是字符串数组")
+            normalized = []
+            for item in raw_paths[:10]:
+                path = _normalize_rel_path(item)
+                if path and path in self._dirty_files and path not in normalized:
+                    normalized.append(path)
+            if not normalized:
+                return err_builder("没有可读取的 dirty file diff")
+            self._consume_budget()
+            chunks: list[str] = []
+            for path in normalized:
+                baseline = await load_file_baseline(path, root_path=self._project_root)
+                old_content = baseline.content if baseline is not None else None
+                abs_path = self._project_root / path
+                if abs_path.exists():
+                    new_content = await _read_text_if_exists(abs_path)
+                else:
+                    new_content = None
+                chunks.append(
+                    _build_file_diff_excerpt(
+                        path=path,
+                        old_content=old_content,
+                        new_content=new_content,
+                        max_lines=50,
+                    )
+                )
+            return ok_builder("\n\n".join(chunks) + self._budget_note())
+        if name != "deliver_stage_result":
+            return err_builder(f"未知虚拟工具: {name}")
+        keep_ids = args.get("keep_insight_ids")
+        drop_ids = args.get("drop_insight_ids")
+        notes = args.get("notes") or []
+        if not isinstance(keep_ids, list) or not all(isinstance(item, str) for item in keep_ids):
+            return err_builder("keep_insight_ids 必须是字符串数组")
+        if not isinstance(drop_ids, list) or not all(isinstance(item, str) for item in drop_ids):
+            return err_builder("drop_insight_ids 必须是字符串数组")
+        if not isinstance(notes, list) or not all(isinstance(item, str) for item in notes):
+            return err_builder("notes 必须是字符串数组")
+        self._decision = FilterDecision(
+            keep_insight_ids=list(dict.fromkeys(item.strip() for item in keep_ids if item.strip())),
+            drop_insight_ids=list(dict.fromkeys(item.strip() for item in drop_ids if item.strip())),
+            notes=[item.strip() for item in notes if item.strip()],
+        )
+        return ok_builder("stage2 结果已接收")
+
+
 class DigestAssimilationStageAgent(_DigestStageAgent):
     def __init__(
         self,
@@ -621,6 +891,7 @@ class DigestAssimilationStageAgent(_DigestStageAgent):
             facts_text=facts_text,
             facts_truncated=facts_truncated,
             tool_budget=_compute_assimilation_budget(insight_count),
+            shared_budget=None,
             allow_serena=True,
             allow_write_annotation=True,
             model=model,
@@ -720,6 +991,7 @@ async def run_digest_filter(
     model: str | None,
     provider: str | None,
     serena_client: SerenaClient,
+    shared_budget: SharedToolBudget | None = None,
 ) -> FilterDecision:
     annotation_paths = _iter_available_annotation_paths(project_root)
     facts_text, truncated = build_filter_facts_text(
@@ -735,6 +1007,7 @@ async def run_digest_filter(
             insights=insights,
             facts_text=facts_text,
             facts_truncated=truncated,
+            shared_budget=shared_budget,
             model=model,
             provider=provider,
         )
@@ -747,6 +1020,48 @@ async def run_digest_filter(
             feedback = (
                 f"上一次 stageA 尝试失败（第 {attempt}/3 次）：{exc}\n"
                 "请修正工具调用或结果格式；若当前信息已足够，应直接提交筛选结果。"
+            )
+    assert last_exc is not None
+    raise last_exc
+
+
+async def run_digest_stale_check(
+    *,
+    project_root: Path,
+    insights: list[InsightFact],
+    dirty_files: list[str],
+    model: str | None,
+    provider: str | None,
+    serena_client: SerenaClient,
+    shared_budget: SharedToolBudget | None = None,
+) -> FilterDecision:
+    facts_text, truncated = build_stale_check_facts_text(
+        insights=insights,
+        dirty_files=dirty_files,
+        model=model or "gpt-4o-mini",
+    )
+    feedback: str | None = None
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        agent = DigestStaleCheckStageAgent(
+            project_root=project_root,
+            insights=insights,
+            facts_text=facts_text,
+            facts_truncated=truncated,
+            dirty_files=dirty_files,
+            shared_budget=shared_budget,
+            model=model,
+            provider=provider,
+        )
+        try:
+            return await agent.run(serena_client=serena_client, retry_feedback=feedback)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 3:
+                break
+            feedback = (
+                f"上一次 stage2 尝试失败（第 {attempt}/3 次）：{exc}\n"
+                "请修正工具调用或结果格式；若路径级事实已足够，应直接提交筛选结果。"
             )
     assert last_exc is not None
     raise last_exc

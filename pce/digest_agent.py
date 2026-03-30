@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .digest_cognition_agent import run_digest_assimilation, run_digest_filter
+from .digest_cognition_agent import (
+    SharedToolBudget,
+    run_digest_assimilation,
+    run_digest_filter,
+    run_digest_stale_check,
+)
 from .digest_delta_builder import DigestDeltaBuilder
 from .file_discovery import filter_visible_paths
 from .insight_cache import InsightCache
@@ -133,6 +138,7 @@ async def run_digest(
     pending_batches = 0
     for batch_index, batch in enumerate(_chunk_insights(insights), start=1):
         logger.info("Digest stageA start: batch=%d insights=%d", batch_index, len(batch.insights))
+        shared_budget = SharedToolBudget(total=max(3, min(50, len(batch.insights) * 3)))
         try:
             decision = await run_digest_filter(
                 project_root=project_root,
@@ -140,6 +146,7 @@ async def run_digest(
                 model=model,
                 provider=provider,
                 serena_client=serena_client,
+                shared_budget=shared_budget,
             )
         except Exception as exc:
             pending_batches += 1
@@ -163,6 +170,39 @@ async def run_digest(
             resolved_batches += 1
             notes = "；".join(decision.notes) if decision.notes else "全部筛除"
             summaries.append(f"[batch:{batch_index}] stageA complete: {notes}")
+            continue
+
+        logger.info("Digest stage2 start: batch=%d insights=%d", batch_index, len(kept_insights))
+        try:
+            stale_decision = await run_digest_stale_check(
+                project_root=project_root,
+                insights=kept_insights,
+                dirty_files=dirty_files,
+                model=model,
+                provider=provider,
+                serena_client=serena_client,
+                shared_budget=shared_budget,
+            )
+        except Exception as exc:
+            pending_batches += 1
+            warnings.append(f"Digest stage2 失败: batch={batch_index}: {exc}")
+            continue
+
+        stale_drop_ids = [item for item in stale_decision.drop_insight_ids if item in keep_ids]
+        stale_keep_ids = [item for item in stale_decision.keep_insight_ids if item in keep_ids and item not in stale_drop_ids]
+        stale_unresolved_ids = [item for item in keep_ids if item not in stale_drop_ids and item not in stale_keep_ids]
+        stale_drop_ids.extend(stale_unresolved_ids)
+        stale_drop_ids = list(dict.fromkeys(stale_drop_ids))
+        kept_insights = [item for item in kept_insights if item.id in stale_keep_ids]
+
+        if stale_drop_ids:
+            await insight_cache.delete_by_ids(stale_drop_ids)
+            deleted_insight_ids.extend(stale_drop_ids)
+
+        if not kept_insights:
+            resolved_batches += 1
+            notes = "；".join(stale_decision.notes) if stale_decision.notes else "stage2 全部筛除"
+            summaries.append(f"[batch:{batch_index}] stage2 complete: {notes}")
             continue
 
         logger.info("Digest stageB start: batch=%d insights=%d", batch_index, len(kept_insights))
