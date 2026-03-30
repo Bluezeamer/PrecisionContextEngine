@@ -1890,83 +1890,6 @@ def _rewrite_coverage_section(content: str, file_paths: list[str], module_name: 
     return "\n".join(rendered).rstrip() + "\n"
 
 
-async def _patch_module_coverage_sections(
-    module_specs: list[tuple[str, str, list[IndexEntry]]],
-    modules_dir: Path,
-) -> None:
-    for module_name, slug, module_entries in module_specs:
-        module_path = modules_dir / f"{slug}.md"
-        file_paths = [str(entry.file_meta.path) for entry in module_entries]
-        try:
-            existing = await asyncio.to_thread(module_path.read_text, "utf-8")
-        except FileNotFoundError:
-            existing = _build_fallback_module_md(module_name, module_entries)
-        updated = _rewrite_coverage_section(existing, file_paths, module_name)
-        await _atomic_write_text(module_path, updated)
-
-
-async def _classify_incremental_annotation_scope(
-    *,
-    root_path: Path,
-    changed_files: list[str],
-    deleted_files: list[str],
-    current_map: dict[str, Any],
-    historical_map: dict[str, Any],
-) -> str:
-    if changed_files and not deleted_files:
-        all_module_like = True
-        for rel_path in changed_files:
-            if current_map.get(rel_path) is None:
-                all_module_like = False
-                break
-            baseline = await load_file_baseline(rel_path, root_path=root_path)
-            if baseline is None:
-                all_module_like = False
-                break
-        if all_module_like:
-            return "module"
-
-    if changed_files and deleted_files:
-        created_items: list[tuple[str, str | None, str | None]] = []
-        deleted_items: list[tuple[str, str | None, str | None]] = []
-
-        for rel_path in changed_files:
-            baseline = await load_file_baseline(rel_path, root_path=root_path)
-            if baseline is not None:
-                return "agent_decide"
-            owner = current_map.get(rel_path)
-            current_hash = await _compute_file_hash(root_path / rel_path)
-            created_items.append((rel_path, getattr(owner, "module_id", None), current_hash))
-
-        for rel_path in deleted_files:
-            baseline = await load_file_baseline(rel_path, root_path=root_path)
-            owner = current_map.get(rel_path) or historical_map.get(rel_path)
-            deleted_items.append((rel_path, getattr(owner, "module_id", None), baseline.content_hash if baseline else None))
-
-        remaining_deleted = list(deleted_items)
-        matched = 0
-        for _, owner_id, new_hash in created_items:
-            match_idx = next(
-                (
-                    idx
-                    for idx, (_, deleted_owner_id, old_hash) in enumerate(remaining_deleted)
-                    if new_hash
-                    and old_hash
-                    and new_hash == old_hash
-                    and (owner_id is None or deleted_owner_id is None or owner_id == deleted_owner_id)
-                ),
-                None,
-            )
-            if match_idx is None:
-                return "agent_decide"
-            matched += 1
-            remaining_deleted.pop(match_idx)
-        if matched == len(created_items) and not remaining_deleted:
-            return "route"
-
-    return "agent_decide"
-
-
 # ============================================================================
 # index.md 解析与增量更新辅助
 # ============================================================================
@@ -4962,6 +4885,287 @@ async def refresh_navigation_from_snapshot(
     return {"areas": len(stable_tree.areas), "modules": len(module_specs)}
 
 
+def _path_exists_in_baseline(root_path: Path, rel_path: str) -> bool:
+    baseline_path = root_path / ".pce" / "baselines" / "files" / f"{rel_path}.json"
+    return baseline_path.exists()
+
+
+def _matches_module_rules(path: str, module: ModuleNavRecord) -> bool:
+    resolved_paths, _ = _expand_module_path_rules(module, {path})
+    if resolved_paths:
+        return True
+    if module.module_type == "directory":
+        return any(_path_matches_prefix(path, root) for root in _directory_roots_for_module(module))
+    return False
+
+
+def _assign_deleted_path_to_tree(
+    tree: NavigationTree,
+    rel_path: str,
+) -> str | None:
+    matched_modules: list[ModuleNavRecord] = []
+    fallback_residual: ModuleNavRecord | None = None
+    for area in tree.areas:
+        residual_module = next((module for module in area.modules if module.module_type == "residual"), None)
+        for module in area.modules:
+            if module.module_type == "residual":
+                continue
+            if _matches_module_rules(rel_path, module):
+                matched_modules.append(module)
+        if area.is_fallback and residual_module is not None:
+            fallback_residual = residual_module
+
+    unique = _dedupe_keep_order([module.slug for module in matched_modules])
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 1:
+        ranked = sorted(
+            matched_modules,
+            key=lambda module: _path_specificity(rel_path, module),
+            reverse=True,
+        )
+        if len(ranked) == 1 or _path_specificity(rel_path, ranked[0]) > _path_specificity(rel_path, ranked[1]):
+            return ranked[0].slug
+        return None
+
+    for area in tree.areas:
+        if area.is_fallback:
+            continue
+        if not any(_path_matches_prefix(rel_path, prefix) for prefix in area.source_prefixes):
+            continue
+        residual_module = next((module for module in area.modules if module.module_type == "residual"), None)
+        if residual_module is not None:
+            return residual_module.slug
+
+    return fallback_residual.slug if fallback_residual is not None else None
+
+
+def _collect_empty_module_slugs(
+    tree: NavigationTree,
+    assignment: dict[str, Any],
+) -> list[str]:
+    module_paths = assignment.get("module_paths") or {}
+    empty_slugs: list[str] = []
+    for area in tree.areas:
+        for module in area.modules:
+            if module_paths.get(module.slug):
+                continue
+            empty_slugs.append(module.slug)
+    return sorted(_dedupe_keep_order(empty_slugs))
+
+
+def _build_incremental_navigation_facts(
+    *,
+    root_path: Path,
+    tree: NavigationTree,
+    entries_map: dict[str, IndexEntry],
+    changed_files: list[str],
+    deleted_files: list[str],
+) -> dict[str, Any]:
+    assignment = _assign_navigation_tree_paths(tree, entries_map)
+    created_files = [
+        path for path in changed_files
+        if path in entries_map and not _path_exists_in_baseline(root_path, path)
+    ]
+    modified_files = [path for path in changed_files if path not in created_files]
+
+    created_covered = sorted(path for path in created_files if assignment["path_owner"].get(path))
+    created_uncovered = sorted(path for path in created_files if not assignment["path_owner"].get(path))
+
+    deleted_assignments: list[dict[str, Any]] = []
+    for path in deleted_files:
+        deleted_assignments.append({
+            "path": path,
+            "owner_slug": _assign_deleted_path_to_tree(tree, path),
+        })
+
+    impacted_module_slugs = sorted(_dedupe_keep_order([
+        *[str(assignment["path_owner"].get(path) or "").strip() for path in created_covered],
+        *[str(item.get("owner_slug") or "").strip() for item in deleted_assignments],
+    ]))
+    impacted_module_slugs = [slug for slug in impacted_module_slugs if slug]
+    impacted_area_slugs = sorted(_dedupe_keep_order([
+        area.slug
+        for area in tree.areas
+        if any(module.slug in impacted_module_slugs for module in area.modules)
+    ]))
+
+    structural_paths = _dedupe_keep_order([*created_files, *deleted_files])
+    structural_tree = _build_topology_missing_paths_tree(
+        [path for path in structural_paths if path in entries_map],
+        entries_map,
+    )
+
+    return {
+        "current_navigation_tree": tree.model_dump(mode="json"),
+        "structural_changes": {
+            "created_files": created_files,
+            "modified_files": modified_files,
+            "deleted_files": deleted_files,
+            "created_covered": created_covered,
+            "created_uncovered": created_uncovered,
+            "deleted_assignments": deleted_assignments,
+            "impacted_module_slugs": impacted_module_slugs,
+            "impacted_area_slugs": impacted_area_slugs,
+            "structural_tree": structural_tree,
+        },
+        "validation_feedback": {
+            "unassigned_paths": list(assignment["unassigned_paths"]),
+            "duplicate_paths": list(assignment["duplicate_paths"]),
+            "duplicate_details": list(assignment["duplicate_details"]),
+            "invalid_paths": list(assignment["invalid_paths"]),
+            "area_residuals": list(assignment["area_residuals"]),
+            "too_many_file_centered_modules": list(assignment["too_many_file_centered_modules"]),
+            "empty_module_slugs": _collect_empty_module_slugs(tree, assignment),
+        },
+    }
+
+
+def _coerce_incremental_navigation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    decision = str(payload.get("decision") or "").strip()
+    if decision not in {"no_change", "module_update", "area_rebuild", "full_rebuild"}:
+        raise ValueError("decision 必须是 no_change/module_update/area_rebuild/full_rebuild")
+    rationale = " ".join(str(payload.get("rationale") or "").split())
+    navigation_tree = payload.get("navigation_tree")
+    return {
+        "decision": decision,
+        "rationale": rationale,
+        "navigation_tree": navigation_tree,
+    }
+
+
+async def _run_incremental_navigation_update(
+    *,
+    entries: list[IndexEntry],
+    project_meta: ProjectMeta,
+    root_path: Path,
+    tree: NavigationTree,
+    changed_files: list[str],
+    deleted_files: list[str],
+    model: str | None,
+    serena_client: SerenaClient,
+) -> dict[str, Any]:
+    del project_meta
+    entries_map = {str(entry.file_meta.path): entry for entry in entries}
+    facts = _build_incremental_navigation_facts(
+        root_path=root_path,
+        tree=tree,
+        entries_map=entries_map,
+        changed_files=changed_files,
+        deleted_files=deleted_files,
+    )
+
+    if not facts["structural_changes"]["created_files"] and not facts["structural_changes"]["deleted_files"]:
+        return {"decision": "no_change", "rationale": "only_content_changes"}
+    if (
+        facts["structural_changes"]["created_files"]
+        and not facts["structural_changes"]["created_uncovered"]
+        and not deleted_files
+    ):
+        return {"decision": "no_change", "rationale": "created_files_already_covered"}
+
+    agent = TopologyCognitionAgent(
+        project_root=root_path,
+        discovery_facts=facts,
+        model=model,
+    )
+    messages = agent.build_initial_messages()
+    payload: dict[str, Any] | None = None
+    last_exc: Exception | None = None
+    max_attempts = 3
+
+    for attempt in range(1, max_attempts + 1):
+        stage_name = "navigation_incremental" if attempt == 1 else "navigation_incremental_repair"
+        try:
+            raw_payload = await agent.run_stage(
+                stage=stage_name,
+                messages=messages,
+                serena_client=serena_client,
+                stage_context=facts,
+            )
+            payload = _coerce_incremental_navigation_payload(raw_payload)
+            if payload["decision"] == "no_change":
+                return payload
+            if payload["decision"] == "full_rebuild":
+                return payload
+            tree_payload = payload.get("navigation_tree")
+            if not isinstance(tree_payload, dict):
+                raise ValueError("decision 不是 no_change/full_rebuild 时必须提供 navigation_tree")
+            candidate_tree = _coerce_topology_navigation_tree(
+                tree_payload,
+                facts={"source_digest": "topology-incremental"},
+                active_slugs=None,
+            )
+            candidate_tree = _normalize_navigation_tree_module_slugs(candidate_tree)
+            _assert_navigation_tree_not_fallback_only(candidate_tree)
+            payload_issues = _collect_navigation_payload_issues(candidate_tree, entries_map)
+            if (
+                payload_issues["unassigned_paths"]
+                or payload_issues["duplicate_paths"]
+                or payload_issues["invalid_paths"]
+            ):
+                raise ValueError(_build_navigation_repair_feedback(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    issues=payload_issues,
+                ))
+            payload["navigation_tree"] = candidate_tree
+            return payload
+        except Exception as exc:
+            last_exc = exc
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"上一次增量导航判定未通过（第 {attempt}/{max_attempts} 次）。"
+                    f"错误：{_format_exception_brief(exc)}\n"
+                    "请保持当前 tree 稳定，只做更小范围修正；若局部修正不可信，请直接提升为 area_rebuild 或 full_rebuild。"
+                ),
+            })
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _build_sections_from_tree_preserving_existing(
+    *,
+    root_path: Path,
+    tree: NavigationTree,
+    entries_map: dict[str, IndexEntry],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[IndexEntry]]], set[str]]:
+    raw_sections = _build_sections_from_navigation_tree(tree, entries_map)
+    recovered_sections = {
+        section["slug"]: section
+        for section in await _load_sections_from_existing_module_docs(root_path)
+    }
+    merged_sections: list[dict[str, Any]] = []
+    new_slugs: set[str] = set()
+
+    for raw_section in raw_sections:
+        slug = raw_section["slug"]
+        existing = recovered_sections.get(slug)
+        if existing is None:
+            section = {
+                "name": raw_section["name"],
+                "slug": slug,
+                "file_paths": list(raw_section.get("file_paths", [])),
+                "body_lines": list(raw_section.get("body_lines", [])),
+            }
+            new_slugs.add(slug)
+        else:
+            section = {
+                "name": existing.get("name", raw_section["name"]),
+                "slug": slug,
+                "file_paths": list(existing.get("file_paths", [])),
+                "body_lines": list(existing.get("body_lines", [])),
+            }
+            section["name"] = raw_section["name"]
+            _update_section_file_list(section, list(raw_section.get("file_paths", [])))
+            _update_section_module_link(section, slug=slug)
+        merged_sections.append(section)
+
+    valid_sections, module_specs = _prepare_module_specs(merged_sections, entries_map)
+    return valid_sections, module_specs, new_slugs
+
+
 async def _update_annotations_incremental(
     entries: list[IndexEntry],
     project_meta: ProjectMeta,
@@ -4974,16 +5178,16 @@ async def _update_annotations_incremental(
 ) -> None:
     """增量更新树状导航。
 
-    两档策略：
-    - 小改动（ownership 完整 + 受影响模块 ≤3）：局部重写模块文档 + 重渲染导航入口
-    - 其余情况：降级为全量 _write_annotations()
+    新链路：
+    - 仅内容变化：跳过导航更新
+    - 结构变化：交给轻量 navigation agent 判断
+    - `no_change`：不动导航层
+    - `module_update` / `area_rebuild`：提交完整 tree 快照，仅重渲染导航层；modules 正文尽量保留
+    - `full_rebuild`：回落到全量 topology 链路
     """
-    index_path = _annotation_index_path(root_path)
-    areas_dir = _annotation_areas_dir(root_path)
     modules_dir = _annotation_modules_dir(root_path)
     entries_map = {str(e.file_meta.path): e for e in entries}
 
-    # 读取现有 navigation_tree.json
     tree_path = _navigation_tree_path(root_path)
     try:
         raw_tree = await asyncio.to_thread(tree_path.read_text, "utf-8")
@@ -5018,40 +5222,35 @@ async def _update_annotations_incremental(
         )
         return
 
-    # 从 module_registry 确定 ownership（不再从 index.md 反查）
-    manager = ModuleRegistryManager(root_path)
-    registry, current_map, historical_map = (
-        await manager.build_file_owner_maps()
-    )
+    if serena_client is None:
+        logger.info("增量导航缺少 serena_client，降级为全量认知文档重建")
+        await _write_annotations(
+            entries,
+            project_meta,
+            root_path,
+            model=model,
+            serena_client=serena_client,
+        )
+        return
 
-    scope_hint = await _classify_incremental_annotation_scope(
+    decision_payload = await _run_incremental_navigation_update(
+        entries=entries,
+        project_meta=project_meta,
         root_path=root_path,
+        tree=tree,
         changed_files=changed_files,
         deleted_files=deleted_files,
-        current_map=current_map,
-        historical_map=historical_map,
+        model=model,
+        serena_client=serena_client,
     )
 
-    affected_slugs: set[str] = set()
-    force_full = False
+    decision = str(decision_payload.get("decision") or "").strip()
+    if decision == "no_change":
+        logger.info("增量导航判定: no_change，跳过导航层更新")
+        return
 
-    for fp in changed_files:
-        owner = current_map.get(fp)
-        if owner is None:
-            force_full = True
-            break
-        affected_slugs.add(owner.slug)
-
-    if not force_full:
-        for fp in deleted_files:
-            owner = current_map.get(fp) or historical_map.get(fp)
-            if owner is None:
-                force_full = True
-                break
-            affected_slugs.add(owner.slug)
-
-    if force_full:
-        logger.info("增量 ownership 不完整，降级为全量认知文档重建")
+    if decision == "full_rebuild":
+        logger.info("增量导航判定: full_rebuild，降级为全量认知文档重建")
         await _write_annotations(
             entries,
             project_meta,
@@ -5061,160 +5260,46 @@ async def _update_annotations_incremental(
         )
         return
 
-    if not affected_slugs:
-        logger.info("认知导航无受影响模块，跳过 annotations 增量更新")
-        return
+    candidate_tree = decision_payload.get("navigation_tree")
+    if not isinstance(candidate_tree, NavigationTree):
+        raise RuntimeError("增量导航更新缺少有效 navigation_tree")
 
-    # 变更范围过大时降级为全量重建
-    if len(affected_slugs) > 3:
-        logger.info(
-            "受影响模块数 %d 超出局部重渲染阈值，降级为全量认知文档重建",
-            len(affected_slugs),
-        )
-        await _write_annotations(
-            entries,
-            project_meta,
-            root_path,
-            model=model,
-            serena_client=serena_client,
-        )
-        return
-
-    # 局部更新路径：重写受影响模块文档 + 重渲染导航入口
-    recovered_sections = {
-        s["slug"]: s
-        for s in await _load_sections_from_existing_module_docs(root_path)
-    }
-    active_records = [
-        r for r in registry.records.values() if r.status == "active"
-    ]
-    sections: list[dict[str, Any]] = []
-    for record in active_records:
-        file_paths = [
-            p for p in _dedupe_keep_order(record.file_paths)
-            if p in entries_map
-        ]
-        if not file_paths:
-            continue
-        section = recovered_sections.get(record.slug) or {
-            "name": record.display_name,
-            "slug": record.slug,
-            "file_paths": [],
-            "body_lines": [
-                f"详细认知：.pce/annotations/modules/{record.slug}.md",
-            ],
-        }
-        section["name"] = record.display_name
-        _update_section_file_list(section, file_paths)
-        _update_section_module_link(section, slug=record.slug)
-        sections.append(section)
-
-    sections = _dedupe_sections_by_slug(sections)
-    valid_sections, module_specs = _prepare_module_specs(sections, entries_map)
-    specs_by_slug = {
-        slug: (name, slug, me) for name, slug, me in module_specs
-    }
-
-    # 只重写受影响的模块文档（或最小化更新覆盖文件）
-    affected_specs = [
-        specs_by_slug[slug]
-        for slug in sorted(affected_slugs)
-        if slug in specs_by_slug
-    ]
-    if not affected_specs:
-        logger.info("受影响模块无可写入规格，降级为全量认知文档重建")
-        await _write_annotations(
-            entries,
-            project_meta,
-            root_path,
-            model=model,
-            serena_client=serena_client,
-        )
-        return
-
-    if scope_hint == "module":
-        await _write_module_files(affected_specs, modules_dir, model)
-        logger.info("annotations 增量预判: module，仅重写受影响模块文档")
-        return
-
-    if scope_hint == "route":
-        await _patch_module_coverage_sections(affected_specs, modules_dir)
-        logger.info("annotations 增量预判: route，仅更新覆盖文件并重渲染导航层")
-    else:
-        await _write_module_files(affected_specs, modules_dir, model)
-        logger.info("annotations 增量预判: agent_decide，沿用当前模块重写 + 导航重渲染路径")
-
-    # 修复并重渲染导航树
+    valid_sections, module_specs, new_slugs = await _build_sections_from_tree_preserving_existing(
+        root_path=root_path,
+        tree=candidate_tree,
+        entries_map=entries_map,
+    )
+    sections_by_slug = {section["slug"]: section for section in valid_sections}
     active_slugs = {slug for _, slug, _ in module_specs}
-    tree = _repair_navigation_tree(
-        tree.model_copy(update={
+    stable_tree = _repair_navigation_tree(
+        candidate_tree.model_copy(update={
             "generated_at": datetime.now(UTC),
             "source_digest": _compute_source_digest(valid_sections),
         }),
         active_slugs,
     )
-    tree_errors = _validate_navigation_tree(tree, active_slugs)
+    stable_tree = _sync_tree_modules_from_sections(stable_tree, sections_by_slug)
+    _assert_navigation_tree_not_fallback_only(stable_tree)
+    tree_errors = _validate_navigation_tree(stable_tree, active_slugs)
     if tree_errors:
-        logger.info(
-            "现有导航树不再可信，降级为全量认知文档重建: %s",
-            " | ".join(tree_errors),
-        )
-        await _write_annotations(
-            entries,
-            project_meta,
-            root_path,
-            model=model,
-            serena_client=serena_client,
-        )
-        return
-
-    injected_sections = _inject_section_summaries_from_cognition(
-        valid_sections,
-        ModuleCognitionFacts(),
+        raise RuntimeError("增量导航产物校验失败: " + " | ".join(tree_errors))
+    await _write_empty_module_skeletons(
+        [spec for spec in module_specs if spec[1] in new_slugs],
+        modules_dir,
     )
-    sections_by_slug = {s["slug"]: s for s in injected_sections}
-    enriched_tree = _enrich_tree_summaries_with_cognition(
-        tree,
+    await _persist_annotation_outputs(
+        root_path=root_path,
+        tree=stable_tree,
         sections_by_slug=sections_by_slug,
-        cognition_facts=ModuleCognitionFacts(),
+        module_specs=module_specs,
     )
-    await _atomic_write_text(
-        index_path,
-        _render_hierarchical_index_md(enriched_tree, sections_by_slug),
-    )
-    areas_dir.mkdir(parents=True, exist_ok=True)
-    for area in enriched_tree.areas:
-        await _atomic_write_text(
-            areas_dir / f"{area.slug}.md",
-            _render_area_md(area, sections_by_slug),
-        )
-    await _atomic_write_text(
-        tree_path,
-        json.dumps(
-            enriched_tree.model_dump(mode="json"), ensure_ascii=False, indent=2
-        )
-        + "\n",
-    )
-    await _persist_navigation_area_cache(root_path, enriched_tree)
-    await _cleanup_stale_area_docs(areas_dir, {a.slug for a in enriched_tree.areas})
-
-    expected_files: set[Path] = {
-        Path(ANNOTATIONS_INDEX_FILE),
-        Path(NAVIGATION_TREE_FILE),
-    }
-    expected_files.update(
-        Path(ANNOTATIONS_MODULES_DIR) / f"{slug}.md"
-        for _, slug, _ in module_specs
-    )
-    expected_files.update(
-        Path(ANNOTATIONS_AREAS_DIR) / f"{a.slug}.md" for a in tree.areas
-    )
-    await _cleanup_stale_annotation_docs(root_path, expected_files)
 
     logger.info(
-        "认知导航增量更新完成: %d 个模块重建, %d 个区域重渲染",
-        len(affected_specs),
-        len(tree.areas),
+        "认知导航增量更新完成: decision=%s areas=%d modules=%d new_modules=%d",
+        decision,
+        len(stable_tree.areas),
+        len(module_specs),
+        len(new_slugs),
     )
 
 

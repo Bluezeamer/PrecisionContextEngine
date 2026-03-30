@@ -27,6 +27,8 @@ from .base_agent import (
 )
 from .init_cognition_limits import (
     PCEIGNORE_STAGE_TOOL_BUDGET,
+    TOPOLOGY_INCREMENTAL_REPAIR_STAGE_TOOL_BUDGET,
+    TOPOLOGY_INCREMENTAL_STAGE_TOOL_BUDGET,
     TOPOLOGY_NAVIGATION_STAGE_TOOL_BUDGET,
     TOPOLOGY_REPAIR_STAGE_TOOL_BUDGET,
 )
@@ -43,6 +45,8 @@ _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE: dict[str, frozenset[str]] = {
     "pceignore_refresh": frozenset({"read_file", "search_for_pattern"}),
     "navigation_tree": frozenset({"find_file", "get_symbols_overview", "read_file"}),
     "navigation_repair": frozenset({"find_file"}),
+    "navigation_incremental": frozenset({"find_file", "get_symbols_overview", "read_file"}),
+    "navigation_incremental_repair": frozenset({"find_file"}),
     "write_area_modules": frozenset({"search_for_pattern", "find_file", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "read_file"}),
 }
 _REACT_FAILURE_MESSAGES: dict[str, str] = {
@@ -112,7 +116,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         self._active_stage = stage
         self._stage_payload = None
         self._stage_context = dict(stage_context or {})
-        if stage not in {"write_area_modules", "navigation_repair"}:
+        if stage not in {"write_area_modules", "navigation_repair", "navigation_incremental", "navigation_incremental_repair"}:
             self._stage_context = {}
         if stage in {"pceignore", "pceignore_refresh"}:
             self._stage_tool_budget_total = PCEIGNORE_STAGE_TOOL_BUDGET
@@ -124,6 +128,14 @@ class TopologyCognitionAgent(BaseReActAgent):
             self._stage_budget_exhausted_notified = False
         elif stage == "navigation_repair":
             self._stage_tool_budget_total = TOPOLOGY_REPAIR_STAGE_TOOL_BUDGET
+            self._stage_tool_budget_used = 0
+            self._stage_budget_exhausted_notified = False
+        elif stage == "navigation_incremental":
+            self._stage_tool_budget_total = TOPOLOGY_INCREMENTAL_STAGE_TOOL_BUDGET
+            self._stage_tool_budget_used = 0
+            self._stage_budget_exhausted_notified = False
+        elif stage == "navigation_incremental_repair":
+            self._stage_tool_budget_total = TOPOLOGY_INCREMENTAL_REPAIR_STAGE_TOOL_BUDGET
             self._stage_tool_budget_used = 0
             self._stage_budget_exhausted_notified = False
         else:
@@ -175,6 +187,8 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- `pceignore_refresh` 输出 `{action, ignore_patterns, rationale}`，其中 `action` 只能是 `no_update` 或 `append_patterns`。",
                 "- stage2 输出 `navigation_tree`：直接给出 project -> areas -> modules 的完整导航树。",
                 "- `navigation_repair` 阶段也输出完整 `navigation_tree`，但目标是基于现有结构补齐遗漏与修正错误挂载。",
+                "- `navigation_incremental` 阶段用于 dirty file 触发后的增量导航判定，可输出 `no_change`、`module_update`、`area_rebuild` 或 `full_rebuild`。",
+                "- `navigation_incremental_repair` 阶段也输出增量导航判定，但必须基于现有 tree 做更保守、更小范围的修正。",
                 "- stage3 不再输出大 JSON；而是直接调用 `write_module_annotation` 写当前 area 下的模块文档。",
                 "- 当当前 area 全部处理完后，调用 `mark_area_done`，再调用 `deliver(answer='stage done')`。",
                 "",
@@ -198,6 +212,13 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "- 恰好 1 个 fallback area；每个文件只能归属一个 module；每个 module 只能归属一个 area。",
                 "- `include` / `exclude` 只能引用当前注入 `files_tree` 可覆盖的候选路径，不要编造索引外文件。",
                 "- 不要单独输出 module_catalog，也不要把目录名机械等同于 area/module。",
+                "",
+                "## navigation_incremental payload 要求",
+                "- 字段：`decision`, `rationale`。",
+                "- `decision` 只能是 `no_change`、`module_update`、`area_rebuild`、`full_rebuild`。",
+                "- 若 `decision` 不是 `no_change`，必须额外提供完整 `navigation_tree` 字段。",
+                "- `rationale` 只需简短说明本次为何属于该级别结构变化。",
+                "- 增量阶段只处理挂载与导航，不主动改动模块认知正文。",
                 "",
                 "## write_module_annotation 约束",
                 "- 只能写当前 area 下被明确分配的 module slug。",
@@ -272,6 +293,55 @@ class TopologyCognitionAgent(BaseReActAgent):
                 "先调用 `deliver_stage_result(stage='navigation_repair', payload=...)`，再调用 `deliver(answer='stage done')`。",
             ]
             return "\n".join(lines)
+        if stage == "navigation_incremental":
+            current_tree = self._stage_context.get("current_navigation_tree")
+            structural_changes = self._stage_context.get("structural_changes")
+            validation_feedback = self._stage_context.get("validation_feedback")
+            lines = [
+                "当前阶段：`navigation_incremental`。",
+                "请基于现有 `navigation_tree` 与 dirty file 结构变化，判断本次导航更新级别。",
+                "可选决策只有：`no_change`、`module_update`、`area_rebuild`、`full_rebuild`。",
+                "如果当前 tree 规则已经足以覆盖本次新增/删除/迁移，直接输出 `no_change`。",
+                "如果只涉及少量模块挂载变更，输出 `module_update` 并给出基于当前 tree 最小修正后的完整 `navigation_tree`。",
+                "如果变化已经上升到 area 级别，输出 `area_rebuild` 并给出完整 `navigation_tree`。",
+                "如果现有 tree 已整体不可信，输出 `full_rebuild`；此时可以不提交新 tree。",
+                "本阶段目标是修正挂载与导航，不要主动重写模块认知正文。",
+                "",
+                "## current_navigation_tree",
+                json.dumps(current_tree, ensure_ascii=False, indent=2),
+                "",
+                "## structural_changes",
+                json.dumps(structural_changes, ensure_ascii=False, indent=2),
+                "",
+                "## validation_feedback",
+                json.dumps(validation_feedback, ensure_ascii=False, indent=2),
+                "",
+                "先调用 `deliver_stage_result(stage='navigation_incremental', payload=...)`，再调用 `deliver(answer='stage done')`。",
+            ]
+            return "\n".join(lines)
+        if stage == "navigation_incremental_repair":
+            current_tree = self._stage_context.get("current_navigation_tree")
+            structural_changes = self._stage_context.get("structural_changes")
+            validation_feedback = self._stage_context.get("validation_feedback")
+            lines = [
+                "当前阶段：`navigation_incremental_repair`。",
+                "上一轮增量导航判定未通过校验，请基于现有 tree 做更保守、更小范围的修正。",
+                "优先保持当前 area/module 结构稳定，除非 facts 明确表明必须新增、删除或重建。",
+                "若现有 tree 已足以覆盖变化，请直接改判为 `no_change`。",
+                "若无法在局部修正下保持结构可信，应提升为 `area_rebuild` 或 `full_rebuild`。",
+                "",
+                "## current_navigation_tree",
+                json.dumps(current_tree, ensure_ascii=False, indent=2),
+                "",
+                "## structural_changes",
+                json.dumps(structural_changes, ensure_ascii=False, indent=2),
+                "",
+                "## validation_feedback",
+                json.dumps(validation_feedback, ensure_ascii=False, indent=2),
+                "",
+                "先调用 `deliver_stage_result(stage='navigation_incremental_repair', payload=...)`，再调用 `deliver(answer='stage done')`。",
+            ]
+            return "\n".join(lines)
         if stage == "write_area_modules":
             area_slug = str(self._stage_context.get("area_slug") or "").strip()
             area_name = str(self._stage_context.get("area_display_name") or "").strip()
@@ -335,7 +405,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         self, state: LoopState, finish_reason: str
     ) -> dict[str, Any]:
         current_stage = self._active_stage or "unknown"
-        if current_stage in {"navigation_tree", "navigation_repair", "pceignore", "pceignore_refresh"}:
+        if current_stage in {"navigation_tree", "navigation_repair", "navigation_incremental", "navigation_incremental_repair", "pceignore", "pceignore_refresh"}:
             return {
                 "role": "user",
                 "content": (
@@ -354,7 +424,7 @@ class TopologyCognitionAgent(BaseReActAgent):
 
     async def on_before_round(self, state: LoopState) -> None:
         if (
-            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"}
+            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair", "navigation_incremental", "navigation_incremental_repair"}
             and self._stage_tool_budget_total > 0
             and self._stage_tool_budget_used >= self._stage_tool_budget_total
             and not self._stage_budget_exhausted_notified
@@ -370,7 +440,7 @@ class TopologyCognitionAgent(BaseReActAgent):
             self._stage_budget_exhausted_notified = True
 
     def _stage_budget_note(self) -> str:
-        if self._active_stage not in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"} or self._stage_tool_budget_total <= 0:
+        if self._active_stage not in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair", "navigation_incremental", "navigation_incremental_repair"} or self._stage_tool_budget_total <= 0:
             return ""
         remaining = max(0, self._stage_tool_budget_total - self._stage_tool_budget_used)
         return (
@@ -536,8 +606,8 @@ class TopologyCognitionAgent(BaseReActAgent):
             return _ok(self._render_tree_snapshot(root, max_depth=max_depth, max_lines=max_lines) + self._stage_budget_note())
 
         if name == "batch_read_file_slice":
-            if self._active_stage not in {"navigation_tree", "navigation_repair"}:
-                return _err("batch_read_file_slice 只能在 navigation_tree / navigation_repair 阶段使用")
+            if self._active_stage not in {"navigation_tree", "navigation_repair", "navigation_incremental", "navigation_incremental_repair"}:
+                return _err("batch_read_file_slice 只能在 navigation_tree / navigation_repair / navigation_incremental / navigation_incremental_repair 阶段使用")
             raw_paths = args.get("paths")
             if not isinstance(raw_paths, list):
                 return _err("paths 必须是字符串数组")
@@ -617,7 +687,7 @@ class TopologyCognitionAgent(BaseReActAgent):
                     },
                 },
             })
-        if self._active_stage in {"navigation_tree", "navigation_repair"}:
+        if self._active_stage in {"navigation_tree", "navigation_repair", "navigation_incremental", "navigation_incremental_repair"}:
             tools.append({
                 "type": "function",
                 "function": {
@@ -755,7 +825,7 @@ class TopologyCognitionAgent(BaseReActAgent):
         tool_name = _get_tool_name(tool_call) or "unknown"
         result = await super()._invoke_serena(tool_call, serena_client, state=state)
         if (
-            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair"}
+            self._active_stage in {"pceignore", "pceignore_refresh", "navigation_tree", "navigation_repair", "navigation_incremental", "navigation_incremental_repair"}
             and tool_name in _ALLOWED_SERENA_TOOL_NAMES_BY_STAGE[self._active_stage]
             and self._stage_tool_budget_total > 0
         ):
