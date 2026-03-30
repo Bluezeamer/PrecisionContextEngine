@@ -52,6 +52,33 @@ def get_env_float(name: str) -> float | None:
         return None
 
 
+def get_env_int(name: str) -> int | None:
+    """读取环境变量整数；非法值视为未配置。"""
+    text = get_env_text(name)
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def get_agent_timeout(default: float) -> float:
+    """读取全局 Agent 总超时（秒）。"""
+    value = get_env_float("PCE_AGENT_TIMEOUT")
+    if value is None or value <= 0:
+        return float(default)
+    return float(value)
+
+
+def get_completion_retries_per_model(default: int = 3) -> int:
+    """读取每个模型的 completion 重试次数。"""
+    value = get_env_int("PCE_COMPLETION_RETRIES_PER_MODEL")
+    if value is None or value < 1:
+        return int(default)
+    return int(value)
+
+
 def get_temperature(
     *,
     specific_key: str | None,

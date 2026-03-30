@@ -27,7 +27,14 @@ from typing import Any
 import litellm
 import litellm.exceptions as litellm_exc
 
-from ._env import build_litellm_model, get_completion_overrides, get_env_text, get_temperature
+from ._env import (
+    build_litellm_model,
+    get_agent_timeout,
+    get_completion_overrides,
+    get_completion_retries_per_model,
+    get_env_text,
+    get_temperature,
+)
 from .prompt_guard import build_prompt_budget, estimate_input_tokens
 from .serena_client import SerenaClient, SerenaClientError
 
@@ -40,7 +47,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_SECONDS = 600.0
 MAX_NO_TOOL_RETRIES = 3
 MAX_LENGTH_CONT = 2
-MAX_TIMEOUT_RETRIES = 1
+MAX_COMPLETION_RETRIES_PER_MODEL = 3
 
 # 预算告警参数（子类可通过类属性覆盖）
 BUDGET_WARNING_RATIO = 0.25
@@ -113,33 +120,6 @@ class PromptBudgetExceeded(RuntimeError):
 def _stringify_error(exc: Exception) -> str:
     """提取稳定、可读的异常原因字符串。"""
     return str(getattr(exc, "message", None) or exc or type(exc).__name__)
-
-
-def _should_fallback_model(exc: Exception) -> bool:
-    """判断是否应切换到下一个模型（不可恢复的模型级错误）。"""
-    if isinstance(
-        exc,
-        (
-            litellm_exc.RateLimitError,
-            litellm_exc.AuthenticationError,
-            litellm_exc.PermissionDeniedError,
-            litellm_exc.NotFoundError,
-        ),
-    ):
-        return True
-    if isinstance(exc, (litellm_exc.BadRequestError, litellm_exc.InvalidRequestError)):
-        msg = _stringify_error(exc).lower()
-        return any(
-            k in msg
-            for k in (
-                "model not found",
-                "unknown model",
-                "invalid model",
-                "does not exist",
-                "no deployments available",
-            )
-        )
-    return False
 
 
 def _parse_model_fallbacks(raw: str) -> list[str]:
@@ -356,7 +336,7 @@ class BaseReActAgent(ABC):
             else _parse_model_fallbacks(os.getenv("PCE_MODEL_FALLBACKS", ""))
         )
         self._model_fallbacks = [m for m in raw_fallbacks if m and m != self._model]
-        self._max_seconds = float(max_seconds)
+        self._max_seconds = get_agent_timeout(float(max_seconds))
         self._completion_temperature = get_temperature(
             specific_key=self._temperature_env_key,
             default=self._completion_temperature,
@@ -506,26 +486,14 @@ class BaseReActAgent(ABC):
                 logger.warning("输入上下文超限，终止 ReAct 循环: %s", exc)
                 return REACT_INPUT_TOO_LARGE, None
 
-            # ── LLM 调用（含单步超时重试） ──
-            timeout_retries = 0
-            while True:
-                try:
-                    response, finish_reason = await self._completion(
-                        state.messages, tools_schema
-                    )
-                    break
-                except LLMCompletionError as exc:
-                    logger.warning("模型降级链耗尽，终止 ReAct 循环: %s", exc)
-                    return REACT_LLM_EXHAUSTED, None
-                except TimeoutError:
-                    timeout_retries += 1
-                    if timeout_retries <= MAX_TIMEOUT_RETRIES:
-                        logger.warning(
-                            "模型调用超时(第 %d 次)，正在重试", timeout_retries
-                        )
-                        continue
-                    logger.warning("模型调用超时，重试次数耗尽，强制终止")
-                    return REACT_TIMEOUT, None
+            # ── LLM 调用（统一交由 _completion 处理重试与 fallback） ──
+            try:
+                response, finish_reason = await self._completion(
+                    state.messages, tools_schema
+                )
+            except LLMCompletionError as exc:
+                logger.warning("模型重试/fallback 链耗尽，终止 ReAct 循环: %s", exc)
+                return REACT_LLM_EXHAUSTED, None
 
             state.token_used = self._extract_next_prompt_size(response)
             message = _extract_message(response)
@@ -619,48 +587,58 @@ class BaseReActAgent(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> tuple[Any, str]:
-        """调用 litellm.completion，沿降级链尝试所有候选模型。"""
+        """调用 litellm.completion，按模型链逐个重试。"""
         overrides = get_completion_overrides()
         model_chain = [
             build_litellm_model(self._provider, m)
             for m in [self._model, *self._model_fallbacks]
         ]
         attempts: list[dict[str, str]] = []
+        retries_per_model = get_completion_retries_per_model(MAX_COMPLETION_RETRIES_PER_MODEL)
 
         for idx, full_model in enumerate(model_chain):
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        litellm.completion,
-                        model=full_model,
-                        messages=messages,
-                        tools=tools if tools else None,
-                        temperature=self._completion_temperature,
-                        **overrides,
-                    ),
-                    timeout=self._completion_timeout,
-                )
-                if idx > 0:
-                    logger.info("模型降级成功: %s (第 %d 候选)", full_model, idx + 1)
-                return response, _extract_finish_reason(response)
-            except (TimeoutError, litellm_exc.Timeout) as exc:
-                raise TimeoutError("litellm timeout") from exc
-            except Exception as exc:
-                if not _should_fallback_model(exc):
-                    raise
-                attempts.append({
-                    "model": full_model,
-                    "error_type": type(exc).__name__,
-                    "reason": _stringify_error(exc),
-                })
-                if idx < len(model_chain) - 1:
-                    logger.warning(
-                        "模型调用失败，触发降级: %s -> %s",
-                        full_model,
-                        model_chain[idx + 1],
+            for attempt in range(1, retries_per_model + 1):
+                try:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            litellm.completion,
+                            model=full_model,
+                            messages=messages,
+                            tools=tools if tools else None,
+                            temperature=self._completion_temperature,
+                            **overrides,
+                        ),
+                        timeout=self._completion_timeout,
                     )
+                    if idx > 0:
+                        logger.info("模型降级成功: %s (第 %d 候选，第 %d 次尝试)", full_model, idx + 1, attempt)
+                    elif attempt > 1:
+                        logger.info("模型调用重试成功: %s (第 %d 次尝试)", full_model, attempt)
+                    return response, _extract_finish_reason(response)
+                except (TimeoutError, litellm_exc.Timeout) as exc:
+                    attempts.append({
+                        "model": full_model,
+                        "error_type": type(exc).__name__,
+                        "reason": "litellm timeout",
+                    })
+                    if attempt < retries_per_model:
+                        logger.warning("模型调用失败，直接重试: %s (第 %d/%d 次): %s", full_model, attempt, retries_per_model, exc)
+                        continue
+                    if idx < len(model_chain) - 1:
+                        logger.warning("模型调用失败，切换 fallback: %s -> %s", full_model, model_chain[idx + 1])
                     continue
-                raise LLMCompletionError(attempts) from exc
+                except Exception as exc:
+                    attempts.append({
+                        "model": full_model,
+                        "error_type": type(exc).__name__,
+                        "reason": _stringify_error(exc),
+                    })
+                    if attempt < retries_per_model:
+                        logger.warning("模型调用失败，直接重试: %s (第 %d/%d 次): %s", full_model, attempt, retries_per_model, exc)
+                        continue
+                    if idx < len(model_chain) - 1:
+                        logger.warning("模型调用失败，切换 fallback: %s -> %s", full_model, model_chain[idx + 1])
+                    continue
 
         raise LLMCompletionError(attempts)
 

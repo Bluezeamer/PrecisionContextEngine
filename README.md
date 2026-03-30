@@ -79,6 +79,8 @@ PCE 使用 [LiteLLM](https://github.com/BerriAI/litellm) 作为 LLM 调用层，
 | `PCE_PROJECT_PATH`   | 当前工作目录 | 目标项目根路径（绝对路径）。MCP 模式下通常不需要设置，通过 `pce_init` 传入即可 |
 | `PCE_CONTEXT_WINDOW` | `256000`     | Agent 上下文窗口大小（token）。影响动态注入块的软上限（= 窗口 / 10）           |
 | `PCE_SERENA_TIMEOUT` | `180`        | Serena MCP 启动 / 初始化超时，单位秒                                           |
+| `PCE_AGENT_TIMEOUT` | `600`        | 全局 Agent 总超时（秒）；统一作用于 query / impact / topology / digest 链路    |
+| `PCE_COMPLETION_RETRIES_PER_MODEL` | `3` | 每个模型的 completion 直接重试次数；耗尽后再切 fallback 模型                 |
 | `PCE_LOG_LEVEL`      | `INFO`       | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`                               |
 | `PCE_TRACE_DIR`      | —            | 设置后启用 JSONL Trace 输出，将 Agent 推理过程写入该目录                       |
 
@@ -293,6 +295,8 @@ PCE uses [LiteLLM](https://github.com/BerriAI/litellm) under the hood — any pr
 | `PCE_PROJECT_PATH`   | cwd      | Target project root (absolute path). Usually not needed in MCP mode — use `pce_init` instead |
 | `PCE_CONTEXT_WINDOW` | `256000` | Agent context window size in tokens. Dynamic injection soft limit = window / 10              |
 | `PCE_SERENA_TIMEOUT` | `180`    | Serena MCP startup timeout in seconds                                                        |
+| `PCE_AGENT_TIMEOUT` | `600`    | Global total Agent timeout in seconds for query / impact / topology / digest chains         |
+| `PCE_COMPLETION_RETRIES_PER_MODEL` | `3` | Direct completion retries per model before switching to a fallback model                   |
 | `PCE_LOG_LEVEL`      | `INFO`   | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR`                                            |
 | `PCE_TRACE_DIR`      | —        | When set, writes JSONL traces of agent reasoning to this directory                           |
 
