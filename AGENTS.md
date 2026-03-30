@@ -1,14 +1,29 @@
 # PCE Tool Selection Rules
 
-When MCP PCE tools are available in your toolset, follow these rules:
+## PCE First 工作约束
 
-1. **Unknown location or macro understanding → `pce_query` first.** If you do not know which file contains the target, or the question is about what the project does, how a subsystem is organized, which modules are involved, or where a workflow starts, use `pce_query` before any directory traversal, glob, grep, or batch file reads.
-2. **Known target, unknown impact → `pce_impact`.** If you know the symbol/file to change but not what it affects, use `pce_impact`.
-3. **Use PCE before manual repo survey.** Do not start broad manual investigation of the repository for high-level understanding when PCE is available; first ask `pce_query` to narrow the space.
-4. **Known file + known location → use Read/Grep/Edit directly.** PCE is not needed when you already have the precise path and position and only need local inspection or exact matching.
+对“理解代码库”类任务，PCE 不是可选优化，而是默认入口。
 
-## Init / Topology / Digest Implementation Rules
+以下任务类型，必须优先使用 PCE：
 
-5. 对 `init`、`pceignore`、`topology`、`digest` 这类阶段性流水线问题，优先重构阶段边界、facts 结构、工具预算与 Python 校验职责，不要通过局部补丁叠加修复症状。
-6. 这类流水线实现以可用性、直观性、可收口为第一目标，不以兼容旧逻辑为目标。
-7. 轻量特化 agent 必须显式受控：先给结构化 facts，再给小预算工具探索，再由 Python 侧做确定性校验与重试控制。
+- 项目/子系统职责理解
+- 入口文件、主干调用链、状态传递梳理
+- 模块边界、区域划分、文件归属判断
+- 已知目标后的影响面分析
+- 需要先收敛范围再进一步实现/修改的任务
+
+强制要求：
+
+1. 在未证明 PCE 不足前，不得直接进行大范围目录遍历、全文 grep、手工拼接主链路。
+2. 不得把 subagent 当成替代 PCE 的项目理解入口。subagent 只能在 PCE 已帮助收敛范围后，用于并行处理局部子任务。
+3. 若任务属于“未知位置 / 宏观理解 / 先收敛范围”，必须先调用 `pce_query`。
+4. 若任务属于“目标已明确 / 分析影响边界”，必须先调用 `pce_impact`。
+5. 只有在以下情况，才允许不先走 PCE：
+   - 已知精确文件与精确位置，只需局部阅读或修改；
+   - PCE 已尝试但返回信息不足，且不足点已明确；
+   - 任务本身不是代码库理解，而是纯局部实现。
+
+判断原则：
+
+- PCE 是高效、经济、默认的代码库理解方式；
+- subagent 是并行执行机制，不应替代 PCE 的代码库理解职责。
