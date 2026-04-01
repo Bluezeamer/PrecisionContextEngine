@@ -50,9 +50,9 @@ from .serena_language_health import (
 from .staging import DirtyState, FileWatcher, StagingArea
 from .memory import get_status, index_exists, load_file_baseline, load_index
 from ._env import configure_litellm_runtime
-from .pce_v2 import ImpactRequest as V2ImpactRequest
-from .pce_v2 import PCEngine as PCEngineV2
-from .pce_v2 import QueryRequest as V2QueryRequest
+from pce_v2 import ImpactRequest as V2ImpactRequest
+from pce_v2 import PCEngine as PCEngineV2
+from pce_v2 import QueryRequest as V2QueryRequest
 from .serena_client import (
     DEFAULT_TIMEOUT_SECONDS,
     SerenaClient,
