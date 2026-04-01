@@ -50,6 +50,9 @@ from .serena_language_health import (
 from .staging import DirtyState, FileWatcher, StagingArea
 from .memory import get_status, index_exists, load_file_baseline, load_index
 from ._env import configure_litellm_runtime
+from .pce_v2 import ImpactRequest as V2ImpactRequest
+from .pce_v2 import PCEngine as PCEngineV2
+from .pce_v2 import QueryRequest as V2QueryRequest
 from .serena_client import (
     DEFAULT_TIMEOUT_SECONDS,
     SerenaClient,
@@ -63,6 +66,11 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # 辅助函数
 # ============================================================================
+
+
+def _use_v2_query_impact() -> bool:
+    raw = os.getenv("PCE_USE_V2_QUERY_IMPACT", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _make_tool_description(
@@ -443,6 +451,7 @@ class PCEContext:
 
         # 运行时组件（pce_init 后才创建）
         self.agent: PCEAgent | None = None
+        self.v2_engine = PCEngineV2()
         self.insight_cache: InsightCache | None = None
         self.staging: StagingArea | None = None
         self.watcher: FileWatcher | None = None
@@ -880,6 +889,17 @@ class PCEContext:
             dirty_info = self._format_dirty_context(visible_dirty)
             enriched_query = f"{query}\n\n{dirty_info}"
 
+        if _use_v2_query_impact():
+            try:
+                result = await self.v2_engine.run_query(
+                    self.project_path,
+                    V2QueryRequest(question=enriched_query),
+                )
+                result["engine"] = "v2"
+                return result
+            except Exception:
+                logger.exception("v2 query 执行失败，回退旧版主线")
+
         async with self.serena_session() as serena_client:
             response = await self.agent.query(
                 question=enriched_query,
@@ -889,6 +909,7 @@ class PCEContext:
             )
         payload = response.model_dump(mode="json")
         payload["answer"] = response.answer
+        payload["engine"] = "legacy"
         return payload
 
     async def handle_impact(
@@ -903,6 +924,18 @@ class PCEContext:
         assert self.staging is not None
 
         effective_target = f"{target} (file={file})" if file else target
+
+        if _use_v2_query_impact():
+            try:
+                result = await self.v2_engine.run_impact(
+                    self.project_path,
+                    V2ImpactRequest(target=target, change_type=change_type, file=file),
+                )
+                result["engine"] = "v2"
+                return result
+            except Exception:
+                logger.exception("v2 impact 执行失败，回退旧版主线")
+
         async with self.serena_session() as serena_client:
             response = await self.agent.impact(
                 target=effective_target,
@@ -913,6 +946,7 @@ class PCEContext:
             )
         payload = response.model_dump(mode="json")
         payload["answer"] = response.answer
+        payload["engine"] = "legacy"
         return payload
 
     async def handle_status(self) -> dict[str, Any]:
