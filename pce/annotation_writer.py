@@ -27,7 +27,6 @@ import aiofiles
 import litellm
 
 from ._env import build_litellm_model, get_completion_overrides, get_env_text, get_temperature
-from .init_cognition_limits import TOPOLOGY_STAGE_MAX_ATTEMPTS
 from .memory import (
     ANNOTATIONS_DIR,
     ANNOTATIONS_AREAS_DIR,
@@ -53,7 +52,6 @@ from .serena_client import SerenaClient, SerenaClientError
 from .topology_cognition_agent import TopologyCognitionAgent
 
 logger = logging.getLogger(__name__)
-_TOPOLOGY_STAGE_MAX_ATTEMPTS = TOPOLOGY_STAGE_MAX_ATTEMPTS
 
 # 常量（与 indexer.py 共享的导航路径常量）
 ANNOTATIONS_INDEX_FILE = "index.md"
@@ -4413,44 +4411,6 @@ def _assert_navigation_tree_not_fallback_only(tree: NavigationTree) -> None:
         raise ValueError("navigation_tree 退化为默认 core/fallback 结构，需重新生成")
 
 
-def _build_navigation_retry_feedback(exc: BaseException, *, attempt: int, max_attempts: int) -> str:
-    return "\n".join([
-        f"上一次 `navigation_tree` 输出未通过校验（第 {attempt}/{max_attempts} 次尝试）。",
-        f"错误信息：{_format_exception_brief(exc)}",
-        "请基于你已经收集到的证据修正导航树。",
-        "要求：给出真实的项目概括、稳定的 areas 划分、每个 area 下的 modules 划分，以及 area/module 摘要。",
-        "禁止退化为粗糙的 core/fallback 导航；若证据不足，请保持较粗但语义明确的区域划分。",
-    ])
-
-
-def _build_area_retry_feedback(
-    area: AreaRecord,
-    *,
-    attempt: int,
-    max_attempts: int,
-    pending_modules: list[str],
-    invalid_modules: dict[str, list[str]],
-    stage_error: BaseException | None,
-) -> str:
-    lines = [
-        f"当前 area `{area.slug}` / {area.display_name} 尚未完成（第 {attempt}/{max_attempts} 次尝试后）。",
-        "请继续处理当前 area，仅补齐未完成或无效的模块文档；已完成且有效的模块无需重写。",
-    ]
-    if stage_error is not None:
-        lines.append(f"本轮阶段错误：{_format_exception_brief(stage_error)}")
-    if pending_modules:
-        lines.append("缺失模块文档：" + ", ".join(pending_modules))
-    if invalid_modules:
-        lines.append("无效模块文档：")
-        for slug, errors in invalid_modules.items():
-            lines.append(f"- {slug}: {' | '.join(errors)}")
-    lines.extend([
-        "请根据错误提示修正文档，再次调用 write_module_annotation。",
-        "当前 area 全部完成后，再调用 mark_area_done(area_slug=..., note=...)。",
-    ])
-    return "\n".join(lines)
-
-
 def _collect_area_module_doc_status(
     area: AreaRecord,
     *,
@@ -4583,170 +4543,155 @@ async def _build_topology_navigation_bundle(
     max_repair_rounds = 6
 
     last_navigation_exc: BaseException | None = None
-    for attempt in range(1, _TOPOLOGY_STAGE_MAX_ATTEMPTS + 1):
-        logger.info(
-            "topology init stage start: navigation_tree attempt=%d/%d",
-            attempt,
-            _TOPOLOGY_STAGE_MAX_ATTEMPTS,
+    logger.info("topology init stage start: navigation_tree")
+    try:
+        navigation_payload = await agent.run_stage(
+            stage="navigation_tree",
+            messages=messages,
+            serena_client=serena_client,
         )
-        try:
-            navigation_payload = await agent.run_stage(
-                stage="navigation_tree",
-                messages=messages,
-                serena_client=serena_client,
-            )
-            if not isinstance(navigation_payload, dict):
-                raise ValueError("navigation_tree payload 必须为 object")
-            await _persist_topology_stage_debug(
-                root_path,
-                stage="navigation_tree",
-                payload=navigation_payload,
-                extra={"attempt": attempt},
-            )
+        if not isinstance(navigation_payload, dict):
+            raise ValueError("navigation_tree payload 必须为 object")
+        await _persist_topology_stage_debug(
+            root_path,
+            stage="navigation_tree",
+            payload=navigation_payload,
+            extra={"attempt": 1},
+        )
 
-            raw_tree = _coerce_topology_navigation_tree(
-                navigation_payload,
-                facts={"source_digest": "topology-init"},
-                active_slugs=None,
-            )
-            raw_tree = _normalize_navigation_tree_module_slugs(raw_tree)
-            _assert_navigation_tree_not_fallback_only(raw_tree)
-            last_metrics: tuple[int, int, int] | None = None
-            while True:
-                payload_issues = _collect_navigation_payload_issues(raw_tree, entries_map)
-                raw_sections = _build_sections_from_navigation_tree(raw_tree, entries_map)
-                valid_sections, raw_module_specs = _prepare_module_specs(raw_sections, entries_map)
-                if not valid_sections:
-                    raise ValueError("navigation_tree 解析后未得到有效模块规格")
+        raw_tree = _coerce_topology_navigation_tree(
+            navigation_payload,
+            facts={"source_digest": "topology-init"},
+            active_slugs=None,
+        )
+        raw_tree = _normalize_navigation_tree_module_slugs(raw_tree)
+        _assert_navigation_tree_not_fallback_only(raw_tree)
+        last_metrics: tuple[int, int, int] | None = None
+        while True:
+            payload_issues = _collect_navigation_payload_issues(raw_tree, entries_map)
+            raw_sections = _build_sections_from_navigation_tree(raw_tree, entries_map)
+            valid_sections, raw_module_specs = _prepare_module_specs(raw_sections, entries_map)
+            if not valid_sections:
+                raise ValueError("navigation_tree 解析后未得到有效模块规格")
 
-                raw_sections_by_slug = {section["slug"]: section for section in valid_sections}
-                raw_active_slugs = {slug for _, slug, _ in raw_module_specs}
-                raw_tree = _repair_navigation_tree(
-                    raw_tree.model_copy(update={
-                        "generated_at": datetime.now(UTC),
-                        "source_digest": _compute_source_digest(valid_sections),
-                    }),
-                    raw_active_slugs,
-                )
-                raw_tree = _sync_tree_modules_from_sections(raw_tree, raw_sections_by_slug)
-                _assert_navigation_tree_not_fallback_only(raw_tree)
-                tree_errors = _validate_navigation_tree(raw_tree, raw_active_slugs)
-                if tree_errors:
-                    raise ValueError(" | ".join(tree_errors))
-
-                coverage_issues = _collect_navigation_tree_coverage_issues(
-                    valid_sections,
-                    entries_map,
-                )
-                metrics = (
-                    len(coverage_issues["unassigned_paths"]),
-                    len(payload_issues["duplicate_paths"]),
-                    len(payload_issues["invalid_paths"]),
-                )
-                if metrics == (0, 0, 0):
-                    break
-
-                repair_attempts += 1
-                if repair_attempts > max_repair_rounds:
-                    issue_parts: list[str] = []
-                    if coverage_issues["unassigned_paths"]:
-                        issue_parts.append(f"仍有 {len(coverage_issues['unassigned_paths'])} 个文件未挂载")
-                    if payload_issues["duplicate_paths"]:
-                        issue_parts.append(f"仍有 {len(payload_issues['duplicate_paths'])} 个文件重复挂载")
-                    if payload_issues["invalid_paths"]:
-                        issue_parts.append(f"仍有 {len(payload_issues['invalid_paths'])} 个非法路径")
-                    raise ValueError(" | ".join(issue_parts) or "navigation_tree 覆盖修复失败")
-
-                if last_metrics is not None and not (
-                    metrics[0] < last_metrics[0]
-                    or metrics[1] < last_metrics[1]
-                    or metrics[2] < last_metrics[2]
-                ):
-                    raise ValueError(
-                        "navigation_repair 未继续收敛: "
-                        f"unassigned={metrics[0]} duplicate={metrics[1]} invalid={metrics[2]}"
-                    )
-
-                last_metrics = metrics
-                missing_paths_tree = _build_topology_missing_paths_tree(
-                    coverage_issues["unassigned_paths"],
-                    entries_map,
-                )
-                repair_payload = await agent.run_stage(
-                    stage="navigation_repair",
-                    messages=messages,
-                    serena_client=serena_client,
-                    stage_context={
-                        "current_navigation_tree": raw_tree.model_dump(mode="json"),
-                        "missing_paths_tree": missing_paths_tree,
-                        "validation_feedback": {
-                            **coverage_issues,
-                            **payload_issues,
-                        },
-                    },
-                    user_prompt=_build_navigation_repair_feedback(
-                        attempt=repair_attempts,
-                        max_attempts=max_repair_rounds,
-                        issues={
-                            **coverage_issues,
-                            **payload_issues,
-                        },
-                    ),
-                )
-                if not isinstance(repair_payload, dict):
-                    raise ValueError("navigation_repair payload 必须为 object")
-                await _persist_topology_stage_debug(
-                    root_path,
-                    stage="navigation_repair",
-                    payload=repair_payload,
-                    extra={"attempt": attempt, "repair_attempt": repair_attempts, "metrics": metrics},
-                )
-                raw_tree = _coerce_topology_navigation_tree(
-                    repair_payload,
-                    facts={"source_digest": "topology-init-repair"},
-                    active_slugs=None,
-                )
-                raw_tree = _normalize_navigation_tree_module_slugs(raw_tree)
-                _assert_navigation_tree_not_fallback_only(raw_tree)
-
-            stable_sections_by_slug = {
-                section["slug"]: section for section in valid_sections
-            }
-            module_specs = raw_module_specs
-            stable_active_slugs = {slug for _, slug, _ in module_specs}
-            stable_tree = _repair_navigation_tree(
+            raw_sections_by_slug = {section["slug"]: section for section in valid_sections}
+            raw_active_slugs = {slug for _, slug, _ in raw_module_specs}
+            raw_tree = _repair_navigation_tree(
                 raw_tree.model_copy(update={
                     "generated_at": datetime.now(UTC),
                     "source_digest": _compute_source_digest(valid_sections),
                 }),
-                stable_active_slugs,
+                raw_active_slugs,
             )
-            stable_tree = _sync_tree_modules_from_sections(stable_tree, stable_sections_by_slug)
-            _assert_navigation_tree_not_fallback_only(stable_tree)
-            tree_errors = _validate_navigation_tree(stable_tree, stable_active_slugs)
+            raw_tree = _sync_tree_modules_from_sections(raw_tree, raw_sections_by_slug)
+            _assert_navigation_tree_not_fallback_only(raw_tree)
+            tree_errors = _validate_navigation_tree(raw_tree, raw_active_slugs)
             if tree_errors:
                 raise ValueError(" | ".join(tree_errors))
 
-            logger.info("topology init stage ok: navigation_tree attempt=%d", attempt)
-            break
-        except Exception as exc:
-            last_navigation_exc = exc
-            await _persist_topology_debug_error(
-                root_path,
-                stage="navigation_tree",
-                message=_format_exception_brief(exc),
-                extra={"attempt": attempt},
+            coverage_issues = _collect_navigation_tree_coverage_issues(
+                valid_sections,
+                entries_map,
             )
-            if attempt >= _TOPOLOGY_STAGE_MAX_ATTEMPTS:
-                raise RuntimeError(f"navigation_tree stage failed after retries: {exc}") from exc
-            messages.append({
-                "role": "user",
-                "content": _build_navigation_retry_feedback(
-                    exc,
-                    attempt=attempt,
-                    max_attempts=_TOPOLOGY_STAGE_MAX_ATTEMPTS,
+            metrics = (
+                len(coverage_issues["unassigned_paths"]),
+                len(payload_issues["duplicate_paths"]),
+                len(payload_issues["invalid_paths"]),
+            )
+            if metrics == (0, 0, 0):
+                break
+
+            repair_attempts += 1
+            if repair_attempts > max_repair_rounds:
+                issue_parts: list[str] = []
+                if coverage_issues["unassigned_paths"]:
+                    issue_parts.append(f"仍有 {len(coverage_issues['unassigned_paths'])} 个文件未挂载")
+                if payload_issues["duplicate_paths"]:
+                    issue_parts.append(f"仍有 {len(payload_issues['duplicate_paths'])} 个文件重复挂载")
+                if payload_issues["invalid_paths"]:
+                    issue_parts.append(f"仍有 {len(payload_issues['invalid_paths'])} 个非法路径")
+                raise ValueError(" | ".join(issue_parts) or "navigation_tree 覆盖修复失败")
+
+            if last_metrics is not None and not (
+                metrics[0] < last_metrics[0]
+                or metrics[1] < last_metrics[1]
+                or metrics[2] < last_metrics[2]
+            ):
+                raise ValueError(
+                    "navigation_repair 未继续收敛: "
+                    f"unassigned={metrics[0]} duplicate={metrics[1]} invalid={metrics[2]}"
+                )
+
+            last_metrics = metrics
+            missing_paths_tree = _build_topology_missing_paths_tree(
+                coverage_issues["unassigned_paths"],
+                entries_map,
+            )
+            repair_payload = await agent.run_stage(
+                stage="navigation_repair",
+                messages=messages,
+                serena_client=serena_client,
+                stage_context={
+                    "current_navigation_tree": raw_tree.model_dump(mode="json"),
+                    "missing_paths_tree": missing_paths_tree,
+                    "validation_feedback": {
+                        **coverage_issues,
+                        **payload_issues,
+                    },
+                },
+                user_prompt=_build_navigation_repair_feedback(
+                    attempt=repair_attempts,
+                    max_attempts=max_repair_rounds,
+                    issues={
+                        **coverage_issues,
+                        **payload_issues,
+                    },
                 ),
-            })
+            )
+            if not isinstance(repair_payload, dict):
+                raise ValueError("navigation_repair payload 必须为 object")
+            await _persist_topology_stage_debug(
+                root_path,
+                stage="navigation_repair",
+                payload=repair_payload,
+                extra={"attempt": 1, "repair_attempt": repair_attempts, "metrics": metrics},
+            )
+            raw_tree = _coerce_topology_navigation_tree(
+                repair_payload,
+                facts={"source_digest": "topology-init-repair"},
+                active_slugs=None,
+            )
+            raw_tree = _normalize_navigation_tree_module_slugs(raw_tree)
+            _assert_navigation_tree_not_fallback_only(raw_tree)
+
+        stable_sections_by_slug = {
+            section["slug"]: section for section in valid_sections
+        }
+        module_specs = raw_module_specs
+        stable_active_slugs = {slug for _, slug, _ in module_specs}
+        stable_tree = _repair_navigation_tree(
+            raw_tree.model_copy(update={
+                "generated_at": datetime.now(UTC),
+                "source_digest": _compute_source_digest(valid_sections),
+            }),
+            stable_active_slugs,
+        )
+        stable_tree = _sync_tree_modules_from_sections(stable_tree, stable_sections_by_slug)
+        _assert_navigation_tree_not_fallback_only(stable_tree)
+        tree_errors = _validate_navigation_tree(stable_tree, stable_active_slugs)
+        if tree_errors:
+            raise ValueError(" | ".join(tree_errors))
+
+        logger.info("topology init stage ok: navigation_tree")
+    except Exception as exc:
+        last_navigation_exc = exc
+        await _persist_topology_debug_error(
+            root_path,
+            stage="navigation_tree",
+            message=_format_exception_brief(exc),
+            extra={"attempt": 1},
+        )
+        raise RuntimeError(f"navigation_tree stage failed: {exc}") from exc
 
     if (
         raw_tree is None

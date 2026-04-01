@@ -8,7 +8,6 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from .init_cognition_limits import PCEIGNORE_STAGE_MAX_ATTEMPTS
 from .memory import _atomic_write_text
 from .file_discovery import is_ignored, is_probably_text_file, is_hard_skipped
 from .serena_client import SerenaClient
@@ -246,14 +245,6 @@ def _normalize_ignore_patterns(payload: dict[str, Any]) -> list[str]:
     return _dedupe_keep_order(normalized)
 
 
-def _build_retry_feedback(exc: Exception, *, attempt: int, max_attempts: int) -> str:
-    return "\n".join([
-        f"上一次 `pceignore` 输出未通过校验（第 {attempt}/{max_attempts} 次尝试）。",
-        f"错误：{type(exc).__name__}: {exc}",
-        "请不要继续探索；请基于现有证据重新输出严格符合 schema 的 JSON：{'ignore_patterns':[...]}。",
-    ])
-
-
 async def _write_pceignore(project_root: Path, ignore_patterns: list[str]) -> None:
     merged = _dedupe_keep_order([
         *_HARD_PATTERNS,
@@ -281,15 +272,6 @@ def _normalize_refresh_payload(payload: dict[str, Any]) -> tuple[str, list[str],
     return action, patterns, rationale
 
 
-def _build_refresh_retry_feedback(exc: Exception, *, attempt: int, max_attempts: int) -> str:
-    return "\n".join([
-        f"上一次 `pceignore_refresh` 输出未通过校验（第 {attempt}/{max_attempts} 次尝试）。",
-        f"错误：{type(exc).__name__}: {exc}",
-        "若无需更新，请输出 `{action:\"no_update\", ignore_patterns:[], rationale:\"...\"}`。",
-        "若需要更新，请输出 `{action:\"append_patterns\", ignore_patterns:[...], rationale:\"...\"}`，且 ignore_patterns 必须是最小增量。",
-    ])
-
-
 async def run_pceignore_stage(
     project_root: Path,
     serena_client: SerenaClient,
@@ -310,34 +292,19 @@ async def run_pceignore_stage(
     messages = agent.build_initial_messages()
 
     last_exc: Exception | None = None
-    for attempt in range(1, PCEIGNORE_STAGE_MAX_ATTEMPTS + 1):
-        logger.info(
-            "pceignore stage start: attempt=%d/%d",
-            attempt,
-            PCEIGNORE_STAGE_MAX_ATTEMPTS,
+    logger.info("pceignore stage start")
+    try:
+        payload = await agent.run_stage(
+            stage="pceignore",
+            messages=messages,
+            serena_client=serena_client,
         )
-        try:
-            payload = await agent.run_stage(
-                stage="pceignore",
-                messages=messages,
-                serena_client=serena_client,
-            )
-            patterns = _normalize_ignore_patterns(payload)
-            await _write_pceignore(project_root, patterns)
-            logger.info("已生成 .pce/pceignore: %d 条规则", len(patterns))
-            return
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= PCEIGNORE_STAGE_MAX_ATTEMPTS:
-                break
-            messages.append({
-                "role": "user",
-                "content": _build_retry_feedback(
-                    exc,
-                    attempt=attempt,
-                    max_attempts=PCEIGNORE_STAGE_MAX_ATTEMPTS,
-                ),
-            })
+        patterns = _normalize_ignore_patterns(payload)
+        await _write_pceignore(project_root, patterns)
+        logger.info("已生成 .pce/pceignore: %d 条规则", len(patterns))
+        return
+    except Exception as exc:
+        last_exc = exc
 
     logger.warning("pceignore stage 失败，降级写入最小规则: %s", last_exc)
     await _write_pceignore(project_root, [])
@@ -374,43 +341,30 @@ async def run_pceignore_refresh_stage(
     messages = agent.build_initial_messages()
 
     last_exc: Exception | None = None
-    for attempt in range(1, PCEIGNORE_STAGE_MAX_ATTEMPTS + 1):
-        logger.info(
-            "pceignore refresh stage start: attempt=%d/%d changed=%d deleted=%d",
-            attempt,
-            PCEIGNORE_STAGE_MAX_ATTEMPTS,
-            len(dirty_changed),
-            len(dirty_deleted),
+    logger.info(
+        "pceignore refresh stage start: changed=%d deleted=%d",
+        len(dirty_changed),
+        len(dirty_deleted),
+    )
+    try:
+        payload = await agent.run_stage(
+            stage="pceignore_refresh",
+            messages=messages,
+            serena_client=serena_client,
         )
-        try:
-            payload = await agent.run_stage(
-                stage="pceignore_refresh",
-                messages=messages,
-                serena_client=serena_client,
-            )
-            action, patterns, rationale = _normalize_refresh_payload(payload)
-            if action == "no_update":
-                logger.info("pceignore refresh: no_update%s", f" ({rationale})" if rationale else "")
-                return "no_update"
-            await _write_pceignore(project_root, patterns)
-            logger.info(
-                "pceignore refresh: appended %d patterns%s",
-                len(patterns),
-                f" ({rationale})" if rationale else "",
-            )
-            return "updated"
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= PCEIGNORE_STAGE_MAX_ATTEMPTS:
-                break
-            messages.append({
-                "role": "user",
-                "content": _build_refresh_retry_feedback(
-                    exc,
-                    attempt=attempt,
-                    max_attempts=PCEIGNORE_STAGE_MAX_ATTEMPTS,
-                ),
-            })
+        action, patterns, rationale = _normalize_refresh_payload(payload)
+        if action == "no_update":
+            logger.info("pceignore refresh: no_update%s", f" ({rationale})" if rationale else "")
+            return "no_update"
+        await _write_pceignore(project_root, patterns)
+        logger.info(
+            "pceignore refresh: appended %d patterns%s",
+            len(patterns),
+            f" ({rationale})" if rationale else "",
+        )
+        return "updated"
+    except Exception as exc:
+        last_exc = exc
 
     logger.warning("pceignore refresh stage 失败，保持现有规则不变: %s", last_exc)
     return "failed_no_change"
